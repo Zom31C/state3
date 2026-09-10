@@ -1,0 +1,45 @@
+import type { StateDict } from '../core/types.js';
+import type { HistoryEntry, StartOptions, StoredTask, TaskSummary } from './store.js';
+
+/**
+ * Structural port over the task store. The real `TaskStore` satisfies it, and a
+ * fake can be substituted in tests without importing `../tasks/store.js` values.
+ */
+export interface TaskStorePort {
+  /**
+   * Absolute state directory. Surfaced in diagnostics because the host may spawn
+   * the server outside the project, and an empty task list must not look the same
+   * as "state is in the wrong place".
+   */
+  readonly rootDir?: string;
+  start(goal: string, options?: StartOptions): Promise<StoredTask>;
+  show(id?: string): Promise<StoredTask>;
+  patch(patch: StateDict, id?: string): Promise<StoredTask>;
+  finish(summary: string, id?: string): Promise<StoredTask>;
+  list(): Promise<TaskSummary[]>;
+  history(id?: string, limit?: number): Promise<HistoryEntry[]>;
+  activeId(): Promise<string | null>;
+  /** Full procedure P for a task: its skill's instructions plus the notation appendix. */
+  instructionsFor(task: StoredTask): string;
+  /** Skills this store can create tasks for; optional so test fakes stay small. */
+  skillNames?(): string[];
+}
+
+/** A named state root besides the primary one. */
+export interface ProjectEntry {
+  name: string;
+  rootDir: string;
+}
+
+/**
+ * Chooses the store a call applies to. One session can read and patch tasks that
+ * live in another project's root — that is how a supervising agent follows a
+ * worker — but only roots declared up front are reachable, so a model can never
+ * point the tools at an arbitrary directory.
+ */
+export interface StoreResolver {
+  /** Store for `project`; the primary store when it is omitted. */
+  resolve(project?: string): TaskStorePort;
+  /** Declared projects, for diagnostics and error messages. */
+  projects(): readonly ProjectEntry[];
+}

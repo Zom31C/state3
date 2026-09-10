@@ -1,0 +1,73 @@
+{
+  "name": "skillstate",
+  "version": "0.1.0",
+  "displayName": "SKILL.state task memory",
+  "description": "External validated task state for long-horizon coding work: the agent patches a compact state instead of relying on the transcript, so progress survives compaction and restarts (arXiv:2608.26263).",
+  "contextFileName": "QWEN.md",
+  "settings": [
+    {
+      "name": "skillstate home",
+      "description": "Absolute path to the skillstate repository that contains dist/mcp/server.js. Needed when this extension is installed outside that repository.",
+      "envVar": "SKILLSTATE_HOME"
+    },
+    {
+      "name": "state directory",
+      "description": "Absolute path of the .skillstate directory to use. Set it when you start qwen outside the project: the server and the hooks otherwise take qwen's startup directory.",
+      "envVar": "SKILLSTATE_STATE_DIR"
+    },
+    {
+      "name": "supervised projects",
+      "description": "Additional .skillstate roots the tools may address by name, as \"name=dir;name2=dir2\" or a JSON object of the same. Only roots declared here are reachable through the project argument, so a session can read and patch the task of a worker in another project without ever reaching an arbitrary directory. The hooks inject the active task of each declared root.",
+      "envVar": "SKILLSTATE_PROJECTS"
+    }
+  ],
+  "mcpServers": {
+    "skillstate": {
+      "command": "node",
+      "args": ["${extensionPath}${/}bin${/}skillstate-mcp.mjs"],
+      "cwd": "${workspacePath}"
+    }
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${extensionPath}${/}hooks${/}inject-state.mjs",
+            "name": "skillstate-inject-state",
+            "timeout": 5000,
+            "statusMessage": "Loading skillstate task state"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${extensionPath}${/}hooks${/}inject-state.mjs",
+            "name": "skillstate-precompact-state",
+            "timeout": 5000,
+            "statusMessage": "Adding skillstate task state to the compaction context"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${extensionPath}${/}hooks${/}inject-state.mjs",
+            "name": "skillstate-session-state",
+            "timeout": 5000,
+            "statusMessage": "Restoring skillstate task state"
+          }
+        ]
+      }
+    ]
+  }
+}
