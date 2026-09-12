@@ -57,11 +57,12 @@ function rootNote(store: TaskStorePort): string {
   return store.rootDir === undefined ? '' : ` (state root: ${store.rootDir})`;
 }
 
-function success(content: string): ToolResult {
+/** Exported for the knowledge-base tools: one shape of answer, whichever half of the project answered. */
+export function success(content: string): ToolResult {
   return { ok: true, content };
 }
 
-function failure(content: string): ToolResult {
+export function failure(content: string): ToolResult {
   return { ok: false, isError: true, content };
 }
 
@@ -81,7 +82,7 @@ function failureFromError(err: unknown, note = ''): ToolResult {
 
 type ArgCheck<T> = { ok: true; value: T } | { ok: false; message: string };
 
-function requireString(args: Record<string, unknown>, name: string): ArgCheck<string> {
+export function requireString(args: Record<string, unknown>, name: string): ArgCheck<string> {
   const raw = args[name];
   if (raw === undefined) return { ok: false, message: `missing required argument: ${name}` };
   if (typeof raw !== 'string' || raw.trim() === '') {
@@ -90,7 +91,10 @@ function requireString(args: Record<string, unknown>, name: string): ArgCheck<st
   return { ok: true, value: raw };
 }
 
-function optionalString(args: Record<string, unknown>, name: string): ArgCheck<string | undefined> {
+export function optionalString(
+  args: Record<string, unknown>,
+  name: string,
+): ArgCheck<string | undefined> {
   const raw = args[name];
   if (raw === undefined) return { ok: true, value: undefined };
   if (typeof raw !== 'string' || raw.trim() === '') {
@@ -126,7 +130,7 @@ function requireStateDict(args: Record<string, unknown>, name: string): ArgCheck
   return { ok: true, value: raw as StateDict };
 }
 
-function optionalPositiveInt(
+export function optionalPositiveInt(
   args: Record<string, unknown>,
   name: string,
 ): ArgCheck<number | undefined> {
@@ -374,7 +378,7 @@ async function taskHistory(
 }
 
 /** Tool handlers must never throw: hosts surface a thrown error as a broken call. */
-function guarded(
+export function guarded(
   args: Record<string, unknown>,
   body: (args: Record<string, unknown>) => Promise<ToolResult>,
 ): Promise<ToolResult> {
@@ -382,7 +386,7 @@ function guarded(
   return body(safeArgs).catch(failureFromError);
 }
 
-const PROJECT_ARG = {
+export const PROJECT_ARG = {
   type: 'string',
   description:
     'Name of a declared project whose state root the call applies to. Omit it for this project. task_list prints the declared names.',

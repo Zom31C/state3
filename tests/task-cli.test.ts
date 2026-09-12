@@ -226,6 +226,7 @@ describe('parseTaskArgs', () => {
       skill: null,
       notation: null,
       project: null,
+      purge: false,
       fromStdin: false,
       help: false,
     });

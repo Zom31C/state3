@@ -117,6 +117,23 @@ describe('skillstate opencode plugin', () => {
     expect(output.context).toEqual([]);
   });
 
+  it('treats a root with state.db as authoritative, and says so when it cannot read it', async () => {
+    // A migrated root archives the JSON it replaced, so falling back to those files would inject
+    // a Σ that is already out of date: the plugin reports the database instead. The database here
+    // is not one, which gives the same answer whether or not a build is reachable — and this suite
+    // must not depend on dist being newer than src.
+    await writeTask(makeRecord());
+    await writeFile(join(projectDir, '.skillstate', 'state.db'), 'this is not a database\n');
+    const hooks = await loadHooks();
+    const output = { context: [] };
+
+    await hooks['experimental.session.compacting']({ sessionID: 's1' }, output);
+
+    expect(output.context).toEqual([]);
+    const warn = logs.find((entry) => entry.body.level === 'warn');
+    expect(warn?.body.message).toContain('state.db');
+  });
+
   it('picks the most recently updated active task', async () => {
     await writeTask({ ...makeRecord(), id: 'task-old', updatedAt: '2026-09-05T00:00:01.000Z' });
     await writeTask(

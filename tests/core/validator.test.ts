@@ -65,6 +65,32 @@ describe('validatePatch', () => {
     });
   });
 
+  it('rejects a dotted delete key, which no field can be and no path addresses', () => {
+    const skill = makeSkill({
+      schema: z.strictObject({ artifacts: z.record(z.string(), z.string()) }),
+      initialState: { artifacts: { 'a.ts': 'first' } },
+    });
+    const res = validatePatch(
+      skill,
+      { artifacts: { 'a.ts': 'first' } },
+      { 'artifacts.a.ts': null },
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.category).toBe('unknown-key');
+      expect(res.message).toContain('artifacts.a.ts');
+      expect(res.message).toContain('silently change nothing');
+    }
+  });
+
+  it('accepts an idempotent null delete of an absent optional key', () => {
+    const skill = makeSkill({
+      schema: z.strictObject({ shelf_0: z.string().nullable().optional() }),
+      initialState: {},
+    });
+    expect(validatePatch(skill, {}, { shelf_0: null })).toEqual({ ok: true });
+  });
+
   it('runs the domain guard before schema validation', () => {
     const skill = makeSkill({
       guard: (current, patch) =>

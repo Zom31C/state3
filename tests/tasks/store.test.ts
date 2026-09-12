@@ -1,10 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { REJECT_CATEGORIES } from '../../src/core/rejections.js';
 import type { RejectCategory } from '../../src/core/rejections.js';
-import type { StateDict } from '../../src/core/types.js';
 import { devTaskSchema } from '../../src/tasks/schema.js';
 import type { DevTaskState } from '../../src/tasks/schema.js';
 import { superviseTaskSchema } from '../../src/tasks/supervise.js';
@@ -23,6 +22,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // The database file cannot be deleted on Windows while a connection holds it.
+  store.close();
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -35,14 +36,41 @@ function supervised(task: StoredTask): SuperviseTaskState {
   return superviseTaskSchema.parse(task.state);
 }
 
-/** A record as written before skills and notation existed: neither field is present. */
-function legacyRecord(id: string, extra: StateDict = {}): string {
-  return JSON.stringify({
-    id,
-    createdAt: '2026-09-07T18:30:59.046Z',
-    updatedAt: '2026-09-07T22:13:55.832Z',
-    state: {
-      goal: 'Task from an older runtime',
+interface RawRow {
+  skill: string;
+  notation: string;
+  status: string;
+  goal: string;
+  state: string;
+  updated_at: string;
+}
+
+/**
+ * The row exactly as the database holds it. A rejected patch must leave it
+ * identical — and under WAL the database file is not what a write changes (the
+ * `-wal` sibling is), so tests compare the row rather than re-reading the file.
+ */
+function rawRow(id: string): RawRow {
+  const row = store
+    .database()
+    .prepare('SELECT skill, notation, status, goal, state, updated_at FROM task WHERE id = ?')
+    .get(id) as RawRow | undefined;
+  if (row === undefined) throw new Error(`no task row for "${id}"`);
+  return row;
+}
+
+/**
+ * Inserts a row past every validation, which is how a record written by a runtime
+ * with a different schema, or a database edited by hand, actually looks.
+ */
+function forceRow(id: string, overrides: Partial<RawRow> = {}): void {
+  const row: RawRow = {
+    skill: 'dev-task',
+    notation: 'plain',
+    status: 'active',
+    goal: 'Forced row',
+    state: JSON.stringify({
+      goal: 'Forced row',
       status: 'active',
       plan: [{ id: '1', task: 'step one', status: 'in_progress', notes: '' }],
       artifacts: {},
@@ -50,24 +78,34 @@ function legacyRecord(id: string, extra: StateDict = {}): string {
       decisions: [],
       blockers: [],
       next: { action: 'continue', risk: 'safe' },
-    },
-    ...extra,
-  });
+    }),
+    updated_at: '2026-09-07T22:13:55.832Z',
+    ...overrides,
+  };
+  store
+    .database()
+    .prepare(
+      `INSERT INTO task (id, skill, notation, status, goal, state, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, '2026-09-07T18:30:59.046Z', ?)`,
+    )
+    .run(id, row.skill, row.notation, row.status, row.goal, row.state, row.updated_at);
 }
 
 describe('TaskStore.start', () => {
-  it('creates a file and returns a valid state', async () => {
+  it('creates one database row, not one file per task, and returns a valid state', async () => {
     const task = await store.start('Build the feature');
     expect(task.meta.id).toMatch(/^task-/);
     expect(task.state.goal).toBe('Build the feature');
     expect(task.state.status).toBe('active');
     expect(devTaskSchema.safeParse(task.state).success).toBe(true);
 
-    const raw = await readFile(task.meta.path, 'utf-8');
-    const record = JSON.parse(raw) as { id: string; skill: string; state: unknown };
-    expect(record.id).toBe(task.meta.id);
-    expect(record.skill).toBe('dev-task');
-    expect(devTaskSchema.safeParse(record.state).success).toBe(true);
+    expect(task.meta.path).toBe(path.join(dir, 'state.db'));
+    const row = rawRow(task.meta.id);
+    expect(row.skill).toBe('dev-task');
+    expect(devTaskSchema.safeParse(JSON.parse(row.state)).success).toBe(true);
+
+    // The whole root is one database; `-wal`/`-shm` exist only while it is open.
+    expect((await readdir(dir)).sort()).toEqual(['state.db', 'state.db-shm', 'state.db-wal']);
   });
 
   it("creates plan items with sequential ids and 'pending' status", async () => {
@@ -146,9 +184,26 @@ describe('TaskStore.patch', () => {
     expect('old.ts' in (patched.state.artifacts as object)).toBe(false);
   });
 
-  it('throws TaskPatchError with category unknown-key and leaves the file unchanged', async () => {
+  it('rejects a dotted delete key instead of silently changing nothing', async () => {
+    const task = await store.start('Dotted delete');
+    await store.patch({ artifacts: { 'old.ts': 'to remove' } }, task.meta.id);
+    const before = rawRow(task.meta.id);
+
+    await expect(store.patch({ 'artifacts.old.ts': null }, task.meta.id)).rejects.toThrow(
+      TaskPatchError,
+    );
+    try {
+      await store.patch({ 'artifacts.old.ts': null }, task.meta.id);
+    } catch (e) {
+      expect((e as TaskPatchError).category).toBe('unknown-key');
+    }
+
+    expect(rawRow(task.meta.id)).toEqual(before);
+  });
+
+  it('throws TaskPatchError with category unknown-key and leaves the stored row unchanged', async () => {
     const task = await store.start('Invalid patch');
-    const before = await readFile(task.meta.path, 'utf-8');
+    const before = rawRow(task.meta.id);
 
     await expect(store.patch({ bogus: 'nope' }, task.meta.id)).rejects.toThrow(TaskPatchError);
     try {
@@ -158,8 +213,7 @@ describe('TaskStore.patch', () => {
       expect((e as TaskPatchError).category).toBe('unknown-key');
     }
 
-    const after = await readFile(task.meta.path, 'utf-8');
-    expect(after).toBe(before);
+    expect(rawRow(task.meta.id)).toEqual(before);
   });
 
   it('throws TaskPatchError with category guard and records ok:false in history', async () => {
@@ -241,7 +295,7 @@ describe('TaskStore.patch with path keys', () => {
 
   it('rejects a bad path with category path and leaves the state untouched', async () => {
     const task = await store.start('Bad path', { plan: ['one'] });
-    const before = await readFile(task.meta.path, 'utf-8');
+    const before = rawRow(task.meta.id);
 
     await expect(store.patch({ 'plan[7].status': 'done' }, task.meta.id)).rejects.toThrow(
       TaskPatchError,
@@ -254,8 +308,7 @@ describe('TaskStore.patch with path keys', () => {
     }
     await expect(store.patch({ 'goal[0]': 'x' }, task.meta.id)).rejects.toThrow(/array field/);
 
-    const after = await readFile(task.meta.path, 'utf-8');
-    expect(after).toBe(before);
+    expect(rawRow(task.meta.id)).toEqual(before);
 
     const hist = await store.history(task.meta.id);
     expect(hist.every((h) => !h.ok)).toBe(true);
@@ -307,8 +360,7 @@ describe('skills', () => {
     expect(superviseTaskSchema.safeParse(task.state).success).toBe(true);
     expect(devTaskSchema.safeParse(task.state).success).toBe(false);
 
-    const raw = JSON.parse(await readFile(task.meta.path, 'utf-8')) as { skill: string };
-    expect(raw.skill).toBe('supervise-task');
+    expect(rawRow(task.meta.id).skill).toBe('supervise-task');
   });
 
   it('validates each task against its own skill and guard', async () => {
@@ -402,9 +454,7 @@ describe('notation', () => {
   it('persists the notation, defaults to plain, and survives patches', async () => {
     const compact = await store.start('Compact task', { notation: 'compact' });
     expect(compact.meta.notation).toBe('compact');
-    expect(
-      (JSON.parse(await readFile(compact.meta.path, 'utf-8')) as { notation: string }).notation,
-    ).toBe('compact');
+    expect(rawRow(compact.meta.id).notation).toBe('compact');
 
     const patched = await store.patch({ decisions: ['ctx tight -> compact'] }, compact.meta.id);
     expect(patched.meta.notation).toBe('compact');
@@ -467,46 +517,27 @@ describe('the rejection vocabulary', () => {
   });
 });
 
-describe('records written before skills existed', () => {
-  it('reads them as the default skill in plain notation', async () => {
-    await writeFile(path.join(dir, 'task-legacy-0001.json'), legacyRecord('task-legacy-0001'));
-
-    const shown = await store.show('task-legacy-0001');
-    expect(shown.meta.skill).toBe('dev-task');
-    expect(shown.meta.notation).toBe('plain');
-    expect(dev(shown).plan[0]?.status).toBe('in_progress');
-  });
-
-  it('normalizes skill and notation onto the record at the next patch', async () => {
-    await writeFile(path.join(dir, 'task-legacy-0002.json'), legacyRecord('task-legacy-0002'));
-
-    await store.patch({ decisions: ['resumed from an older runtime'] }, 'task-legacy-0002');
-    const raw = JSON.parse(await readFile(path.join(dir, 'task-legacy-0002.json'), 'utf-8')) as {
-      skill: string;
-      notation: string;
-    };
-    expect(raw.skill).toBe('dev-task');
-    expect(raw.notation).toBe('plain');
-  });
-
-  it('lists a legacy record next to new ones and treats it as active', async () => {
-    await writeFile(path.join(dir, 'task-legacy-0003.json'), legacyRecord('task-legacy-0003'));
-    const all = await store.list();
-    expect(all).toHaveLength(1);
-    expect(all[0]?.skill).toBe('dev-task');
-    expect(all[0]?.progressDone).toBe(0);
-    expect(all[0]?.progressTotal).toBe(1);
-    expect(await store.activeId()).toBe('task-legacy-0003');
-  });
-
-  it('refuses a record naming a skill this runtime does not have, and skips it in list', async () => {
-    await writeFile(
-      path.join(dir, 'task-alien-0001.json'),
-      legacyRecord('task-alien-0001', { skill: 'alien-task' }),
-    );
+describe('rows this runtime cannot interpret', () => {
+  it('refuses a row naming a skill it does not have, and skips it in list', async () => {
+    forceRow('task-alien-0001', { skill: 'alien-task' });
 
     await expect(store.show('task-alien-0001')).rejects.toThrow(/does not have/);
     expect(await store.list()).toHaveLength(0);
+  });
+
+  it('refuses a row whose state breaks its own skill schema, and skips it in list', async () => {
+    forceRow('task-bad-schema', { state: JSON.stringify({ goal: 'not a dev-task state' }) });
+
+    await expect(store.show('task-bad-schema')).rejects.toThrow(/does not satisfy/);
+    expect(await store.list()).toHaveLength(0);
+  });
+
+  it('keeps the readable tasks usable next to an unreadable one', async () => {
+    forceRow('task-alien-0002', { skill: 'alien-task' });
+    const good = await store.start('Still reachable');
+
+    expect(await store.activeId()).toBe(good.meta.id);
+    expect((await store.list()).map((task) => task.id)).toEqual([good.meta.id]);
   });
 });
 
@@ -531,9 +562,9 @@ describe('TaskStore.list', () => {
     expect(all[0]!.updatedAt >= all[1]!.updatedAt).toBe(true);
   });
 
-  it('skips corrupted files without throwing', async () => {
+  it('skips a row whose state is not valid JSON without throwing', async () => {
     await store.start('Good task');
-    await writeFile(path.join(dir, 'task-broken-xxxx.json'), '{ not valid json', 'utf-8');
+    forceRow('task-broken-xxxx', { state: '{ not valid json' });
 
     const all = await store.list();
     expect(all).toHaveLength(1);
@@ -566,15 +597,18 @@ describe('TaskStore.history', () => {
   });
 });
 
-describe('TaskStore atomicity and id generation', () => {
-  it('leaves no .tmp files after several patches', async () => {
+describe('TaskStore storage footprint and id generation', () => {
+  it('leaves only the database after several patches, and one file once closed', async () => {
     const task = await store.start('Atomic test');
     await store.patch({ decisions: ['one'] }, task.meta.id);
     await store.patch({ decisions: ['one', 'two'] }, task.meta.id);
     await store.patch({ decisions: ['one', 'two', 'three'] }, task.meta.id);
 
-    const files = await readdir(dir);
-    expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
+    expect((await readdir(dir)).sort()).toEqual(['state.db', 'state.db-shm', 'state.db-wal']);
+
+    // Closing folds the write-ahead log back, so a project at rest is a single file.
+    store.close();
+    expect(await readdir(dir)).toEqual(['state.db']);
   });
 
   it('creates distinct ids and show() returns the newest active task', async () => {
@@ -633,5 +667,30 @@ describe('TaskStore.activeId', () => {
     const active = await store.start('Active');
 
     expect(await store.activeId()).toBe(active.meta.id);
+  });
+});
+
+describe('a root still in the legacy JSON layout', () => {
+  it('refuses to report "no tasks" and names the migrate command instead', async () => {
+    await writeFile(
+      path.join(dir, 'task-legacy-0001.json'),
+      JSON.stringify({
+        id: 'task-legacy-0001',
+        createdAt: '2026-09-07T18:30:59.046Z',
+        updatedAt: '2026-09-07T22:13:55.832Z',
+        state: { goal: 'Task from an older runtime', status: 'active' },
+      }),
+      'utf-8',
+    );
+
+    await expect(store.list()).rejects.toThrow(/legacy JSON layout/);
+    await expect(store.list()).rejects.toThrow(/task migrate --root/);
+    // activeId() goes through list(), so it cannot silently answer "nothing is open".
+    await expect(store.activeId()).rejects.toThrow(/legacy JSON layout/);
+  });
+
+  it('still reports a genuinely empty root as empty', async () => {
+    expect(await store.list()).toEqual([]);
+    expect(await store.activeId()).toBeNull();
   });
 });

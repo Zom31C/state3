@@ -1,7 +1,7 @@
 import type { PatchRejectCategory } from './rejections.js';
 import type { SchemaIssue, Skill } from './skill.js';
 import type { StateDict } from './types.js';
-import { mergeState } from './state.js';
+import { findMalformedDeleteKeys, mergeState } from './state.js';
 
 /**
  * The categories this validator can report. It is a subset of the shared
@@ -26,6 +26,20 @@ export function validatePatch(skill: Skill, state: StateDict, patch: StateDict):
     return { ok: false, category: 'guard', message: guardError };
   }
 
+  const malformedDeletes = findMalformedDeleteKeys(patch);
+  if (malformedDeletes.length > 0) {
+    return {
+      ok: false,
+      category: 'unknown-key',
+      message:
+        'State validation failed: ' +
+        `${malformedDeletes.map((key) => `"${key}"`).join(', ')} is not a field and not a path key, ` +
+        'so deleting it would silently change nothing — only array fields take path keys ' +
+        '("plan[0].notes"); to delete a key inside an object send it nested ' +
+        '({"artifacts": {"the/key": null}}).',
+    };
+  }
+
   const candidate = mergeState(state, patch);
   const parsed = skill.schema.safeParse(candidate);
   if (parsed.success) return { ok: true };
@@ -34,10 +48,15 @@ export function validatePatch(skill: Skill, state: StateDict, patch: StateDict):
   if (issue === undefined) {
     return { ok: false, category: 'schema', message: 'State schema validation failed.' };
   }
-  return { ok: false, category: categorizeIssue(issue.code), message: formatIssue(issue) };
+  return { ok: false, category: issueCategory(issue.code), message: formatIssue(issue) };
 }
 
-function categorizeIssue(code: string): ValidationErrorCategory {
+/**
+ * Maps a zod issue code onto the shared rejection vocabulary. Exported because the
+ * knowledge base validates with zod too, and one mapping keeps a `type-coercion`
+ * meaning the same thing whichever layer refused the write.
+ */
+export function issueCategory(code: string): ValidationErrorCategory {
   switch (code) {
     case 'unrecognized_keys':
       return 'unknown-key';

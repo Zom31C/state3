@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { expandPathPatch, mergeState, parsePathKey, StateStore } from '../../src/core/state.js';
+import {
+  expandPathPatch,
+  findMalformedDeleteKeys,
+  mergeState,
+  parsePathKey,
+  StateStore,
+} from '../../src/core/state.js';
 import type { StateDict } from '../../src/core/types.js';
 
 describe('mergeState', () => {
@@ -76,6 +82,28 @@ describe('mergeState', () => {
       shelf: null,
       count: 2,
     });
+  });
+});
+
+describe('findMalformedDeleteKeys', () => {
+  it('flags a dotted key, which no field can be', () => {
+    expect(findMalformedDeleteKeys({ 'artifacts.src/': null })).toEqual(['artifacts.src/']);
+  });
+
+  it('flags a bracketed key that parses as no path', () => {
+    expect(findMalformedDeleteKeys({ 'plan[x]': null })).toEqual(['plan[x]']);
+  });
+
+  it('leaves a valid path key for path expansion to judge', () => {
+    expect(findMalformedDeleteKeys({ 'plan[0].notes': null })).toEqual([]);
+  });
+
+  it('leaves a plain key alone, so deleting an absent one stays idempotent', () => {
+    expect(findMalformedDeleteKeys({ shelf_7: null, blockers: null })).toEqual([]);
+  });
+
+  it('ignores values that are not null, which the schema rejects on its own', () => {
+    expect(findMalformedDeleteKeys({ 'artifacts.src/': 'x' })).toEqual([]);
   });
 });
 
@@ -272,6 +300,16 @@ describe('expandPathPatch', () => {
     expect(removed.ok).toBe(true);
     if (removed.ok) {
       expect(mergedRows(state, removed.patch).runs?.[0]).toEqual({ id: '1', review: {} });
+    }
+  });
+
+  it('rejects null on a key the element does not have instead of silently doing nothing', () => {
+    const state = { plan: [{ id: '1', notes: 'old' }] };
+    const result = expandPathPatch(state, { 'plan[0].note': null });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain('plan[0].note');
+      expect(result.message).toContain('does not have');
     }
   });
 

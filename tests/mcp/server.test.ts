@@ -206,6 +206,8 @@ describe('createMcpServer over an in-memory transport', () => {
   let primaryRoot: string;
   let workerRoot: string;
   let client: Client;
+  /** Every store the server was given, so afterEach can release the database handles. */
+  let stores: TaskStore[];
 
   /** Text of the content blocks of a tool result. */
   function textOf(result: CallResult): string {
@@ -216,12 +218,18 @@ describe('createMcpServer over an in-memory transport', () => {
       .join('\n');
   }
 
+  function tracked(rootDir: string): TaskStore {
+    const store = new TaskStore(rootDir);
+    stores.push(store);
+    return store;
+  }
+
   async function connect(instructions?: string): Promise<void> {
-    const store = new TaskStore(primaryRoot);
+    const store = tracked(primaryRoot);
     const resolver = createProjectResolver(
       store,
       [{ name: 'worker', rootDir: workerRoot }],
-      (rootDir) => new TaskStore(rootDir),
+      (rootDir) => tracked(rootDir),
     );
     const server =
       instructions === undefined
@@ -233,12 +241,16 @@ describe('createMcpServer over an in-memory transport', () => {
   }
 
   beforeEach(async () => {
+    stores = [];
     primaryRoot = await mkdtemp(resolve(tmpdir(), 'skillstate-primary-'));
     workerRoot = await mkdtemp(resolve(tmpdir(), 'skillstate-worker-'));
   });
 
   afterEach(async () => {
     await client?.close();
+    // Windows will not delete a directory whose database handle is still open, and
+    // closing folds the WAL back so the root is left with the one file.
+    for (const store of stores) store.close();
     await rm(primaryRoot, { recursive: true, force: true });
     await rm(workerRoot, { recursive: true, force: true });
   });
@@ -288,7 +300,12 @@ describe('createMcpServer over an in-memory transport', () => {
     expect(text).toContain('ship the server');
     expect(text).toContain('skills: dev-task, supervise-task');
     expect(text).toContain(`projects: worker (${workerRoot})`);
-    expect(await readdir(primaryRoot)).toHaveLength(1);
+
+    // One database for the whole root, not one file per task. The `-wal`/`-shm`
+    // siblings exist only while a connection is open.
+    const files = await readdir(primaryRoot);
+    expect(files).toContain('state.db');
+    expect(files.filter((file) => !file.startsWith('state.db'))).toEqual([]);
   });
 
   it('routes a call with a project argument to that declared root', async () => {
@@ -300,7 +317,9 @@ describe('createMcpServer over an in-memory transport', () => {
     expect(started.isError).toBe(false);
     expect(textOf(started)).toContain('[supervise-task]');
     expect(textOf(started)).toContain(workerRoot);
-    expect(await readdir(workerRoot)).toHaveLength(1);
+    const workerFiles = await readdir(workerRoot);
+    expect(workerFiles).toContain('state.db');
+    expect(workerFiles.filter((file) => !file.startsWith('state.db'))).toEqual([]);
     expect(await readdir(primaryRoot)).toHaveLength(0);
 
     const listed = await client.callTool({

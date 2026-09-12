@@ -72,6 +72,9 @@ async function runHook({ args = [], env = {}, stdin = null }) {
 
 const runSelfTest = (env = {}) => runHook({ args: ['--self-test', dir], env });
 
+/** `--self-test <dir> <event>`: how a session start is driven by hand, without stdin. */
+const runSelfTestEvent = (event, env = {}) => runHook({ args: ['--self-test', dir, event], env });
+
 /** The injected text, or null when the hook stayed silent. */
 function contextOf(result) {
   if (result.stdout.trim() === '') return null;
@@ -249,15 +252,67 @@ describe('inject-state hook', () => {
     expect(contextOf(result)).toContain('Resume from the task state below');
   });
 
+  it('takes the event from --self-test, so a session start needs no stdin', async () => {
+    await writeTask('task-1.json', record('task-1', devState()));
+
+    const result = await runSelfTestEvent('SessionStart');
+
+    expect(eventOf(result)).toBe('SessionStart');
+    expect(contextOf(result)).toContain('Resume from the task state below');
+    // An event name the hook does not know is the same as none at all.
+    expect(eventOf(await runSelfTestEvent('Nonsense'))).toBe('UserPromptSubmit');
+  });
+
+  it('injects no brief for a legacy JSON root: no database, so no pages', async () => {
+    // The brief comes out of state.db, which this root does not have. Whether a root that does
+    // have one gets a brief, and only at session start, is the smoke script's check: it needs a
+    // build, and this suite must not depend on dist being newer than src.
+    await writeTask('task-1.json', record('task-1', devState()));
+
+    const context = contextOf(await runSelfTestEvent('SessionStart'));
+
+    expect(context).toContain('Task task-1');
+    expect(context).not.toContain('## Project brief (skillstate)');
+  });
+
   it('treats an unknown or missing event as UserPromptSubmit', async () => {
     await writeTask('task-1.json', record('task-1', devState()));
 
     const unknown = await runHook({ stdin: JSON.stringify({ hook_event_name: 'Stop', cwd: dir }) });
     expect(eventOf(unknown)).toBe('UserPromptSubmit');
 
-    const garbage = await runHook({ stdin: 'not json at all' });
+    // Garbage on stdin means no cwd either, so the hook falls back to the process cwd. Pin
+    // the state directory, or this asserts against whatever the developer's own project holds.
+    const garbage = await runHook({
+      stdin: 'not json at all',
+      env: { SKILLSTATE_STATE_DIR: stateDir },
+    });
     expect(garbage.code).toBe(0);
     expect(eventOf(garbage)).toBe('UserPromptSubmit');
+  });
+
+  it('warns on stderr, and injects nothing, when state.db cannot be read', async () => {
+    await writeFile(join(stateDir, 'state.db'), 'this is not a database\n', 'utf8');
+
+    const result = await runSelfTest();
+
+    // A hook must cost the turn nothing — but it must not fail silently either, or Σ just
+    // stops appearing with nothing anywhere to say why.
+    expect(result.code).toBe(0);
+    expect(result.stdout.trim()).toBe('');
+    expect(result.stderr).toContain('state.db');
+  });
+
+  it('does not fall back to legacy JSON once the root has a database', async () => {
+    await writeTask('task-1.json', record('task-1', devState()));
+    await writeFile(join(stateDir, 'state.db'), 'this is not a database\n', 'utf8');
+
+    const result = await runSelfTest();
+
+    // The database is what the tools read, so injecting the JSON beside it would show the
+    // model a state it cannot patch.
+    expect(result.stdout.trim()).toBe('');
+    expect(result.stderr).toContain('state.db');
   });
 
   it('honours SKILLSTATE_STATE_DIR over the reported cwd', async () => {

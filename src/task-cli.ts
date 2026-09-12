@@ -1,6 +1,8 @@
 import { resolve } from 'node:path';
 import type { StateDict } from './core/types.js';
 import { formatRuntimeInfo, runtimeInfo } from './runtime-info.js';
+import { formatDoctorReport, inspectStateRoot } from './tasks/doctor.js';
+import { formatMigrationReport, migrateRootToDatabase } from './tasks/migrate.js';
 import { isNotation, NOTATIONS } from './tasks/notation.js';
 import { describeProjects, parseProjectsSpec } from './tasks/projects.js';
 import { renderTaskHead } from './tasks/render.js';
@@ -10,9 +12,21 @@ import { TaskStore } from './tasks/store.js';
 export type TaskStorePort = Pick<
   TaskStore,
   'start' | 'show' | 'patch' | 'finish' | 'list' | 'history' | 'activeId'
->;
+> & {
+  /** Optional so test fakes stay small; the CLI closes it to release the database file. */
+  close?(): void;
+};
 
-export const TASK_SUBCOMMANDS = ['start', 'show', 'patch', 'finish', 'list', 'history'] as const;
+export const TASK_SUBCOMMANDS = [
+  'start',
+  'show',
+  'patch',
+  'finish',
+  'list',
+  'history',
+  'migrate',
+  'doctor',
+] as const;
 export type TaskSubcommand = (typeof TASK_SUBCOMMANDS)[number];
 
 export const DEFAULT_TASK_ROOT = '.skillstate';
@@ -30,6 +44,8 @@ export interface TaskCliOptions {
   notation: string | null;
   /** Declared project whose root replaces `--root`; see SKILLSTATE_PROJECTS. */
   project: string | null;
+  /** With `migrate`: delete the legacy JSON files instead of archiving them. */
+  purge: boolean;
   fromStdin: boolean;
   /** Print the help text and touch no state. */
   help: boolean;
@@ -95,6 +111,7 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
   let notation: string | null = null;
   let project: string | null = null;
   let help = false;
+  let purge = false;
   const plan: string[] = [];
   const positional: string[] = [];
 
@@ -130,6 +147,9 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
       case '--project':
         project = takeValue(token);
         break;
+      case '--purge':
+        purge = true;
+        break;
       case '--help':
       case '-h':
         help = true;
@@ -164,6 +184,7 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
       skill,
       notation,
       project,
+      purge,
       fromStdin: false,
       help: true,
     };
@@ -185,6 +206,7 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
     skill,
     notation,
     project,
+    purge,
     fromStdin: false,
     help: false,
   };
@@ -222,8 +244,12 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
   if (options.plan.length > 0 && subcommand !== 'start') {
     throw new Error('--plan is only valid for task start');
   }
-  if (options.id !== null && (subcommand === 'start' || subcommand === 'list')) {
+  const TAKES_ID: readonly TaskSubcommand[] = ['show', 'patch', 'finish', 'history'];
+  if (options.id !== null && !TAKES_ID.includes(subcommand)) {
     throw new Error(`--id is not valid for task ${subcommand}`);
+  }
+  if (options.purge && subcommand !== 'migrate') {
+    throw new Error('--purge is only valid for task migrate');
   }
   if (options.skill !== null && subcommand !== 'start') {
     throw new Error('--skill is only valid for task start');
@@ -249,6 +275,9 @@ const SUBCOMMAND_HELP: Record<TaskSubcommand, string> = {
   finish: 'mark the task done and append the summary to decisions',
   list: 'list tasks with skill, status, progress, and the build that is answering',
   history: 'print the audit trail of patches, rejected ones included; --limit N',
+  migrate: 'move legacy <id>.json + <id>.history.jsonl into state.db; archives them unless --purge',
+  doctor:
+    'report on the state root: integrity, schema version, counts, unreadable or dangling rows',
 };
 
 /** Flags the help prints; a test feeds each one back to parseTaskArgs. */
@@ -260,6 +289,7 @@ const FLAG_HELP: readonly (readonly [flag: string, text: string])[] = [
   ['--skill <name>', 'skill for start; task list prints the ones this runtime has'],
   ['--notation <name>', 'how to write Σ: plain prose or compact pseudocode'],
   ['--limit <n>', 'history entries to print (default 20)'],
+  ['--purge', 'with migrate: delete the legacy files instead of moving them into an archive'],
 ];
 
 /** The documented flags, as parseTaskArgs spells them. */
@@ -328,8 +358,34 @@ function describeFailure(err: unknown): string {
 }
 
 async function executeTaskCommand(options: TaskCliOptions, deps: TaskCliDeps): Promise<void> {
-  const store = deps.createStore(resolveTaskRoot(options, process.env));
+  const root = resolveTaskRoot(options, process.env);
 
+  // migrate and doctor work on the state root itself: migrate writes rows verbatim, and
+  // doctor has to be able to report on a database it cannot fully open.
+  if (options.subcommand === 'migrate') {
+    deps.log(formatMigrationReport(await migrateRootToDatabase(root, { purge: options.purge })));
+    return;
+  }
+  if (options.subcommand === 'doctor') {
+    deps.log(formatDoctorReport(await inspectStateRoot(root)));
+    return;
+  }
+
+  const store = deps.createStore(root);
+  try {
+    await runStoreCommand(options, store, deps);
+  } finally {
+    // Release the database file: on Windows an open handle is what stops a project from
+    // being moved, archived or deleted, and it is what leaves the -wal sibling behind.
+    store.close?.();
+  }
+}
+
+async function runStoreCommand(
+  options: TaskCliOptions,
+  store: TaskStorePort,
+  deps: TaskCliDeps,
+): Promise<void> {
   switch (options.subcommand) {
     case 'start': {
       const goal = options.goal;
@@ -389,6 +445,10 @@ async function executeTaskCommand(options: TaskCliOptions, deps: TaskCliDeps): P
       deps.log(formatHistory(entries));
       return;
     }
+    case 'migrate':
+    case 'doctor':
+      // Both act on the state root itself and are handled before the store is opened.
+      return;
   }
 }
 

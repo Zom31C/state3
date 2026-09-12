@@ -4,13 +4,21 @@
 // so long tasks survive compaction and restarts, and optionally blocks risky tool
 // calls while the active task marks its next action as destructive/external.
 //
-// Self-contained on purpose: the file is copied into `.opencode/plugins/`, so it
-// must not import anything from the skillstate repository.
+// A root that holds `state.db` is read through the skillstate build (`readInjection` in
+// `dist/tasks/inject.js`), because reading SQLite needs the driver — the same route the Qwen
+// Code hook takes, resolved by `SKILLSTATE_HOME` or by walking up from this file. Such a root is
+// authoritative: the JSON files beside it are the archive migration left behind, and injecting
+// them would show a Σ that is already out of date. The legacy JSON layout is still read here, so
+// a project that has not migrated needs no build at all — and only that half is self-contained.
+import { existsSync } from 'node:fs';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const STATE_DIRNAME = '.skillstate';
+const STATE_DB_FILENAME = 'state.db';
+/** Proves a directory is a built skillstate repository, as far as this plugin is concerned. */
+const INJECT_MARKER = join('dist', 'tasks', 'inject.js');
 // Above this size Σ stops being an O(1) prompt component, so the agent is told to compress it.
 const STATE_SIZE_HINT_CHARS = 4000;
 const GUARDED_TOOLS = new Set(['bash', 'write', 'edit', 'patch']);
@@ -41,25 +49,134 @@ async function loadActiveTask(stateDir) {
   return best;
 }
 
-function stateBlock(record, purpose) {
+/** The skillstate build to read a database through, or null when there is none to find. */
+function findBuildHome() {
+  const fromEnv = process.env.SKILLSTATE_HOME;
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') {
+    const candidate = resolve(fromEnv);
+    if (existsSync(join(candidate, INJECT_MARKER))) return candidate;
+  }
+  // Walking up only helps while the plugin runs in place (this repository, its tests, a
+  // `--self-test`); a copy inside `.opencode/plugins/` is found through SKILLSTATE_HOME alone.
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let depth = 0; depth < 8; depth++) {
+    if (existsSync(join(dir, INJECT_MARKER))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+// Resolved once per process: opencode loads the plugin at startup and then calls the hooks on
+// every request, and an import that failed once (a runtime refusing the native driver, say)
+// must not be retried — nor silently re-fail — on each of them.
+let readerPromise = null;
+
+function reader() {
+  readerPromise ??= (async () => {
+    const home = findBuildHome();
+    if (home === null) return null;
+    try {
+      return await import(pathToFileURL(join(home, INJECT_MARKER)).href);
+    } catch {
+      return null;
+    }
+  })();
+  return readerPromise;
+}
+
+/**
+ * What one state root holds, ready to inject: `{ head, brief, risk }`, or `{ warn }` when the
+ * root holds a database this plugin cannot read, or null when there is nothing to inject.
+ *
+ * `warn` is reported rather than swallowed: a root that holds Σ but cannot be read means the
+ * model silently stops seeing its own progress, and nothing else in the session would say why.
+ */
+async function loadContext(stateDir, wantBrief) {
+  const dbPath = join(stateDir, STATE_DB_FILENAME);
+  if (existsSync(dbPath)) {
+    const module = await reader();
+    if (module === null || typeof module.readInjection !== 'function') {
+      return {
+        warn:
+          `${dbPath} needs the skillstate build: run "npm run build" in the repository ` +
+          'and set SKILLSTATE_HOME to it',
+      };
+    }
+    let injection;
+    try {
+      injection = module.readInjection(stateDir, { brief: wantBrief === true });
+    } catch (err) {
+      return { warn: `cannot read ${dbPath}: ${err?.message ?? String(err)}` };
+    }
+    if (injection === null || typeof injection !== 'object') return null;
+    if (injection.kind === 'context') {
+      return {
+        head: typeof injection.task === 'string' ? injection.task : null,
+        brief: typeof injection.brief === 'string' ? injection.brief : null,
+        risk: typeof injection.risk === 'string' ? injection.risk : null,
+      };
+    }
+    // A build from before the brief and the risk existed answers with Σ alone, under its own
+    // kind. Accepted rather than dropped: losing Σ silently is the failure this plugin exists to
+    // prevent, and the guard then degrades to not blocking instead of blocking everything.
+    if (injection.kind === 'head') return { head: injection.text, brief: null, risk: null };
+    if (injection.kind === 'unreadable') {
+      return { warn: `cannot read ${dbPath}: ${String(injection.reason)}` };
+    }
+    return null;
+  }
+
+  const record = await loadActiveTask(stateDir);
+  if (record === null) return null;
   const compact = JSON.stringify(record.state);
-  const lead =
-    purpose === 'compacting'
-      ? 'The conversation is about to be compacted. The task state below is the authoritative record of progress — keep it in the summary.'
-      : 'Authoritative progress record for the active task (the transcript may be incomplete):';
-  return [
-    '## Active task state (skillstate)',
-    lead,
-    `Task ${record.id} (${record.state.status}):`,
-    compact,
-    compact.length > STATE_SIZE_HINT_CHARS
-      ? `Σ is ${compact.length} chars — compress it: keep only what future steps need and reduce finished work to its outcome.`
-      : '',
-    'After every meaningful step call the task_patch tool with only the changed fields (null deletes a key; arrays are replaced wholesale; exactly one plan item in_progress).',
-    'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.',
-  ]
+  return {
+    head: [
+      `Task ${record.id} (${record.state.status}):`,
+      compact,
+      compact.length > STATE_SIZE_HINT_CHARS
+        ? `Σ is ${compact.length} chars — compress it: keep only what future steps need and reduce finished work to its outcome.`
+        : '',
+    ]
+      .filter((line) => line !== '')
+      .join('\n'),
+    brief: null,
+    risk: typeof record.state?.next?.risk === 'string' ? record.state.next.risk : null,
+  };
+}
+
+function leadFor(purpose) {
+  return purpose === 'compacting'
+    ? 'The conversation is about to be compacted. The task state below is the authoritative record of progress — keep it in the summary.'
+    : 'Authoritative progress record for the active task (the transcript may be incomplete):';
+}
+
+/** The two rules a host that injects Σ without the procedure P still has to carry. */
+const REMINDERS = [
+  'After every meaningful step call the task_patch tool with only the changed fields (null deletes a key; arrays are replaced wholesale; exactly one plan item in_progress).',
+  'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.',
+];
+
+function stateBlock(head, purpose) {
+  return ['## Active task state (skillstate)', leadFor(purpose), head, ...REMINDERS]
     .filter((line) => line !== '')
     .join('\n');
+}
+
+/**
+ * The knowledge-base map: one line per page, no bodies.
+ *
+ * Injected at a session's first request and at compaction, never on every request — the map is
+ * worth its tokens once, and at compaction because the summary is what a resumed session starts
+ * from. The lead says how old the snapshot is: a page written since then is newer than it.
+ */
+function briefBlock(brief) {
+  return [
+    '## Project brief (skillstate)',
+    'What this project has written down for an agent with no context, as one line per page — a snapshot taken when this session started, so a page changed since then is newer than this.',
+    brief,
+  ].join('\n');
 }
 
 // opencode reports worktree "/" for a project that is not a git repository
@@ -117,30 +234,43 @@ export const Skillstate = async ({ directory, worktree, project, client }) => {
     }
   };
 
-  const readBlock = async (purpose) => {
+  /** Sessions that already got the brief: it is a map, not something to pay for every turn. */
+  const briefed = new Set();
+
+  /** The blocks to inject for one hook call: Σ always, the brief once per session and at compaction. */
+  const readBlocks = async (purpose, input) => {
     try {
-      const record = await loadActiveTask(stateDir);
-      return record === null ? null : stateBlock(record, purpose);
+      const key = typeof input?.sessionID === 'string' ? input.sessionID : 'default';
+      const wantBrief = purpose === 'compacting' || !briefed.has(key);
+      const context = await loadContext(stateDir, wantBrief);
+      if (context === null) return [];
+      if (context.warn !== undefined) {
+        await log('warn', context.warn);
+        return [];
+      }
+      if (context.brief !== null) briefed.add(key);
+      const blocks = [];
+      if (context.head !== null) blocks.push(stateBlock(context.head, purpose));
+      if (context.brief !== null) blocks.push(briefBlock(context.brief));
+      return blocks;
     } catch (err) {
       await log('debug', `state read failed: ${err?.message ?? String(err)}`);
-      return null;
+      return [];
     }
   };
 
   const hooks = {
     // Documented: extra context strings are appended to the compaction prompt.
-    'experimental.session.compacting': async (_input, output) => {
-      const block = await readBlock('compacting');
-      if (block !== null) output.context.push(block);
+    'experimental.session.compacting': async (input, output) => {
+      for (const block of await readBlocks('compacting', input)) output.context.push(block);
     },
   };
 
   // Present in the 1.18.26 plugin typings (not in the public docs): the system
   // prompt of every request, which keeps Σ in context turn by turn.
   if (process.env.SKILLSTATE_NO_SYSTEM !== '1') {
-    hooks['experimental.chat.system.transform'] = async (_input, output) => {
-      const block = await readBlock('system');
-      if (block !== null) output.system.push(block);
+    hooks['experimental.chat.system.transform'] = async (input, output) => {
+      for (const block of await readBlocks('system', input)) output.system.push(block);
     };
   }
 
@@ -148,8 +278,8 @@ export const Skillstate = async ({ directory, worktree, project, client }) => {
   if (guarded) {
     hooks['tool.execute.before'] = async (input) => {
       if (!GUARDED_TOOLS.has(input.tool)) return;
-      const record = await loadActiveTask(stateDir).catch(() => null);
-      const risk = record?.state?.next?.risk;
+      const context = await loadContext(stateDir, false).catch(() => null);
+      const risk = context?.risk;
       if (typeof risk === 'string' && RISKY.has(risk)) {
         throw new Error(
           `skillstate: the active task marks its next action as "${risk}". ` +
@@ -161,7 +291,8 @@ export const Skillstate = async ({ directory, worktree, project, client }) => {
 
   await log(
     'info',
-    `loaded (state: ${stateDir}, system injection: ${process.env.SKILLSTATE_NO_SYSTEM !== '1'}, guard: ${guarded})`,
+    `loaded (state: ${stateDir}, build: ${findBuildHome() ?? 'none — legacy JSON only'}, ` +
+      `system injection: ${process.env.SKILLSTATE_NO_SYSTEM !== '1'}, guard: ${guarded})`,
   );
   return hooks;
 };
@@ -175,13 +306,22 @@ if (invokedDirectly && process.argv.includes('--self-test')) {
   const dir = process.argv[at + 1];
   const projectDir = dir === undefined || dir.startsWith('-') ? process.cwd() : dir;
   const stateDir = resolveStateDir(projectDir);
-  const record = await loadActiveTask(stateDir);
-  if (record === null) {
-    console.log(`no active task in ${stateDir}`);
+  // The brief is asked for, so a database root shows both halves a session start would get.
+  const context = await loadContext(stateDir, true);
+  if (context === null) {
+    console.log(`nothing to inject in ${stateDir} (no open task, no pages)`);
+  } else if (context.warn !== undefined) {
+    console.log(`warning: ${context.warn}`);
   } else {
-    console.log('--- experimental.chat.system.transform ---');
-    console.log(stateBlock(record, 'system'));
-    console.log('\n--- experimental.session.compacting ---');
-    console.log(stateBlock(record, 'compacting'));
+    const sections = [
+      ['experimental.chat.system.transform', 'system'],
+      ['experimental.session.compacting', 'compacting'],
+    ];
+    for (const [hook, purpose] of sections) {
+      console.log(`--- ${hook} ---`);
+      if (context.head !== null) console.log(stateBlock(context.head, purpose));
+      if (context.brief !== null) console.log(briefBlock(context.brief));
+      console.log('');
+    }
   }
 }

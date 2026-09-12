@@ -3,13 +3,26 @@
 // task state so the model sees Σ instead of relying on the transcript. When
 // SKILLSTATE_PROJECTS declares further roots, their active tasks are injected too,
 // so a supervising session sees each worker's Σ without a tool call.
+// On SessionStart it also injects the project brief — the knowledge base as one line per
+// page — because that is the one moment the transcript holds nothing to orient by. On every
+// other event the brief stays out: the session has already seen it, and paying for it again
+// on each prompt would cost more than the map is worth.
 // Never blocks a turn — on any problem it prints nothing and exits 0.
-// Standalone by design: the extension can be installed outside the repository, so
-// the record shape and the wording of src/tasks/* are mirrored here, not imported.
+// Σ lives in the project's state.db, and reading SQLite needs the driver, so a root that
+// has one is read through the repository build (dist/tasks/inject.js). The legacy JSON
+// layout is still read here: that keeps an un-migrated root working, and keeps the hook
+// usable by an extension installed without the repository. Only that half is standalone,
+// mirroring the record shape and the wording of src/tasks/* instead of importing them.
+// A legacy root has no database and therefore no pages, so it never has a brief to inject.
+import { existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { INJECT_MARKER, findSkillstateHome } from '../lib/home.mjs';
 
 const STATE_DIRNAME = '.skillstate';
+/** Mirrors STATE_DB_FILENAME in src/db/database.ts. */
+const STATE_DB_FILENAME = 'state.db';
 const KNOWN_EVENTS = new Set(['UserPromptSubmit', 'PreCompact', 'SessionStart']);
 // Above this size Σ stops being an O(1) prompt component, so the agent is told to compress it.
 const STATE_SIZE_HINT_CHARS = 4000;
@@ -104,6 +117,75 @@ function taskLines(record) {
   ].filter((line) => line !== '');
 }
 
+/** The compiled reader, or null when this extension cannot reach a build. Resolved once. */
+let injectModule;
+async function reader() {
+  if (injectModule !== undefined) return injectModule;
+  const home = findSkillstateHome(import.meta.url, INJECT_MARKER);
+  if (home === null) {
+    injectModule = null;
+  } else {
+    try {
+      injectModule = await import(pathToFileURL(join(home, INJECT_MARKER)).href);
+    } catch {
+      // A build that will not load is the same, from here, as no build at all.
+      injectModule = null;
+    }
+  }
+  return injectModule;
+}
+
+/**
+ * What to inject for one state root, or null when there is nothing to inject.
+ *
+ * A root with a database is read through the build and is authoritative: migration archives
+ * the JSON it replaced, so falling back to those files would inject a state that is already
+ * out of date. `warn` is a line for stderr — a root that holds Σ but cannot be read must not
+ * fail silently, because the model would simply stop seeing its own progress and nothing in
+ * the turn would say why.
+ *
+ * `wantBrief` asks for the knowledge-base brief as well, which only a session start does.
+ */
+async function injectionFor(rootDir, wantBrief) {
+  const dbPath = join(rootDir, STATE_DB_FILENAME);
+  if (existsSync(dbPath)) {
+    const module = await reader();
+    if (module === null || typeof module.readInjection !== 'function') {
+      return {
+        warn:
+          `${dbPath} needs the skillstate build: run "npm run build" in the repository, ` +
+          'or set SKILLSTATE_HOME to it',
+      };
+    }
+    let injection;
+    try {
+      injection = wantBrief
+        ? module.readInjection(rootDir, { brief: true })
+        : module.readInjection(rootDir);
+    } catch (err) {
+      return { warn: `cannot read ${dbPath}: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    if (injection === null || typeof injection !== 'object') return null;
+    if (injection.kind === 'context') {
+      return {
+        task: typeof injection.task === 'string' ? injection.task : null,
+        brief: typeof injection.brief === 'string' ? injection.brief : null,
+      };
+    }
+    // A build from before the brief existed answers with Σ alone under its own kind. Accepted
+    // rather than dropped: an extension and a SKILLSTATE_HOME build are not upgraded together,
+    // and losing Σ silently is the one failure this hook must not have.
+    if (injection.kind === 'head') return { task: injection.text, brief: null };
+    if (injection.kind === 'unreadable') {
+      return { warn: `cannot read ${dbPath}: ${String(injection.reason)}` };
+    }
+    return null;
+  }
+
+  const record = await loadActiveTask(rootDir);
+  return record === null ? null : { task: taskLines(record).join('\n'), brief: null };
+}
+
 /**
  * Mirrors parseProjectsSpec, but leniently: `null` means "skip the projects section
  * entirely". A bad declaration from the environment must never fail a turn.
@@ -164,14 +246,29 @@ function leadFor(event) {
   return 'Authoritative progress record for the active task (the transcript may be incomplete):';
 }
 
-// `--self-test [dir]` skips the stdin event so the hook can be run by hand.
+/**
+ * The brief, as its own section. The lead says what the text is and how old it is: a page
+ * written later in the session is newer than this snapshot, and an agent that treats the
+ * brief as live would argue with the project's own database.
+ */
+function briefSection(brief) {
+  return [
+    '## Project brief (skillstate)',
+    'What this project has written down for an agent with no context, as one line per page — a snapshot taken at session start, so a page changed since then is newer than this.',
+    brief,
+  ].join('\n');
+}
+
+// `--self-test [dir] [event]` skips the stdin event so the hook can be run by hand. An unknown
+// event name is safe here: it falls through to UserPromptSubmit exactly as a bad event would.
 const selfTestAt = process.argv.indexOf('--self-test');
 let event = {};
 if (selfTestAt !== -1) {
   const dir = process.argv[selfTestAt + 1];
+  const name = process.argv[selfTestAt + 2];
   event = {
     cwd: dir === undefined ? process.cwd() : resolve(dir),
-    hook_event_name: 'UserPromptSubmit',
+    hook_event_name: name === undefined ? 'UserPromptSubmit' : name,
   };
 } else {
   try {
@@ -194,23 +291,36 @@ const eventName = KNOWN_EVENTS.has(event.hook_event_name)
   : 'UserPromptSubmit';
 
 const sections = [];
+/** One line per root that holds Σ but could not be read. Goes to stderr, never to stdout. */
+const warnings = [];
+
+// This root only, and on a session start only. A supervising session gets each worker's Σ
+// injected, but not each worker's knowledge base: that would multiply the brief by the number
+// of projects, and project_brief {"project":"<name>"} is one call away when it is really needed.
+const wantBrief = eventName === 'SessionStart';
 
 let primary = null;
 try {
-  primary = await loadActiveTask(stateDir);
+  primary = await injectionFor(stateDir, wantBrief);
 } catch {
   primary = null;
 }
-if (primary !== null) {
+if (primary !== null && primary.warn !== undefined) warnings.push(primary.warn);
+if (primary !== null && typeof primary.task === 'string') {
   sections.push(
     [
       '## Active task state (skillstate)',
       leadFor(eventName),
-      ...taskLines(primary),
+      primary.task,
       'After every meaningful step call task_patch with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one — without resending the array; exactly one plan item in_progress).',
       'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.',
     ].join('\n'),
   );
+}
+// Σ first, the brief second: a resumed session is here to continue, and the map is what it
+// reads once it knows what it is continuing.
+if (primary !== null && typeof primary.brief === 'string') {
+  sections.push(briefSection(primary.brief));
 }
 
 // Supervised projects: their Σ is injected as well, so the supervising session does
@@ -229,8 +339,14 @@ if (typeof projectsSpec === 'string' && projectsSpec.trim() !== '') {
       entries.map(async (entry) => {
         try {
           if (sameRoot(entry.rootDir, stateDir)) return null;
-          const record = await loadActiveTask(entry.rootDir);
-          return record === null ? null : { entry, record };
+          // No brief for a supervised root: see wantBrief above.
+          const injection = await injectionFor(entry.rootDir, false);
+          if (injection === null) return null;
+          if (injection.warn !== undefined) {
+            warnings.push(injection.warn);
+            return null;
+          }
+          return typeof injection.task === 'string' ? { entry, text: injection.task } : null;
         } catch {
           return null;
         }
@@ -238,7 +354,7 @@ if (typeof projectsSpec === 'string' && projectsSpec.trim() !== '') {
     );
     const subsections = loaded
       .filter((item) => item !== null)
-      .map((item) => [`### ${item.entry.name} — ${item.entry.rootDir}`, ...taskLines(item.record)]);
+      .map((item) => [`### ${item.entry.name} — ${item.entry.rootDir}`, item.text]);
     if (subsections.length > 0) {
       sections.push(
         [
@@ -251,10 +367,18 @@ if (typeof projectsSpec === 'string' && projectsSpec.trim() !== '') {
   }
 }
 
-if (sections.length === 0) process.exit(0);
+for (const line of warnings) process.stderr.write(`skillstate: ${line}\n`);
 
-process.stdout.write(
-  `${JSON.stringify({
-    hookSpecificOutput: { hookEventName: eventName, additionalContext: sections.join('\n\n') },
-  })}\n`,
-);
+if (sections.length > 0) {
+  process.stdout.write(
+    `${JSON.stringify({
+      hookSpecificOutput: { hookEventName: eventName, additionalContext: sections.join('\n\n') },
+    })}\n`,
+  );
+}
+
+// Exit explicitly: the host may leave stdin open, and a hook that waits for it runs into its
+// timeout instead of letting the turn proceed. Skipped when a warning was just written —
+// process.exit() can drop a pending stderr write, and that line is the only clue a user gets
+// as to why Σ stopped being injected.
+if (warnings.length === 0) process.exit(0);

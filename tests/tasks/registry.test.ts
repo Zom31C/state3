@@ -196,6 +196,7 @@ describe('a custom registry driving TaskStore', () => {
   });
 
   afterEach(async () => {
+    store.close();
     await rm(dir, { recursive: true, force: true });
   });
 

@@ -61,6 +61,26 @@ export function parsePathKey(key: string): PathTarget | null {
 
 export type PathPatchResult = { ok: true; patch: StateDict } | { ok: false; message: string };
 
+/**
+ * Lists the top-level keys a patch tries to delete with `null` but that cannot
+ * name a state field: they look like a path (dotted or bracketed) yet parse as
+ * none.
+ *
+ * Why: `mergeState` deletes before anything validates, so `{"artifacts.src/":
+ * null}` — what an agent writes when it assumes objects are addressable like
+ * arrays — used to vanish without a trace while the patch reported success. The
+ * agent then keeps reading the entry it believes it removed.
+ *
+ * A plain key that is merely absent stays legal: domains where "empty" means
+ * "not in Σ" (the warehouse shelves) delete idempotently. The check is
+ * syntactic, so it needs nothing from the schema.
+ */
+export function findMalformedDeleteKeys(patch: StateDict): string[] {
+  return Object.entries(patch)
+    .filter(([key, value]) => value === null && parsePathKey(key) === null && /[.[]/.test(key))
+    .map(([key]) => key);
+}
+
 function assignAtTail(
   element: StateDict,
   tail: readonly string[],
@@ -85,8 +105,15 @@ function assignAtTail(
   }
   const leaf = tail[tail.length - 1];
   if (leaf === undefined) return `path "${key}": empty key after the index`;
-  if (value === null) delete node[leaf];
-  else node[leaf] = structuredClone(value);
+  if (value === null) {
+    if (!(leaf in node)) {
+      return (
+        `path "${key}": null deletes "${leaf}", which that item does not have — ` +
+        'a misspelled key would silently change nothing; task_show prints the current state'
+      );
+    }
+    delete node[leaf];
+  } else node[leaf] = structuredClone(value);
   return null;
 }
 

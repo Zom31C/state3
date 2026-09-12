@@ -9,8 +9,13 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult, ListToolsResult, Tool } from '@modelcontextprotocol/sdk/types.js';
-import type { ProjectEntry, StoreResolver } from '../tasks/ports.js';
+import type { ProjectEntry, StoreResolver, TaskStorePort } from '../tasks/ports.js';
 import { parseProjectsSpec } from '../tasks/projects.js';
+import type { TaskStore } from '../tasks/store.js';
+import type { DatabaseOwner, KbResolver, KbStores } from '../kb/ports.js';
+import { LinkStore } from '../kb/links.js';
+import { PageStore } from '../kb/store.js';
+import { createKbTools } from './kb-tools.js';
 import { createTaskTools } from './tools.js';
 import type { TaskToolDefinition } from './tools.js';
 
@@ -22,9 +27,11 @@ const SERVER_INFO = { name: 'skillstate', version: '0.2.0' };
  */
 export const RUNTIME_INSTRUCTIONS: string = `skillstate keeps the progress of long-horizon work in an external state Σ that is validated on every write, instead of in the conversation transcript, so it survives compaction and restarts.
 
-Tools: task_start, task_show, task_patch, task_finish, task_list, task_history.
+Tools: task_start, task_show, task_patch, task_finish, task_list, task_history, project_brief, page, search.
 Each task names a skill, and the skill owns the Σ schema, the domain rules and the procedure P — "dev-task" implements work in a project, "supervise-task" reviews work another agent does. Call task_show to read Σ together with the P of that task, call task_patch after every meaningful step with only the fields that changed, and call task_list to see the skills and projects this runtime knows.
-A rejected patch never modifies the state: read the diagnostic category, fix the patch, retry. Set next.risk before acting, and ask the user before any "destructive" or "external" action.`;
+A rejected patch never modifies the state: read the diagnostic category, fix the patch, retry. Set next.risk before acting, and ask the user before any "destructive" or "external" action.
+
+The same file holds the project's knowledge base: pages saying what the project is, what the user wants from it, how to start working in it, what a feature does and why a decision was taken. Call project_brief first when you have no context — it is one line per page inside a fixed budget. If it reports that the project has no knowledge base, page {"op":"init"} scaffolds the three reserved pages as templates to fill in. Then search before reading anything in full, page with op "get" to read one, and op "put" to write down what you learned. Keep a page summary to one informative line: it is all a cold agent sees before deciding whether to open the page.`;
 
 const USAGE = `skillstate MCP server (stdio transport)
 
@@ -45,7 +52,8 @@ Environment:
                         the tools can follow a worker in another project without
                         ever writing to an arbitrary directory.
 
-Tools: task_start, task_show, task_patch, task_finish, task_list, task_history.
+Tools: task_start, task_show, task_patch, task_finish, task_list, task_history, project_brief,
+       page, search.
 `;
 
 function toToolDescriptor(tool: TaskToolDefinition): Tool {
@@ -58,14 +66,16 @@ function toToolDescriptor(tool: TaskToolDefinition): Tool {
 }
 
 /**
- * Registers the six task tools on a low-level `Server`: it accepts plain JSON
- * Schema tool definitions, whereas `McpServer.registerTool` requires Zod schemas.
+ * Registers the task tools — and the knowledge-base tools, when a resolver for them is
+ * given — on a low-level `Server`: it accepts plain JSON Schema tool definitions, whereas
+ * `McpServer.registerTool` requires Zod schemas.
  */
 export function createMcpServer(
   resolver: StoreResolver,
   instructions: string = RUNTIME_INSTRUCTIONS,
+  kb?: KbResolver,
 ): Server {
-  const tools = createTaskTools(resolver);
+  const tools = [...createTaskTools(resolver), ...(kb === undefined ? [] : createKbTools(kb))];
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
 
   const server = new Server(SERVER_INFO, {
@@ -151,6 +161,22 @@ export function resolveProjectEntries(
   return entries;
 }
 
+/**
+ * The knowledge base borrows the task store's connection instead of opening its own. A store
+ * that cannot lend one has no pages to serve, and saying so up front beats failing later on a
+ * query with no database behind it.
+ */
+function asDatabaseOwner(store: TaskStorePort): DatabaseOwner {
+  const candidate = store as Partial<DatabaseOwner>;
+  if (typeof candidate.database !== 'function' || typeof candidate.readable !== 'function') {
+    throw new Error(
+      'this state root has no knowledge base: its task store does not expose a database connection',
+    );
+  }
+  // The port says nothing about connections; the concrete store always has both.
+  return store as unknown as DatabaseOwner;
+}
+
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<void> {
   const options = parseServerArgs(argv);
   if (options.help) {
@@ -167,15 +193,41 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   ]);
 
   const skills = builtinSkillRegistry();
-  const primary = new TaskStore(options.root, skills);
+  // Every store this process opens, so shutdown can release the database files.
+  const opened: TaskStore[] = [];
+  const track = (store: TaskStore): TaskStore => {
+    opened.push(store);
+    return store;
+  };
+
+  const primary = track(new TaskStore(options.root, skills));
   const projects = resolveProjectEntries(options.projects);
-  const resolver = createProjectResolver(
-    primary,
-    projects,
-    (rootDir) => new TaskStore(rootDir, skills),
+  const resolver = createProjectResolver(primary, projects, (rootDir) =>
+    track(new TaskStore(rootDir, skills)),
   );
 
-  const server = createMcpServer(resolver);
+  // The knowledge base of each root, borrowing the connection the task store already opened.
+  // Cached per store instance, which resolve() hands back unchanged for a given project.
+  const kbStores = new WeakMap<TaskStorePort, KbStores>();
+  const kb: KbResolver = {
+    kb: (project?: string): KbStores => {
+      const store = resolver.resolve(project);
+      const cached = kbStores.get(store);
+      if (cached !== undefined) return cached;
+      const owner = asDatabaseOwner(store);
+      const made: KbStores = { pages: new PageStore(owner), links: new LinkStore(owner) };
+      kbStores.set(store, made);
+      return made;
+    },
+  };
+
+  // Closing folds each write-ahead log back into its database, so a project at rest is a
+  // single `state.db` and the file is not left locked for whatever the host does next.
+  process.once('exit', () => {
+    for (const store of opened) store.close();
+  });
+
+  const server = createMcpServer(resolver, RUNTIME_INSTRUCTIONS, kb);
   await server.connect(new StdioServerTransport());
   const declared =
     projects.length === 0 ? '' : `, projects: ${projects.map((p) => p.name).join(', ')}`;

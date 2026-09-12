@@ -13,7 +13,7 @@ export const RISK_RULES: string = `Risk levels for next.risk:
 Before executing an action whose risk is "destructive" or "external", you MUST ask the user for confirmation. Never execute such actions silently.`;
 
 export const PATCH_SEMANTICS: string = `Patch semantics (ΔΣ merged into Σ with ⊕):
-- A null value deletes the key. Example: {"artifacts": {"src/old.ts": null}} removes that artifact.
+- A null value deletes the key. Example: {"artifacts": {"src/old.ts": null}} removes that artifact. Keys of an object are addressed nested like this, never by a dotted top-level key: {"artifacts.src/old.ts": null} names no field and is rejected as unknown-key.
 - Arrays are replaced wholesale. To change one item you may send the entire array with the updated element.
 - Nested plain objects merge recursively; scalars replace.
 - Cheaper for arrays — a path key touches one element: {"plan[1].status": "done"}, {"rounds[0].verdict": "accepted"}, and {"plan[+]": {…}} appends an item. Indexes count from 0. Prefer this over resending the array. It cannot remove an item (send the array without it), and one field cannot be sent both wholesale and by path in the same patch.
