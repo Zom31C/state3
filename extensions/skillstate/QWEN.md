@@ -1,6 +1,6 @@
 # skillstate: task state and project knowledge for long work
 
-This extension adds an external task state (Σ) for long-horizon work, based on SKILL.state (arXiv:2608.26263), and a project knowledge base beside it. Both live in one SQLite file, `.skillstate/state.db`. Σ is validated on every write and injected into the conversation as `## Active task state (skillstate)`; at session start the knowledge base is injected as `## Project brief (skillstate)` — one line per page, no bodies.
+This extension adds an external task state (Σ) for long-horizon work, based on SKILL.state (arXiv:2608.26263), and a project knowledge base beside it. Both live in one SQLite file, `.skillstate/state.db`. Σ is validated on every write and injected into the conversation as `## Active task state (skillstate)`; at session start the knowledge base is injected as `## Project brief (skillstate)` — one line per page, no bodies. A delegated subagent starts with no transcript and gets an orientation instead of Σ on `SubagentStart` — the task, its goal, the step in flight, the next action and its risk; `SKILLSTATE_SUBAGENT_STATE=off` switches that off. The subagent reports and the session that delegated it patches Σ: one owner per state.
 
 Tools (MCP server `skillstate`; Qwen Code exposes them as `mcp__skillstate__*`):
 

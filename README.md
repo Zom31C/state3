@@ -22,7 +22,7 @@
 
 - **Фаза 5** — task-state ядро: схема `DevTaskState` (`goal`, `status`, `plan`, `artifacts`, `verifications`, `decisions`, `blockers`, `next{action,risk}`), доменный guard (задачу в `done` нельзя переоткрыть; выполненный пункт плана — только с пояснением в `notes`; `blocked` требует непустого `blockers`), `TaskStore` с атомарной записью и аудит-историей, CLI-подкоманда `task`
 - **Фаза 6** — MCP-сервер `skillstate` (stdio, SDK 1.30.0): инструменты `task_start`, `task_show`, `task_patch`, `task_finish`, `task_list`, `task_history`; патчи валидируются до записи, отвергнутый патч возвращает диагностику и не трогает состояние
-- **Фаза 7** — Qwen Code extension: MCP-сервер + хуки `UserPromptSubmit`/`PreCompact`/`SessionStart` (инжектируют компактную Σ в контекст) + навык `/long-task` (процедура P). Проверено вживую: `qwen mcp list` → Connected, хуки отрабатывают, модель видит Σ и все шесть инструментов
+- **Фаза 7** — Qwen Code extension: MCP-сервер + хуки `UserPromptSubmit`/`PreCompact`/`SessionStart`/`SubagentStart` (инжектируют компактную Σ в контекст, а делегированному сабагенту — ориентацию вместо Σ) + навык `/long-task` (процедура P). Проверено вживую: `qwen mcp list` → Connected, хуки отрабатывают, модель видит Σ и все шесть инструментов
 - **Обобщение (09.09.2026)** — ядро больше не привязано к домену «задача разработки»: реестр навыков (`dev-task`, `supervise-task`), корни состояния нескольких проектов (`--project` / `SKILLSTATE_PROJECTS`), компактная нотация Σ и path-ключи патчей. Подробности — §11 [INTEGRATION.md](./INTEGRATION.md)
 - **Единая база и база знаний (12.09.2026)** — состояние в одном файле `.skillstate/state.db` (SQLite + FTS5) вместо набора JSON, перенос легаси-корней (`task migrate`) и диагностика корня (`task doctor`); страницы проекта, связи задач со страницами и инструменты `page` / `search` / `project_brief`; холодный старт: бриф базы знаний вводит хук на `SessionStart`, а `page {"op":"init"}` пишет шаблоны трёх зарезервированных страниц, включая вводный гайд для агента без контекста. Подробности — §12 [INTEGRATION.md](./INTEGRATION.md)
 
@@ -62,6 +62,21 @@ npm run run -- task doctor                     # integrity, версия схе�
 
 В пустом проекте `page {"op":"init"}` пишет три зарезервированные страницы шаблонами: заголовки, которые надо заполнить, плейсхолдеры `<…>` и `status: stale` (в брифе это видно как `- project (stale): TEMPLATE …`, поэтому незаполненный шаблон не читается как документированная правда). Заполните их и тем же `put` поставьте `status: current`. `init` никогда не перезаписывает существующую страницу — отчёт разделяет `created` и `existing`; переписать страницу можно только явным `put`.
 
+### Шаблон AGENTS.md для нового проекта
+
+[`templates/AGENTS.md`](./templates/AGENTS.md) — переносимый файл правил: скопируйте его в корень нового проекта как `AGENTS.md` и заполните последнюю секцию.
+
+```bash
+copy templates\AGENTS.md D:\Projects\<проект>\AGENTS.md      # Windows
+cp templates/AGENTS.md /path/to/project/AGENTS.md            # остальное
+```
+
+Шаблон host-agnostic — `AGENTS.md` в корне читают и Qwen Code (наряду с `QWEN.md`: «If your repository already has an `AGENTS.md` file for other AI tools, Qwen reads that too», `docs/features/memory.md`; в рантайме — `AGENT_CONTEXT_FILENAME`), и opencode, и другие агенты, следующие этому соглашению. Он описывает **привычки**, а не процедуру: порядок чтения при холодном старте (инжектированные блоки → `project_brief` → `task_show` → страницы `project`/`user-intent` → `search`), когда открывать задачу и что писать в каждое поле Σ, дисциплину патчей (path-ключи, `null`-удаление, «Σ реинжектируется каждый ход — её размер это повторяющаяся стоимость»), обязанность документировать проект страницами (`decision` / `feature` / `note`, одна содержательная строка в `summary`, ссылки на код вместо копирования), протокол «починить баг без контекста диалога» (`project_brief` → `search` → `task_history` → `git log` → только потом код), таксономию `next.risk` с требованием спрашивать до destructive/external, чек-лист перед остановкой и правила делегирования сабагентам (Σ владеет оркестратор, бриф вместо транскрипта, самый дешёвый подходящий агент с узким allowlist, плата за ответ, а не за путь, «сначала проверь — потом запиши», fork против именованного агента).
+
+Полную процедуру P своего навыка возвращает `task_show` — шаблон её намеренно не дублирует: две копии правил разъезжаются, а P приходит из рантайма вместе с Σ. Секция `## This project` в конце — единственная, которую проект заполняет сам; держите её короче десяти строк (файл читается каждой сессией, а всё длинное относится на страницу `project`).
+
+Если расширение Qwen Code подключено, его [QWEN.md](./extensions/skillstate/QWEN.md) уже несёт те же правила в контексте каждой сессии — шаблон нужен проектам на других хостах и тем, кто хочет иметь правила в репозитории. Для opencode к шаблону дописывается секция из [adapters/opencode/AGENTS.md](./adapters/opencode/AGENTS.md): префиксы инструментов `skillstate_*`, инжекция плагином, `SKILLSTATE_HOME` и opt-in guard.
+
 ### Подключение к Qwen Code
 
 ```bash
@@ -80,7 +95,7 @@ qwen mcp list                                        # ✓ skillstate ... - Conn
 
 ```bash
 npm run build
-npm run smoke:mcp                # 30 проверок через stdio-клиент во временном каталоге
+npm run smoke:mcp                # 31 проверка через stdio-клиент во временном каталоге
 npm run smoke:mcp -- --server extensions\skillstate\bin\skillstate-mcp.mjs
 node dist\mcp\server.js --help
 ```
@@ -146,4 +161,4 @@ npm run run -- --runtime memory --horizons 50 --seeds 42,43,44 --memory-window 3
 | `npm run build`     | компиляция `src/` в `dist/`                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `npm run run`       | прогон навыка (`--horizon`, `--seed`, `--provider`, `--model`, `--max-retries`, `--out`, `--quiet`) или подкоманда `task` (`start`, `show`, `patch`, `finish`, `list`, `history`, `migrate`, `doctor`; `--root`, `--id`, `--limit`, `--plan`, `--skill`, `--notation`, `--project`, `--purge`, `-h`/`--help`). `task list` последней строкой печатает `runtime:` — версию и каталог сборки, с пометкой `STALE`, если `src` новее `dist` |
 | `npm run smoke`     | дымовой вызов провайдера (`--provider`, `--model`, `--prompt`)                                                                                                                                                                                                                                                                                                                                                                          |
-| `npm run smoke:mcp` | сквозная проверка MCP-сервера через stdio-клиент (30 проверок: девять инструментов, цикл базы знаний, поиск, бриф, инъекции хука и плагина opencode; `--server <path>` — другая точка входа)                                                                                                                                                                                                                                            |
+| `npm run smoke:mcp` | сквозная проверка MCP-сервера через stdio-клиент (31 проверка: девять инструментов, цикл базы знаний, поиск, бриф, инъекции хука — включая ориентацию сабагента — и плагина opencode; `--server <path>` — другая точка входа)                                                                                                                                                                                                           |

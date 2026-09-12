@@ -1,18 +1,54 @@
-# skillstate: состояние задачи для длинной работы
+# skillstate in opencode: supplement to the project's AGENTS.md
 
-В этом проекте доступно внешнее состояние задачи Σ (SKILL.state, arXiv:2608.26263) и база знаний проекта рядом с ним. Всё хранится в `.skillstate/state.db`, валидируется на каждую запись и переживает сжатие сессии и перезапуск. Плагин `skillstate` добавляет компактную Σ в системный промпт каждого запроса и в контекст сжатия, а на первом запросе сессии и при сжатии — ещё и бриф базы знаний (по строке на страницу, без тел). Если Σ в контексте нет, а задача заведена, — значит плагин не нашёл сборку skillstate (`SKILLSTATE_HOME`): прочитай состояние инструментом `task_show` и скажи пользователю.
+The rules for working with skillstate are host-independent and live in one place:
+[`templates/AGENTS.md`](../../templates/AGENTS.md) in the skillstate repository. Copy that
+file to the root of your project as `AGENTS.md` first (step 4 of the installation below),
+then append the "opencode specifics" section of this file to it.
 
-Инструменты MCP-сервера `skillstate` (в opencode видны с префиксом имени сервера, например `skillstate_task_show`): `task_start`, `task_show`, `task_patch`, `task_finish`, `task_list`, `task_history`, а также `project_brief`, `page`, `search`.
+This file kept only what opencode does differently, so that the rules do not drift between
+two copies. Russian prose stays in [README.md](./README.md) — the adapter's own
+documentation; the block below is in English because it ends up inside a project `AGENTS.md`
+next to the English template.
 
-Правила:
+## opencode specifics (append to the project's AGENTS.md)
 
-- Если работа требует больше нескольких шагов (рефакторинги, миграции, многофайловые фичи, расследования, продолжение прежней работы) — начни с `task_start`: цель одним предложением и упорядоченный план. Навык выбери аргументом `skill`: `dev-task` (по умолчанию) — работа в этом проекте, `supervise-task` — проверка работы другого агента (у него нет массива `plan`: начни с цели и заполняй `spec`, `worker`, `rounds` патчами). Аргумент `notation: compact` предписывает писать значения Σ сжатым псевдокодом (одна запись — одна строка, пути и команды дословно) — это важно, когда Σ реинжектируется каждый ход и каждый символ стоит контекста. `task_list` печатает доступные навыки и проекты.
-- После каждого значимого шага (файл изменён, проверка запущена, решение принято, найден блокер) вызывай `task_patch` только с изменившимися полями. `null` удаляет ключ; массивы заменяются целиком — но один элемент дешевле поменять path-ключом: `{"plan[1].status":"done"}`, а `{"plan[+]":{…}}` добавляет элемент (индексы с нуля, форма работает для любого массива Σ — `{"decisions[+]":"…"}`, `{"rounds[0].verdict":"accepted"}`). Path-ключи раскрываются до guard'а и схемы, поэтому обойти доменное правило ими нельзя; удалить элемент ими нельзя (пришли массив без него), и одно поле нельзя прислать одновременно целиком и path-ключом. Ровно один пункт плана в `in_progress`.
-- Инжектированное состояние задачи — авторитетный источник, когда транскрипт неполон. После сжатия или перезапуска сначала вызови `task_show`: он вернёт Σ и полную процедуру P своего навыка и нотации.
-- Отвергнутый патч не изменяет состояние. Прочитай диагностику (`unknown-key`, `type-coercion`, `guard`, `path`, `schema`, `skill`), исправь патч и повтори.
-- В `verifications` записывай реальные команды проверок и их фактические статусы; никогда не ставь `pass` без подтверждающего вывода.
-- `next.risk` помечает следующее действие: `safe`, `destructive` (удаление файлов/веток, drop таблиц, force-push, перезапись чужих изменений) или `external` (всё, что выходит за пределы рабочего каталога проекта: push, комментарии в PR/issue, отправка сообщений, деплой, внешние сервисы, изменения конфигурации пользователя — глобальные настройки агента, подключение расширений, установка глобальных пакетов). Перед исполнением destructive/external спроси подтверждение пользователя и не исполняй молча.
-- Храни только то, что нужно будущим шагам: завершённую работу сжимай до результата, устаревшие ключи удаляй через `null` (слияние само состояние не уменьшает).
-- У всех инструментов есть необязательный аргумент `project` — имя корня состояния, который объявил пользователь (`SKILLSTATE_PROJECTS`); так супервизирующая сессия читает и патчит Σ рабочего агента в другом каталоге. Достижимы только объявленные корни, а необъявленное имя даёт ошибку с их перечислением: не пытайся добраться до необъявленного каталога, попроси пользователя его объявить.
-- Инструменты называют корень состояния (`no tasks (state root: …)`, `Started task <id> [<skill>] at <path>`). Если этот корень не внутри твоего проекта — остановись и скажи пользователю, не создавай и не патчь задачи в чужом каталоге: хост запускает сервер в своём каталоге запуска, а нужный каталог задаётся `SKILLSTATE_STATE_DIR`.
-- База знаний проекта: читай дёшево сверху вниз — `project_brief` (карта в фиксированном бюджете, по строке на страницу, без тел) → `search` (совпадения со сниппетами) → `page {"op":"get"}` (страница целиком). Записывай узнаванное сразу, а не в конце: `decision` — выбор и его причина, `feature` — что сделано, а `project` обнови, если изменились раскладка или команды. `summary` держи в одну содержательную строку: холодная сессия видит только её и по ней решает, открывать ли страницу. В проекте без страниц `page {"op":"init"}` создаёт три зарезервированные страницы шаблонами (`project`, `user-intent`, `onboarding`) со статусом `stale`: заполни плейсхолдеры `<…>` и тем же `put` поставь `status: current`. `init` никогда не перезаписывает существующую страницу — переписать её можно только явным `put`.
+### How Σ reaches you here
+
+- Tools carry the server-name prefix: `skillstate_task_show`, `skillstate_page`,
+  `skillstate_search`. They are switched off in the config with the mask
+  `"skillstate_*": false`.
+- The `skillstate` plugin pushes compact Σ into the system prompt of every request and into
+  the compaction context, and the knowledge-base brief on the first request of a session and
+  on compaction — not on every request. opencode has no per-prompt injection event, so the
+  brief is what the session sees once, and `project_brief` is how you refresh it.
+- If Σ is missing from the context although a task is open, the plugin did not find the
+  skillstate build: read the state with `task_show` and tell the user (the plugin logs a
+  `warn` mentioning `state.db`). A root with `state.db` is read through the build
+  (`dist/tasks/inject.js`, found via `SKILLSTATE_HOME` or by walking up from the plugin
+  file); a legacy JSON root is read without it. A root with `state.db` is authoritative — the
+  JSON files beside it are the archive the migration left, and they are not injected.
+- The injected block from a legacy root carries no skill name and no compact-notation
+  reminder; `task_show` returns both, together with the procedure P.
+- The plugin injects **one** root and does not read `SKILLSTATE_PROJECTS`: for another
+  declared project use `task_show {"project":"<name>"}`. The MCP server does read
+  `SKILLSTATE_PROJECTS` — from the environment of the opencode process or from the
+  `environment` block of its mcp config — so the `project` argument works even though the
+  injection covers one root.
+- When opencode is launched outside the project directory, `SKILLSTATE_STATE_DIR` pins the
+  state directory; `SKILLSTATE_ROOT` sets the project directory the plugin looks in.
+
+### The optional guard
+
+`SKILLSTATE_GUARD=1` makes the plugin throw on `bash`, `write`, `edit` and `patch` calls
+while the active task's `next.risk` is `destructive` or `external`. It is enforcement on top
+of the rule "ask the user before a destructive or external action", and it is off by default
+because it deliberately interrupts tool calls; opencode's own permission system
+(`permission.ask`) is the second layer, not a replacement for asking. Setting `next.risk`
+before acting is still your job — the guard can only block what Σ already describes.
+
+## Installation and the rest
+
+Installation (plugin, mcp config, `AGENTS.md`, self-test), what each plugin hook does, the
+environment variables, debugging, the end-to-end run against a local model and the known
+limitations are in [README.md](./README.md) — step 4 there is the one that puts the shared
+template and the block above into the project's `AGENTS.md`.

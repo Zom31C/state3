@@ -6,7 +6,7 @@ import { STATE_DB_FILENAME, openStateDatabase } from '../db/database.js';
 import type { SqlDatabase } from '../db/database.js';
 import { renderDatabaseBrief } from '../kb/brief.js';
 import { DEFAULT_NOTATION, isNotation } from './notation.js';
-import { renderTaskHead } from './render.js';
+import { renderTaskBrief, renderTaskHead } from './render.js';
 import { RISK_LEVELS } from './schema.js';
 import type { RiskLevel } from './schema.js';
 import type { StoredTask, TaskMeta } from './store.js';
@@ -35,6 +35,13 @@ export interface InjectionOptions {
    * same text would be a tax on every turn for a map the session has already seen.
    */
   brief?: boolean;
+  /**
+   * Render the task as the few lines a delegated subagent needs instead of Σ. A subagent has no
+   * transcript and usually no skillstate tools, so it needs to know a task exists and which step
+   * is in flight — not the whole state, which it would pay for on every one of its turns. The
+   * full Σ and the procedure stay behind `task_show`.
+   */
+  subagent?: boolean;
 }
 
 interface CandidateRow {
@@ -90,7 +97,11 @@ function riskOf(state: StateDict): RiskLevel | null {
     : null;
 }
 
-function readTaskHead(db: SqlDatabase, dbPath: string): TaskHead {
+function readTaskHead(
+  db: SqlDatabase,
+  dbPath: string,
+  render: (task: StoredTask) => string,
+): TaskHead {
   const row = pickCandidate(db);
   if (row === null) return { text: null, risk: null, unreadable: null };
 
@@ -118,7 +129,7 @@ function readTaskHead(db: SqlDatabase, dbPath: string): TaskHead {
   };
   const state = parsed as StateDict;
   const task: StoredTask = { meta, state };
-  return { text: renderTaskHead(task), risk: riskOf(state), unreadable: null };
+  return { text: render(task), risk: riskOf(state), unreadable: null };
 }
 
 /**
@@ -150,7 +161,11 @@ export function readInjection(rootDir: string, options: InjectionOptions = {}): 
   }
 
   try {
-    const head = readTaskHead(db, dbPath);
+    const head = readTaskHead(
+      db,
+      dbPath,
+      options.subagent === true ? renderTaskBrief : renderTaskHead,
+    );
     if (head.unreadable !== null) return { kind: 'unreadable', reason: head.unreadable };
     const brief = options.brief === true ? renderDatabaseBrief(db) : null;
     if (head.text === null && brief === null) return { kind: 'idle' };

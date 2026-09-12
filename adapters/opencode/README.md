@@ -13,11 +13,11 @@ MCP-сервером, а компактная Σ попадает в конте�
 
 ## Состав
 
-| Файл                    | Назначение                                                                                                          |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `plugin/skillstate.js`  | плагин: инжекция Σ в системный промпт и в контекст сжатия, опциональный guard опасных действий, режим `--self-test` |
-| `opencode.example.json` | пример блока `mcp` для подключения сервера skillstate                                                               |
-| `AGENTS.md`             | блок процедурных правил P для агента (положить в корень проекта или объединить с существующим `AGENTS.md`)          |
+| Файл                    | Назначение                                                                                                                                                                                       |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `plugin/skillstate.js`  | плагин: инжекция Σ в системный промпт и в контекст сжатия, опциональный guard опасных действий, режим `--self-test`                                                                              |
+| `opencode.example.json` | пример блока `mcp` для подключения сервера skillstate                                                                                                                                            |
+| `AGENTS.md`             | дополнение к общим правилам из [`templates/AGENTS.md`](../../templates/AGENTS.md): только то, что в opencode устроено иначе (префиксы инструментов, инжекция плагином, `SKILLSTATE_HOME`, guard) |
 
 ## Установка
 
@@ -34,8 +34,10 @@ copy adapters\opencode\plugin\skillstate.js .opencode\plugins\skillstate.js
 #    в opencode.json (или opencode.jsonc) и поправить пути на свои
 copy adapters\opencode\opencode.example.json opencode.json
 
-# 4. Правила P — в AGENTS.md проекта (скопировать или объединить)
-copy adapters\opencode\AGENTS.md AGENTS.md
+# 4. Правила — в AGENTS.md проекта: общий шаблон + дополнение opencode
+copy templates\AGENTS.md <проект>\AGENTS.md
+#    затем дописать к нему секцию «opencode specifics» из adapters\opencode\AGENTS.md
+#    и заполнить секцию «## This project» в конце
 
 # 5. Проверка
 opencode mcp list
@@ -140,7 +142,7 @@ opencode mcp list                                       # сервер skillstat
 # --self-test печатает оба блока (Σ и бриф); корню с state.db нужна видимая сборка —
 # SKILLSTATE_HOME или запуск из каталога репозитория
 node adapters\opencode\plugin\skillstate.js --self-test D:\Projects\skillState
-npm run smoke:mcp -- --server extensions\skillstate\bin\skillstate-mcp.mjs   # 30 проверок сервера
+npm run smoke:mcp -- --server extensions\skillstate\bin\skillstate-mcp.mjs   # 31 проверка сервера
 ```
 
 - Инструменты MCP регистрируются с префиксом имени сервера (в конфигурации

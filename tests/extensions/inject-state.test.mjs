@@ -331,4 +331,79 @@ describe('inject-state hook', () => {
 
     expect(contextOf(result)).toContain('Pinned root');
   });
+
+  it('orients a subagent with the step in flight instead of Σ', async () => {
+    await writeTask('task-1.json', record('task-1', devState()));
+
+    const result = await runSelfTestEvent('SubagentStart');
+    const context = contextOf(result);
+
+    expect(eventOf(result)).toBe('SubagentStart');
+    expect(context).toContain('delegated a subtask');
+    expect(context).toContain('Task task-1 [dev-task] (active)');
+    expect(context).toContain('goal: Ship the adapter');
+    expect(context).toContain('in flight: Write the plugin');
+    expect(context).toContain('next: Run the tests [risk: safe]');
+    // Not Σ, and not the patching rules: a subagent reports, the orchestrator patches.
+    expect(context).not.toContain('"artifacts":{}');
+    expect(context).not.toContain('call task_patch with only the changed fields');
+    expect(context).toContain('the session that delegated you owns Σ');
+  });
+
+  it('shows a subagent what is blocking, because it would walk straight into it', async () => {
+    await writeTask(
+      'task-1.json',
+      record('task-1', devState({ status: 'blocked', blockers: ['waiting on the user'] })),
+    );
+
+    const context = contextOf(await runSelfTestEvent('SubagentStart'));
+
+    expect(context).toContain('(blocked)');
+    expect(context).toContain('blocked: waiting on the user');
+  });
+
+  it('stays silent on SubagentStart when the orientation is switched off', async () => {
+    await writeTask('task-1.json', record('task-1', devState()));
+
+    const result = await runSelfTestEvent('SubagentStart', { SKILLSTATE_SUBAGENT_STATE: 'off' });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout.trim()).toBe('');
+    // The switch is for this event only: a session still gets its Σ.
+    expect(contextOf(await runSelfTest({ SKILLSTATE_SUBAGENT_STATE: 'off' }))).toContain(
+      'Task task-1',
+    );
+  });
+
+  it('gives a subagent no supervised projects: it was delegated inside this one', async () => {
+    const workerRoot = join(dir, 'worker-state');
+    await mkdir(workerRoot, { recursive: true });
+    await writeFile(
+      join(workerRoot, 'task-w.json'),
+      `${JSON.stringify(record('task-w', devState({ goal: 'Build the car' })), null, 2)}\n`,
+      'utf8',
+    );
+    await writeTask('task-1.json', record('task-1', devState()));
+
+    const subagent = await runHook({
+      args: ['--self-test', dir, 'SubagentStart'],
+      env: { SKILLSTATE_PROJECTS: `worker=${workerRoot}` },
+    });
+    const session = await runHook({
+      args: ['--self-test', dir, 'UserPromptSubmit'],
+      env: { SKILLSTATE_PROJECTS: `worker=${workerRoot}` },
+    });
+
+    expect(contextOf(subagent)).not.toContain('## Supervised projects');
+    expect(contextOf(subagent)).not.toContain('Build the car');
+    expect(contextOf(session)).toContain('## Supervised projects');
+  });
+
+  it('injects no brief on SubagentStart: the map is a session-start cost', async () => {
+    await writeTask('task-1.json', record('task-1', devState()));
+
+    expect(contextOf(await runSelfTestEvent('SubagentStart'))).not.toContain(
+      '## Project brief (skillstate)',
+    );
+  });
 });

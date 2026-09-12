@@ -277,3 +277,28 @@ describe('readInjection risk', () => {
     expect(injection.risk).toBeNull();
   });
 });
+
+describe('readInjection subagent', () => {
+  it('renders the orientation instead of Σ, and leaves the default untouched', () => {
+    forceRow('task-1', { state: stateJson('active', 'goal of task-1') });
+    store.close();
+
+    const text = taskOf(readInjection(dir, { subagent: true }));
+
+    expect(text).toContain('goal: goal of task-1');
+    expect(text).toContain('in flight: step one');
+    expect(text).toContain('next: continue [risk: safe]');
+    expect(text).not.toContain('"artifacts"');
+    // A session still gets the whole state: the option is per call, not per root.
+    expect(taskOf(readInjection(dir))).toContain('"artifacts"');
+  });
+
+  it('still reports a state it cannot parse, brief or not', () => {
+    forceRow('task-1', { state: '{"goal": "x", ' });
+    store.close();
+
+    const injection = readInjection(dir, { subagent: true });
+
+    expect(injection.kind).toBe('unreadable');
+  });
+});

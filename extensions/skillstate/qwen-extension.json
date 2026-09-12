@@ -19,6 +19,11 @@
       "name": "supervised projects",
       "description": "Additional .skillstate roots the tools may address by name, as \"name=dir;name2=dir2\" or a JSON object of the same. Only roots declared here are reachable through the project argument, so a session can read and patch the task of a worker in another project without ever reaching an arbitrary directory. The hooks inject the active task of each declared root.",
       "envVar": "SKILLSTATE_PROJECTS"
+    },
+    {
+      "name": "subagent orientation",
+      "description": "Set to \"off\" to inject nothing on SubagentStart. By default a delegated subagent, which starts with no transcript, receives a few lines of orientation — the task, its goal, the step in flight, the next action and its risk — instead of the whole state. There is no \"full\" mode on purpose: the complete Σ and the procedure of its skill come from task_show.",
+      "envVar": "SKILLSTATE_SUBAGENT_STATE"
     }
   ],
   "mcpServers": {
@@ -65,6 +70,19 @@
             "name": "skillstate-session-state",
             "timeout": 5000,
             "statusMessage": "Restoring skillstate task state"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${extensionPath}${/}hooks${/}inject-state.mjs",
+            "name": "skillstate-subagent-state",
+            "timeout": 5000,
+            "statusMessage": "Orienting the subagent in the task state"
           }
         ]
       }

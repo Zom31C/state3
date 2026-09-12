@@ -163,6 +163,20 @@ try {
     hook.stderr.trim() === '' ? `exit ${hook.status}` : hook.stderr.trim().split('\n')[0],
   );
 
+  // A delegated subagent starts with no transcript, so it is told what is in flight — but it
+  // carries those lines on every one of its own turns, which is why it gets orientation and
+  // not Σ. Checked here, against a real database, because the brief is rendered by the build.
+  const subagentHook = runHook('SubagentStart');
+  check(
+    'inject-state hook orients a subagent with the goal and next step instead of Σ',
+    subagentHook.context.includes('delegated a subtask') &&
+      subagentHook.context.includes('goal: Smoke the stdio MCP server') &&
+      subagentHook.context.includes('next: ') &&
+      !subagentHook.context.includes('"artifacts"') &&
+      !subagentHook.context.includes('## Project brief (skillstate)'),
+    subagentHook.context.split('\n')[0],
+  );
+
   const listed = await call('task_list', {});
   check('task_list reports the task', text(listed).includes('Tasks (1)'), text(listed).trim());
 

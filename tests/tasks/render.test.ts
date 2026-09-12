@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest';
 import type { StateDict } from '../../src/core/types.js';
 import type { Notation } from '../../src/tasks/notation.js';
 import type { DevTaskState } from '../../src/tasks/schema.js';
-import { STATE_SIZE_HINT_CHARS, renderTaskHead, stateSizeHint } from '../../src/tasks/render.js';
+import {
+  STATE_SIZE_HINT_CHARS,
+  renderTaskBrief,
+  renderTaskHead,
+  stateSizeHint,
+} from '../../src/tasks/render.js';
 import type { StoredTask } from '../../src/tasks/store.js';
 
 function makeState(overrides: Partial<DevTaskState> = {}): DevTaskState {
@@ -81,5 +86,56 @@ describe('stateSizeHint', () => {
     const overLimit = { decisions: ['x'.repeat(STATE_SIZE_HINT_CHARS)] };
     expect(stateSizeHint(overLimit)).toContain('Σ is ');
     expect(stateSizeHint(overLimit)).toContain('chars');
+  });
+});
+
+describe('renderTaskBrief', () => {
+  it('carries the goal, the step in flight and the next action — and nothing else', () => {
+    const text = renderTaskBrief(
+      makeTask(
+        makeState({
+          artifacts: { 'src/a.ts': 'new reader' },
+          decisions: ['chose the hook over a tool'],
+          verifications: [{ check: 'npm test', status: 'pass' }],
+          plan: [
+            { id: '1', task: 'Done already', status: 'done', notes: '' },
+            { id: '2', task: 'Wire the hook', status: 'in_progress', notes: 'half way' },
+          ],
+        }),
+      ),
+    );
+
+    expect(text.split('\n')).toEqual([
+      'Task task-9 [dev-task] (active)',
+      'goal: Ship the integration',
+      'in flight: Wire the hook — half way',
+      'next: Run the tests [risk: safe]',
+    ]);
+    // The whole point: a subagent carries these lines on every one of its turns.
+    expect(text).not.toContain('chose the hook');
+    expect(text).not.toContain('npm test');
+    expect(text).not.toContain('src/a.ts');
+  });
+
+  it('adds the blockers, and no line for a field this skill does not have', () => {
+    const blocked = renderTaskBrief(
+      makeTask(makeState({ status: 'blocked', blockers: ['needs the user', 'no key'] })),
+    );
+    expect(blocked).toContain('(blocked)');
+    expect(blocked).toContain('blocked: needs the user; no key');
+
+    // A supervise-task state has no plan; the brief must not invent a line for it, and must
+    // still render the risk-less next action of a state written by an older build.
+    const foreign = makeTask(makeState());
+    foreign.state = {
+      goal: 'Review the worker',
+      status: 'active',
+      next: { action: 'Read the diff' },
+    };
+    expect(renderTaskBrief(foreign).split('\n')).toEqual([
+      'Task task-9 [dev-task] (active)',
+      'goal: Review the worker',
+      'next: Read the diff',
+    ]);
   });
 });

@@ -1,12 +1,16 @@
 #!/usr/bin/env node
-// UserPromptSubmit / PreCompact / SessionStart hook: injects the compact active
-// task state so the model sees Σ instead of relying on the transcript. When
+// UserPromptSubmit / PreCompact / SessionStart / SubagentStart hook: injects the compact
+// active task state so the model sees Σ instead of relying on the transcript. When
 // SKILLSTATE_PROJECTS declares further roots, their active tasks are injected too,
 // so a supervising session sees each worker's Σ without a tool call.
 // On SessionStart it also injects the project brief — the knowledge base as one line per
 // page — because that is the one moment the transcript holds nothing to orient by. On every
 // other event the brief stays out: the session has already seen it, and paying for it again
 // on each prompt would cost more than the map is worth.
+// On SubagentStart it injects neither Σ nor the brief but a few lines of orientation instead:
+// a delegated agent begins with no transcript and usually no skillstate tools, so it needs to
+// know that a task exists and which step is in flight — not the whole state, which it would
+// pay for again on every one of its own turns. SKILLSTATE_SUBAGENT_STATE=off leaves it silent.
 // Never blocks a turn — on any problem it prints nothing and exits 0.
 // Σ lives in the project's state.db, and reading SQLite needs the driver, so a root that
 // has one is read through the repository build (dist/tasks/inject.js). The legacy JSON
@@ -23,9 +27,13 @@ import { INJECT_MARKER, findSkillstateHome } from '../lib/home.mjs';
 const STATE_DIRNAME = '.skillstate';
 /** Mirrors STATE_DB_FILENAME in src/db/database.ts. */
 const STATE_DB_FILENAME = 'state.db';
-const KNOWN_EVENTS = new Set(['UserPromptSubmit', 'PreCompact', 'SessionStart']);
+const KNOWN_EVENTS = new Set(['UserPromptSubmit', 'PreCompact', 'SessionStart', 'SubagentStart']);
 // Above this size Σ stops being an O(1) prompt component, so the agent is told to compress it.
 const STATE_SIZE_HINT_CHARS = 4000;
+// Set to `off` to leave a delegated subagent without orientation: the right choice for an agent
+// whose work has nothing to do with the task in flight, and whose every turn would otherwise
+// carry these lines.
+const SUBAGENT_STATE_ENV = 'SKILLSTATE_SUBAGENT_STATE';
 // Records written before `skill` and `notation` existed carry neither; the runtime
 // reads them as the default skill in plain notation, and so does this hook.
 const DEFAULT_SKILL = 'dev-task';
@@ -117,6 +125,54 @@ function taskLines(record) {
   ].filter((line) => line !== '');
 }
 
+/** A trimmed string, or null: Σ is domain state, so every field is read defensively. */
+function trimmed(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return text === '' ? null : text;
+}
+
+/** The one plan item in flight, notes included — a subagent must not redo it. */
+function inProgress(plan) {
+  if (!Array.isArray(plan)) return null;
+  for (const item of plan) {
+    if (item === null || typeof item !== 'object' || item.status !== 'in_progress') continue;
+    const what = trimmed(item.task);
+    if (what === null) continue;
+    const notes = trimmed(item.notes);
+    return notes === null ? what : `${what} — ${notes}`;
+  }
+  return null;
+}
+
+/**
+ * Orientation for a delegated subagent (mirrors renderTaskBrief in src/tasks/render.ts): the
+ * task, its goal, the step in flight, what comes next, what blocks. Not Σ — a subagent carries
+ * its prompt on every one of its own turns, and the full state together with the procedure of
+ * its skill is one task_show away for the rare agent that has the tool.
+ */
+function subagentBriefLines(record) {
+  const state = record.state !== null && typeof record.state === 'object' ? record.state : {};
+  const goal = trimmed(state.goal);
+  const current = inProgress(state.plan);
+  const next = state.next !== null && typeof state.next === 'object' ? state.next : {};
+  const action = trimmed(next.action);
+  const risk = trimmed(next.risk);
+  const blockers = Array.isArray(state.blockers)
+    ? state.blockers
+        .map(trimmed)
+        .filter((line) => line !== null)
+        .join('; ')
+    : '';
+  return [
+    `Task ${record.id} [${skillOf(record)}] (${taskStatus(state)})`,
+    goal === null ? '' : `goal: ${goal}`,
+    current === null ? '' : `in flight: ${current}`,
+    action === null ? '' : `next: ${action}${risk === null ? '' : ` [risk: ${risk}]`}`,
+    blockers === '' ? '' : `blocked: ${blockers}`,
+  ].filter((line) => line !== '');
+}
+
 /** The compiled reader, or null when this extension cannot reach a build. Resolved once. */
 let injectModule;
 async function reader() {
@@ -144,9 +200,11 @@ async function reader() {
  * fail silently, because the model would simply stop seeing its own progress and nothing in
  * the turn would say why.
  *
- * `wantBrief` asks for the knowledge-base brief as well, which only a session start does.
+ * `brief` asks for the knowledge-base brief as well, which only a session start does;
+ * `subagent` asks for the delegated-agent orientation instead of Σ. A build from before the
+ * subagent brief existed ignores that option and answers with Σ: costlier, but never silent.
  */
-async function injectionFor(rootDir, wantBrief) {
+async function injectionFor(rootDir, { brief = false, subagent = false } = {}) {
   const dbPath = join(rootDir, STATE_DB_FILENAME);
   if (existsSync(dbPath)) {
     const module = await reader();
@@ -159,9 +217,7 @@ async function injectionFor(rootDir, wantBrief) {
     }
     let injection;
     try {
-      injection = wantBrief
-        ? module.readInjection(rootDir, { brief: true })
-        : module.readInjection(rootDir);
+      injection = module.readInjection(rootDir, { brief, subagent });
     } catch (err) {
       return { warn: `cannot read ${dbPath}: ${err instanceof Error ? err.message : String(err)}` };
     }
@@ -183,7 +239,9 @@ async function injectionFor(rootDir, wantBrief) {
   }
 
   const record = await loadActiveTask(rootDir);
-  return record === null ? null : { task: taskLines(record).join('\n'), brief: null };
+  if (record === null) return null;
+  const lines = subagent ? subagentBriefLines(record) : taskLines(record);
+  return { task: lines.join('\n'), brief: null };
 }
 
 /**
@@ -243,6 +301,9 @@ function leadFor(event) {
   if (event === 'SessionStart') {
     return 'The session started, resumed, or was compacted. Resume from the task state below; call task_show for the full procedure.';
   }
+  if (event === 'SubagentStart') {
+    return 'You have been delegated a subtask and start with no conversation history. This is the task in flight in the project you were launched in: do not open a second one, and do not redo the step already in flight. task_show returns the full state and the procedure, if you have that tool.';
+  }
   return 'Authoritative progress record for the active task (the transcript may be incomplete):';
 }
 
@@ -289,6 +350,18 @@ const stateDir =
 const eventName = KNOWN_EVENTS.has(event.hook_event_name)
   ? event.hook_event_name
   : 'UserPromptSubmit';
+const isSubagentStart = eventName === 'SubagentStart';
+
+// An agent delegated for work unrelated to the task in flight gains nothing from these lines
+// and pays for them on every turn, so the orientation can be switched off per environment.
+const subagentState = process.env[SUBAGENT_STATE_ENV];
+if (
+  isSubagentStart &&
+  typeof subagentState === 'string' &&
+  subagentState.trim().toLowerCase() === 'off'
+) {
+  process.exit(0);
+}
 
 const sections = [];
 /** One line per root that holds Σ but could not be read. Goes to stderr, never to stdout. */
@@ -301,7 +374,7 @@ const wantBrief = eventName === 'SessionStart';
 
 let primary = null;
 try {
-  primary = await injectionFor(stateDir, wantBrief);
+  primary = await injectionFor(stateDir, { brief: wantBrief, subagent: isSubagentStart });
 } catch {
   primary = null;
 }
@@ -312,8 +385,17 @@ if (primary !== null && typeof primary.task === 'string') {
       '## Active task state (skillstate)',
       leadFor(eventName),
       primary.task,
-      'After every meaningful step call task_patch with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one — without resending the array; exactly one plan item in_progress).',
-      'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.',
+      // A subagent is told to report rather than to patch: it usually has no skillstate tools,
+      // and two agents patching one Σ is how a plan item gets marked done twice.
+      ...(isSubagentStart
+        ? [
+            'Report what you changed and what you actually verified — the session that delegated you owns Σ and records it there. Patch the state yourself only if you were given the skillstate tools.',
+            'If next.risk is "destructive" or "external", stop and report it: asking the user is the orchestrator\'s job, not yours.',
+          ]
+        : [
+            'After every meaningful step call task_patch with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one — without resending the array; exactly one plan item in_progress).',
+            'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.',
+          ]),
     ].join('\n'),
   );
 }
@@ -326,8 +408,10 @@ if (primary !== null && typeof primary.brief === 'string') {
 // Supervised projects: their Σ is injected as well, so the supervising session does
 // not have to spend a tool call per worker to see progress. One bad project (unreadable
 // root, no active task, duplicate of the primary root) is skipped without hiding the rest.
+// Not for a subagent: it was delegated inside this project, and every worker's Σ on top of its
+// own orientation is context it cannot act on. A supervising session still gets them all.
 const projectsSpec = process.env.SKILLSTATE_PROJECTS;
-if (typeof projectsSpec === 'string' && projectsSpec.trim() !== '') {
+if (!isSubagentStart && typeof projectsSpec === 'string' && projectsSpec.trim() !== '') {
   let entries = null;
   try {
     entries = parseProjectsSpec(projectsSpec, projectDir);
@@ -340,7 +424,7 @@ if (typeof projectsSpec === 'string' && projectsSpec.trim() !== '') {
         try {
           if (sameRoot(entry.rootDir, stateDir)) return null;
           // No brief for a supervised root: see wantBrief above.
-          const injection = await injectionFor(entry.rootDir, false);
+          const injection = await injectionFor(entry.rootDir);
           if (injection === null) return null;
           if (injection.warn !== undefined) {
             warnings.push(injection.warn);
