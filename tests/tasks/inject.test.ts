@@ -278,6 +278,59 @@ describe('readInjection risk', () => {
   });
 });
 
+describe('readInjection compaction', () => {
+  /** Σ with one archived step, one in flight, and a heavy decisions log. */
+  function heavyState(decisions: string[]): string {
+    return JSON.stringify({
+      goal: 'Ship the integration',
+      status: 'active',
+      plan: [
+        {
+          id: '1',
+          task: 'the finished step',
+          status: 'done',
+          notes: 'outcome is in decisions',
+          archived: true,
+        },
+        { id: '2', task: 'the step in flight', status: 'in_progress', notes: 'half way' },
+      ],
+      artifacts: { 'src/a.ts': 'the reader' },
+      verifications: [{ check: 'npm test', status: 'pass' }],
+      decisions,
+      blockers: ['needs the user'],
+      next: { action: 'continue', risk: 'safe' },
+    });
+  }
+
+  it('leaves an archived plan step out of what a prompt carries, and says so', () => {
+    forceRow('task-1', { state: heavyState(['a short decision']) });
+    store.close();
+
+    const text = taskOf(readInjection(dir));
+
+    expect(text).not.toContain('the finished step');
+    expect(text).toContain('the step in flight');
+    expect(text).toContain('+1 archived plan step(s) left out of this injection');
+    expect(text).toContain('task_show lists every one');
+  });
+
+  it('carries only the step in flight once Σ outgrows the delta threshold', () => {
+    forceRow('task-1', { state: heavyState(['z'.repeat(7000)]) });
+    store.close();
+
+    const text = taskOf(readInjection(dir));
+
+    expect(text).not.toContain('zzzz');
+    expect(text).not.toContain('src/a.ts');
+    expect(text).toContain('the step in flight');
+    // What a resumed session cannot work without survives every cut.
+    expect(text).toContain('needs the user');
+    expect(text).toContain('continue');
+    expect(text).toContain('this injection carries only the step in flight, next and blockers');
+    expect(text).toContain('1 artifacts');
+  });
+});
+
 describe('readInjection subagent', () => {
   it('renders the orientation instead of Σ, and leaves the default untouched', () => {
     forceRow('task-1', { state: stateJson('active', 'goal of task-1') });

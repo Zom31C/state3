@@ -189,18 +189,40 @@ describe('StateStore', () => {
 
 describe('parsePathKey', () => {
   it('parses an index, a tail of keys, and the append marker', () => {
-    expect(parsePathKey('plan[2]')).toEqual({ field: 'plan', index: 2, tail: [] });
+    expect(parsePathKey('plan[2]')).toEqual({ field: 'plan', index: 2, id: null, tail: [] });
     expect(parsePathKey('plan[2].status')).toEqual({
       field: 'plan',
       index: 2,
+      id: null,
       tail: ['status'],
     });
     expect(parsePathKey('runs[0].review.verdict')).toEqual({
       field: 'runs',
       index: 0,
+      id: null,
       tail: ['review', 'verdict'],
     });
-    expect(parsePathKey('plan[+]')).toEqual({ field: 'plan', index: 'append', tail: [] });
+    expect(parsePathKey('plan[+]')).toEqual({
+      field: 'plan',
+      index: 'append',
+      id: null,
+      tail: [],
+    });
+  });
+
+  it('parses an id selector, because an id is not an index', () => {
+    expect(parsePathKey('plan[id=5].notes')).toEqual({
+      field: 'plan',
+      index: null,
+      id: '5',
+      tail: ['notes'],
+    });
+    expect(parsePathKey('plan[id=step-3]')).toEqual({
+      field: 'plan',
+      index: null,
+      id: 'step-3',
+      tail: [],
+    });
   });
 
   it('leaves ordinary and dotted field names alone', () => {
@@ -210,6 +232,10 @@ describe('parsePathKey', () => {
     expect(parsePathKey('artifacts.src/tasks/store.ts')).toBeNull();
     expect(parsePathKey('plan[2')).toBeNull();
     expect(parsePathKey('plan.2.status')).toBeNull();
+    // A selector that is neither an index, an append nor an id is not a path key: it stays
+    // an unknown top-level key, which the schema refuses by name.
+    expect(parsePathKey('plan[foo]')).toBeNull();
+    expect(parsePathKey('plan[id=]')).toBeNull();
   });
 });
 
@@ -319,12 +345,99 @@ describe('expandPathPatch', () => {
     if (!result.ok) expect(result.message).toContain('needs an array field "goal"');
   });
 
-  it('rejects an out-of-range index and points at [+]', () => {
+  it('rejects an out-of-range index, and prints where the items actually are', () => {
     const result = expandPathPatch({ plan }, { 'plan[5].status': 'done' });
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.message).toContain('out of range');
       expect(result.message).toContain('plan[+]');
+      // The refusal that costs a retry is the one that does not show the pairing: a step
+      // whose id is "5" sits at index 4, and nothing else says so.
+      expect(result.message).toContain('index → id: 0→"1", 1→"2"');
+    }
+  });
+
+  it('addresses an element by its own id, which survives an index shift', () => {
+    const state = { plan: [...plan, { id: '3', task: 'c', status: 'pending', notes: '' }] };
+
+    const byId = expandPathPatch(state, { 'plan[id=3].status': 'done' });
+    expect(byId.ok).toBe(true);
+    if (byId.ok) {
+      expect(mergedRows(state, byId.patch).plan?.[2]).toEqual({
+        id: '3',
+        task: 'c',
+        status: 'done',
+        notes: '',
+      });
+    }
+
+    // The same step by index is a different one, which is why the id form exists.
+    const byIndex = expandPathPatch(state, { 'plan[3]': null });
+    expect(byIndex.ok).toBe(false);
+  });
+
+  it('rejects an id the array does not have, and one it has twice', () => {
+    const missing = expandPathPatch({ plan }, { 'plan[id=9].status': 'done' });
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) {
+      expect(missing.message).toContain('no item of "plan" has id "9"');
+      expect(missing.message).toContain('index → id: 0→"1", 1→"2"');
+    }
+
+    const twice = expandPathPatch(
+      {
+        plan: [
+          { id: '1', task: 'a' },
+          { id: '1', task: 'b' },
+        ],
+      },
+      { 'plan[id=1].task': 'c' },
+    );
+    expect(twice.ok).toBe(false);
+    if (!twice.ok) {
+      expect(twice.message).toContain('2 items of "plan" have id "1"');
+      expect(twice.message).toContain('indexes 0, 1');
+    }
+  });
+
+  it('removes an element on null, by index or by id', () => {
+    const byIndex = expandPathPatch({ plan }, { 'plan[0]': null });
+    expect(byIndex.ok).toBe(true);
+    if (byIndex.ok) {
+      expect(mergedRows({ plan }, byIndex.patch).plan).toEqual([
+        { id: '2', task: 'b', status: 'pending', notes: '' },
+      ]);
+    }
+
+    const byId = expandPathPatch({ plan }, { 'plan[id=2]': null });
+    expect(byId.ok).toBe(true);
+    if (byId.ok) {
+      expect(mergedRows({ plan }, byId.patch).plan).toEqual([
+        { id: '1', task: 'a', status: 'done', notes: '' },
+      ]);
+    }
+
+    // Σ itself is never mutated by an expansion.
+    expect(plan).toHaveLength(2);
+  });
+
+  it('applies two removals in the order the keys were written, since each shifts the indexes', () => {
+    const verifications = [
+      { check: 'a', status: 'pass' },
+      { check: 'b', status: 'fail' },
+      { check: 'c', status: 'pass' },
+    ];
+    const result = expandPathPatch(
+      { verifications },
+      { 'verifications[0]': null, 'verifications[1]': null },
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // First "a" goes, then index 1 of what is left — "c" — not "b".
+      expect(mergedRows({ verifications }, result.patch).verifications).toEqual([
+        { check: 'b', status: 'fail' },
+      ]);
     }
   });
 
@@ -334,10 +447,7 @@ describe('expandPathPatch', () => {
     if (!result.ok) expect(result.message).toContain('both wholesale and by path');
   });
 
-  it('rejects null on an element and on [+], which cannot express removal', () => {
-    const element = expandPathPatch({ plan }, { 'plan[0]': null });
-    expect(element.ok).toBe(false);
-    if (!element.ok) expect(element.message).toContain('cannot remove an array item');
+  it('rejects null on [+], which appends and so has nothing to remove', () => {
     const append = expandPathPatch({ plan }, { 'plan[+]': null });
     expect(append.ok).toBe(false);
     if (!append.ok) expect(append.message).toContain('needs the item to append');

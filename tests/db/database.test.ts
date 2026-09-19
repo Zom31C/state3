@@ -149,6 +149,77 @@ describe('openStateDatabase', () => {
   });
 });
 
+describe('migrating an older database forward', () => {
+  /**
+   * A database at an older schema version, made by undoing what the later migrations add.
+   * The migration path has to be exercised against a file that really is behind, because
+   * every project already using skillState has one.
+   */
+  function databaseAtVersion(file: string, version: number): void {
+    const db = track(openStateDatabase(file));
+    insertPage(db, 'project', 'Drift Ages', 'A driving game.', 'Physics lives in scripts/.');
+    if (version < 3) {
+      db.exec('ALTER TABLE page DROP COLUMN source_commit');
+      db.exec('ALTER TABLE page DROP COLUMN source_files');
+    }
+    if (version < 2) db.exec('DROP TABLE page_history');
+    db.exec(`PRAGMA user_version = ${version}`);
+    db.close();
+    open.pop();
+  }
+
+  /** The columns a version added, read back through a write: existing is not enough. */
+  function expectUsable(db: SqlDatabase): void {
+    expect(() =>
+      db
+        .prepare('INSERT INTO page_history (page_id, at, body) VALUES (?, ?, ?)')
+        .run('project', '2026-09-18T10:00:00.000Z', 'an older body'),
+    ).not.toThrow();
+    expect(() =>
+      db
+        .prepare('UPDATE page SET source_commit = ?, source_files = ? WHERE id = ?')
+        .run('abc1234', 'scripts/Car.cs', 'project'),
+    ).not.toThrow();
+  }
+
+  it('adds what the new version needs and keeps every row that was there', () => {
+    const file = tempFile();
+    databaseAtVersion(file, SCHEMA_VERSION - 1);
+
+    const db = track(openStateDatabase(file));
+
+    expect(db.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
+    expect(db.prepare('SELECT title, body FROM page WHERE id = ?').get('project')).toEqual({
+      title: 'Drift Ages',
+      body: 'Physics lives in scripts/.',
+    });
+    expectUsable(db);
+    expect(db.prepare('SELECT count(*) AS n FROM page_history').get()).toEqual({ n: 1 });
+  });
+
+  it('runs every migration between a database two versions back and this build', () => {
+    const file = tempFile();
+    databaseAtVersion(file, SCHEMA_VERSION - 2);
+
+    const db = track(openStateDatabase(file));
+
+    expect(db.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
+    expect(db.prepare('SELECT source_commit FROM page WHERE id = ?').get('project')).toEqual({
+      // A row carried over has no anchor: it was written before there was one to record,
+      // and inventing HEAD would claim a freshness nobody checked.
+      source_commit: null,
+    });
+    expectUsable(db);
+  });
+
+  it('search still answers for a page carried over by the migration', () => {
+    const file = tempFile();
+    databaseAtVersion(file, SCHEMA_VERSION - 2);
+
+    expect(match(track(openStateDatabase(file)), 'physics')).toEqual(['page:project']);
+  });
+});
+
 describe('search index triggers', () => {
   it('indexes a task on insert, re-indexes it on update, and drops it on delete', () => {
     const db = track(openStateDatabase(tempFile()));

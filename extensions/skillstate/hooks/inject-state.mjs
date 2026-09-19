@@ -393,7 +393,7 @@ if (primary !== null && typeof primary.task === 'string') {
             'If next.risk is "destructive" or "external", stop and report it: asking the user is the orchestrator\'s job, not yours.',
           ]
         : [
-            'After every meaningful step call task_patch with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one — without resending the array; exactly one plan item in_progress).',
+            'After every meaningful step call task_patch with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one, {"verifications[2]":null} removes one, {"plan[id=5].notes":"…"} names a step by its own id — without resending the array; exactly one plan item in_progress, and a finished step whose outcome is already in decisions may be marked {"plan[0].archived":true} to leave this injection).',
             'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.',
           ]),
     ].join('\n'),

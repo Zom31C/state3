@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { STATE_DB_FILENAME } from '../../src/db/database.js';
 import { KbError, PageStore } from '../../src/kb/store.js';
-import { SUMMARY_MAX_CHARS } from '../../src/kb/schema.js';
+import { SUMMARY_MAX_CHARS, BODY_MAX_CHARS, PAGE_BODY_HISTORY_LIMIT } from '../../src/kb/schema.js';
 import { TaskStore } from '../../src/tasks/store.js';
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -178,6 +178,135 @@ describe('PageStore.put', () => {
   });
 });
 
+describe('PageStore.patchBody and appendBody', () => {
+  const body = '# Combat\n\nStatus: not written.\n\n## Left\n\n- armour\n';
+
+  beforeEach(() => {
+    pages.put({
+      ...projectPage,
+      id: 'combat',
+      kind: 'feature',
+      title: 'Combat',
+      summary: 'S',
+      body,
+    });
+  });
+
+  it('changes part of a body and keeps the rest, which is what put cannot do cheaply', () => {
+    const stored = pages.patchBody('combat', [{ find: 'not written', replace: 'implemented' }]);
+
+    expect(stored.body).toBe('# Combat\n\nStatus: implemented.\n\n## Left\n\n- armour\n');
+    expect(pages.get('combat')?.body).toBe(stored.body);
+  });
+
+  it('counts as an update: createdAt stays, updatedAt moves', async () => {
+    const created = pages.get('combat');
+    await delay(10);
+
+    const stored = pages.patchBody('combat', [{ find: 'armour', replace: 'armour (done)' }]);
+
+    expect(stored.createdAt).toBe(created?.createdAt);
+    expect(stored.updatedAt > (created?.updatedAt ?? '')).toBe(true);
+  });
+
+  it('refuses an edit that does not match uniquely, and writes nothing', () => {
+    const refusal = refusalOf(() =>
+      pages.patchBody('combat', [
+        { find: 'armour', replace: 'armour (done)' },
+        { find: 'hull', replace: 'hull (done)' },
+      ]),
+    );
+
+    expect(refusal.category).toBe('path');
+    expect(refusal.message).toContain('edit 2 of 2 refused');
+    expect(pages.get('combat')?.body).toBe(body);
+  });
+
+  it('refuses to patch or append to a page that is not there, rather than creating it', () => {
+    const patched = refusalOf(() => pages.patchBody('nope', [{ find: 'a', replace: 'b' }]));
+    expect(patched.category).toBe('guard');
+    expect(patched.message).toContain('no page "nope" to patch');
+    expect(refusalOf(() => pages.appendBody('nope', 'text')).message).toContain('to append');
+    expect(pages.get('nope')).toBeNull();
+  });
+
+  it('re-checks the length limit, since a small edit can still grow a body past it', () => {
+    const refusal = refusalOf(() =>
+      pages.patchBody('combat', [{ find: '# Combat', replace: 'y'.repeat(BODY_MAX_CHARS) }]),
+    );
+    expect(refusal.category).toBe('schema');
+    expect(pages.get('combat')?.body).toBe(body);
+  });
+
+  it('appends below the stored body', () => {
+    expect(pages.appendBody('combat', '- ammo').body).toBe(`${body.trimEnd()}\n\n- ammo`);
+  });
+});
+
+describe('the page body history', () => {
+  it('keeps the body a write replaced, newest first', () => {
+    pages.put({ ...projectPage, body: 'first' });
+    pages.put({ id: 'project', body: 'second' });
+    pages.patchBody('project', [{ find: 'second', replace: 'third' }]);
+
+    expect(pages.get('project')?.body).toBe('third');
+    expect(pages.bodyHistory('project').map((entry) => entry.chars)).toEqual([
+      'second'.length,
+      'first'.length,
+    ]);
+  });
+
+  it('records nothing when a write left the body as it was', () => {
+    pages.put({ ...projectPage, body: 'unchanged' });
+    pages.put({ id: 'project', summary: 'A new one-liner.' });
+
+    expect(pages.bodyHistory('project')).toEqual([]);
+  });
+
+  it('keeps only the last few versions, because a body is the largest thing stored here', () => {
+    // Each body's length is its index, so the kept set can be checked by size alone.
+    const bodyOf = (index: number) => 'v' + 'x'.repeat(index);
+    pages.put({ ...projectPage, body: bodyOf(0) });
+    for (let index = 1; index <= PAGE_BODY_HISTORY_LIMIT + 3; index += 1) {
+      pages.put({ id: 'project', body: bodyOf(index) });
+    }
+
+    const kept = pages.bodyHistory('project');
+    expect(kept).toHaveLength(PAGE_BODY_HISTORY_LIMIT);
+    // The dropped ones are the oldest, so what remains still covers this session.
+    expect(kept.map((entry) => entry.chars)).toEqual(
+      Array.from(
+        { length: PAGE_BODY_HISTORY_LIMIT },
+        (_, drop) => PAGE_BODY_HISTORY_LIMIT + 3 - drop,
+      ),
+    );
+    expect(pages.get('project')?.body).toBe(bodyOf(PAGE_BODY_HISTORY_LIMIT + 3));
+  });
+
+  it('reads one stored version back by its seq, and null for one it does not have', () => {
+    pages.put({ ...projectPage, body: 'the text that was lost' });
+    pages.put({ id: 'project', body: 'current' });
+
+    const [newest] = pages.bodyHistory('project');
+    expect(newest).toBeDefined();
+    expect(pages.bodyRevision('project', newest?.seq ?? 0)?.body).toBe('the text that was lost');
+    expect(pages.bodyRevision('project', 999999)).toBeNull();
+    expect(pages.bodyRevision('nope', 1)).toBeNull();
+  });
+
+  it('drops the versions with the page, so no trail outlives what it describes', () => {
+    pages.put({ ...projectPage, body: 'first' });
+    pages.put({ id: 'project', body: 'second' });
+
+    pages.delete('project');
+
+    const left = tasks.database().prepare('SELECT count(*) AS n FROM page_history').get() as {
+      n: number;
+    };
+    expect(left.n).toBe(0);
+  });
+});
+
 describe('PageStore.list', () => {
   it('leaves bodies out, which is what makes the listing cheap enough to inject', () => {
     pages.put({ ...projectPage, body: 'x'.repeat(5000) });
@@ -320,6 +449,53 @@ describe('PageStore.delete', () => {
 
     const left = tasks.database().prepare('SELECT count(*) AS n FROM link').get() as { n: number };
     expect(left.n).toBe(0);
+  });
+});
+
+describe('anchoring a page to the tree it describes', () => {
+  const body = 'The controller lives in scripts/Car.cs:262-272 and the bar in scripts/Hud.cs.';
+
+  it('records the files a body names, and no commit when there is no repository', () => {
+    const stored = pages.put({ ...projectPage, body });
+
+    expect(stored.sourceFiles).toEqual(['scripts/Car.cs', 'scripts/Hud.cs']);
+    // This root is a temporary directory: "unknown" is recorded, not a guess at HEAD.
+    expect(stored.sourceCommit).toBeNull();
+    expect(pages.get('project')?.sourceFiles).toEqual(['scripts/Car.cs', 'scripts/Hud.cs']);
+  });
+
+  it('keeps the anchor on a write that does not touch the body', () => {
+    pages.put({ ...projectPage, body });
+
+    const corrected = pages.put({ id: 'project', summary: 'A shorter line.' });
+
+    expect(corrected.sourceFiles).toEqual(['scripts/Car.cs', 'scripts/Hud.cs']);
+  });
+
+  it('re-anchors when the body changes, since the references changed with it', () => {
+    pages.put({ ...projectPage, body });
+
+    const rewritten = pages.put({ id: 'project', body: 'Now it is scripts/CarCombat.cs.' });
+
+    expect(rewritten.sourceFiles).toEqual(['scripts/CarCombat.cs']);
+  });
+
+  it('reports a page that names no file as one nothing can stale', () => {
+    pages.put({ ...projectPage, body: 'A page about intent and decisions.' });
+
+    expect(pages.freshness('project')).toEqual({ commit: null, files: [], changed: [] });
+  });
+
+  it('answers "unknown" rather than "unchanged" when there is no git to ask', () => {
+    pages.put({ ...projectPage, body });
+
+    expect(pages.freshness('project')).toEqual({
+      commit: null,
+      files: ['scripts/Car.cs', 'scripts/Hud.cs'],
+      changed: null,
+    });
+    expect(pages.stalePages()).toEqual([]);
+    expect(pages.freshness('nope')).toBeNull();
   });
 });
 

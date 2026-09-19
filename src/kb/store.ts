@@ -1,8 +1,23 @@
 import type { RejectCategory } from '../core/rejections.js';
-import { issueCategory } from '../core/validator.js';
+import { gitCommitsTouching, gitHead } from '../core/git.js';
+import { issueCategory, issueSizeDetail } from '../core/validator.js';
 import type { SqlDatabase } from '../db/database.js';
-import type { DatabaseOwner } from './ports.js';
-import { isPageKind, isPageStatus, pageGuard, pageInputSchema } from './schema.js';
+import { applyBodyEdits, appendToBody } from './body.js';
+import type { BodyEdit } from './body.js';
+import type {
+  BodyRevision,
+  BodyRevisionText,
+  DatabaseOwner,
+  PageFreshness,
+  StalePage,
+} from './ports.js';
+import {
+  PAGE_BODY_HISTORY_LIMIT,
+  isPageKind,
+  isPageStatus,
+  pageGuard,
+  pageInputSchema,
+} from './schema.js';
 import type {
   PageFilter,
   PageInput,
@@ -14,8 +29,10 @@ import type {
 } from './schema.js';
 import { searchDatabase } from './search.js';
 import type { SearchHit, SearchOptions } from './search.js';
+import { decodeSourceFiles, encodeSourceFiles, extractSourceFiles } from './sources.js';
 
-export type { DatabaseOwner } from './ports.js';
+export type { BodyRevision, BodyRevisionText, DatabaseOwner } from './ports.js';
+export type { PageFreshness, StalePage } from './ports.js';
 
 /**
  * A refused page write. It carries the same rejection vocabulary as a refused task
@@ -42,14 +59,24 @@ interface PageRow {
   parent: string | null;
   status: string;
   pin: number;
+  source_commit: string | null;
+  source_files: string;
   created_at: string;
   updated_at: string;
 }
 
-const PAGE_COLUMNS = 'id, kind, title, summary, body, parent, status, pin, created_at, updated_at';
+const PAGE_COLUMNS =
+  'id, kind, title, summary, body, parent, status, pin, source_commit, source_files, ' +
+  'created_at, updated_at';
 
 /** Pinned first, then the most recently touched: what a reader wants from "what is here". */
 const PAGE_ORDER = 'ORDER BY pin DESC, updated_at DESC, id';
+
+/** How many pages the staleness report lists; the rest are reachable by raising the limit. */
+export const STALE_PAGES_LIMIT = 20;
+
+/** How many pages the report examines to find them: each one costs a git call. */
+export const STALE_SCAN_LIMIT = 100;
 
 export class PageStore {
   constructor(private readonly owner: DatabaseOwner) {}
@@ -67,9 +94,13 @@ export class PageStore {
       const issue = parsed.error.issues[0];
       if (issue === undefined) throw new KbError('schema', 'Page validation failed.');
       const at = issue.path.length > 0 ? `at "${issue.path.join('.')}" ` : '';
+      // The sent value, not the parsed one: a value that failed its length check has no
+      // parsed form, and its actual size is the number the caller needs to shorten by.
+      const size = issueSizeDetail(issue, input);
       throw new KbError(
         issueCategory(issue.code),
-        `Page validation failed ${at}(${issue.code}): ${issue.message}`,
+        `Page validation failed ${at}(${issue.code}): ${issue.message}` +
+          (size === null ? '' : ` — ${size}`),
       );
     }
     const draft: PageInput = parsed.data;
@@ -95,17 +126,38 @@ export class PageStore {
         this.kindOf(current);
       }
 
-      const page = this.merge(draft, current, now);
+      const body = draft.body ?? current?.body ?? '';
+      const bodyChanged = current === null || current.body !== body;
+      // The anchor moves only with the body. A page whose summary was corrected still
+      // describes the code it described, and re-anchoring it would report a freshness
+      // nobody checked — the exact false confidence the anchor exists to remove.
+      const anchor = bodyChanged
+        ? this.anchorFor(body)
+        : {
+            commit: current?.source_commit ?? null,
+            files: decodeSourceFiles(current?.source_files ?? ''),
+          };
+
+      const page = this.merge(draft, current, now, anchor);
       const refusal = pageGuard(page, (id) => this.refOrNull(db, id));
       if (refusal !== null) throw new KbError('guard', refusal);
 
+      // The body about to be replaced is the one worth keeping: it is the text a
+      // reader may have cited a minute ago, and after this write nothing else holds
+      // it. Recorded in the same transaction, so a page and its trail cannot disagree.
+      if (current !== null && bodyChanged) {
+        this.rememberBody(db, draft.id, current.body, now);
+      }
+
       db.prepare(
-        `INSERT INTO page (id, kind, title, summary, body, parent, status, pin, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO page (id, kind, title, summary, body, parent, status, pin, source_commit,
+           source_files, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (id) DO UPDATE SET
            kind = excluded.kind, title = excluded.title, summary = excluded.summary,
            body = excluded.body, parent = excluded.parent, status = excluded.status,
-           pin = excluded.pin, updated_at = excluded.updated_at`,
+           pin = excluded.pin, source_commit = excluded.source_commit,
+           source_files = excluded.source_files, updated_at = excluded.updated_at`,
       ).run(
         page.id,
         page.kind,
@@ -115,12 +167,201 @@ export class PageStore {
         page.parent,
         page.status,
         page.pin ? 1 : 0,
+        page.sourceCommit,
+        encodeSourceFiles(page.sourceFiles),
         page.createdAt,
         page.updatedAt,
       );
 
       return page;
     });
+  }
+
+  /**
+   * The commit and the files a body is anchored to.
+   *
+   * The commit is read at write time, not at read time, because it has to say what the tree
+   * looked like when the page was written — asking later would answer a different question.
+   * A project with no repository, and an owner that holds only a database handle, anchor to
+   * null: the files are still worth recording, and "unknown" must stay distinguishable from
+   * "nothing changed".
+   */
+  private anchorFor(body: string): { commit: string | null; files: string[] } {
+    const projectDir = this.owner.projectDir?.();
+    return {
+      commit: projectDir === undefined ? null : gitHead(projectDir),
+      files: extractSourceFiles(body),
+    };
+  }
+
+  /**
+   * Changes part of a page's body, instead of the whole of it.
+   *
+   * Every edit must address exactly one place in the text, and a refused edit leaves
+   * the stored body untouched — the edits are applied to a copy and only written once
+   * all of them landed. The write itself goes through `put`, so a patched body is
+   * re-indexed for search and re-checked against the length limit like any other.
+   */
+  patchBody(id: string, edits: readonly BodyEdit[]): PageRecord {
+    const current = this.get(id);
+    if (current === null) throw this.noSuchPage(id, 'patch');
+
+    const result = applyBodyEdits(current.body, edits);
+    if (!result.ok) {
+      throw new KbError(
+        'path',
+        `edit ${result.index + 1} of ${edits.length} refused: ${result.message}`,
+      );
+    }
+    return this.put({ id, body: result.body });
+  }
+
+  /** Adds text at the end of a body: the cheapest way to record one more measurement. */
+  appendBody(id: string, text: string): PageRecord {
+    const current = this.get(id);
+    if (current === null) throw this.noSuchPage(id, 'append');
+    return this.put({ id, body: appendToBody(current.body, text) });
+  }
+
+  /**
+   * `patch` and `append` need a page to change, and "there is none" is a different
+   * answer from `put`'s: writing a body edit for a page that does not exist is a
+   * mistaken id far more often than an intention to create it.
+   */
+  private noSuchPage(id: string, op: string): KbError {
+    return new KbError(
+      'guard',
+      `no page "${id}" to ${op} — check the id with op "list", or create the page with op "put"`,
+    );
+  }
+
+  /**
+   * The bodies a page had before this one, newest first, without their text: a
+   * listing costs a line per version, and reading one is a separate call. The current
+   * body is not among them — that is what `get` returns — and a page that was never
+   * rewritten has none.
+   */
+  bodyHistory(id: string, limit: number = PAGE_BODY_HISTORY_LIMIT): BodyRevision[] {
+    const db = this.owner.readable();
+    if (db === null) return [];
+    const rows = db
+      .prepare(
+        `SELECT seq, at, length(body) AS chars FROM page_history
+         WHERE page_id = ? ORDER BY seq DESC LIMIT ?`,
+      )
+      .all(id, limit) as BodyRevision[];
+    return rows;
+  }
+
+  /**
+   * One previous body in full, by the `seq` its history line printed. Addressed by
+   * seq rather than by position in the listing, because a position shifts as soon as
+   * the page is written again — and a version read silently turning into another one
+   * is exactly the confusion this trail exists to remove.
+   */
+  bodyRevision(id: string, seq: number): BodyRevisionText | null {
+    const db = this.owner.readable();
+    if (db === null) return null;
+    const row = db
+      .prepare('SELECT at, body FROM page_history WHERE page_id = ? AND seq = ?')
+      .get(id, seq) as BodyRevisionText | undefined;
+    return row === undefined ? null : row;
+  }
+
+  /**
+   * What this page is anchored to, and what has moved in the tree under it since.
+   *
+   * `changed` is null when the question has no answer — no repository, or a page written
+   * before anchoring existed — and an empty list when the files are unchanged. Keeping those
+   * apart is the whole point: a reader who cannot tell them apart learns to distrust every
+   * page, including the ones that are current.
+   */
+  freshness(id: string): PageFreshness | null {
+    const page = this.get(id);
+    if (page === null) return null;
+    const files = page.sourceFiles;
+    // A page that names no file describes decisions and intent, which no commit can stale.
+    if (files.length === 0) return { commit: page.sourceCommit, files, changed: [] };
+
+    const projectDir = this.owner.projectDir?.();
+    if (projectDir === undefined || page.sourceCommit === null) {
+      return { commit: page.sourceCommit, files, changed: null };
+    }
+    return {
+      commit: page.sourceCommit,
+      files,
+      changed: gitCommitsTouching(projectDir, page.sourceCommit, files),
+    };
+  }
+
+  /**
+   * The pages whose files changed after they were written, worst first.
+   *
+   * Scanned most-recently-updated first and capped, because each page costs a git call: a
+   * report that took a minute on a large knowledge base would not be run at cold start,
+   * which is the one moment it is worth reading.
+   */
+  stalePages(limit: number = STALE_PAGES_LIMIT): StalePage[] {
+    const db = this.owner.readable();
+    if (db === null) return [];
+    const projectDir = this.owner.projectDir?.();
+    if (projectDir === undefined) return [];
+    const head = gitHead(projectDir);
+    if (head === null) return [];
+
+    const rows = db
+      .prepare(
+        `SELECT id, title, source_commit, source_files FROM page
+          WHERE source_commit IS NOT NULL AND source_files <> '' AND status <> 'archived'
+          ORDER BY updated_at DESC, id LIMIT ?`,
+      )
+      .all(STALE_SCAN_LIMIT) as {
+      id: string;
+      title: string;
+      source_commit: string;
+      source_files: string;
+    }[];
+
+    const stale: StalePage[] = [];
+    for (const row of rows) {
+      // Written against the current commit: nothing can have moved under it since.
+      if (row.source_commit === head) continue;
+      const files = decodeSourceFiles(row.source_files);
+      if (files.length === 0) continue;
+      const touches = gitCommitsTouching(projectDir, row.source_commit, files);
+      if (touches === null || touches.length === 0) continue;
+
+      const changed: string[] = [];
+      for (const touch of touches) {
+        for (const file of touch.files) {
+          if (!changed.includes(file)) changed.push(file);
+        }
+      }
+      stale.push({
+        id: row.id,
+        title: row.title,
+        commit: row.source_commit,
+        commits: touches.length,
+        files: changed,
+      });
+      if (stale.length >= limit) break;
+    }
+    return stale.sort((a, b) => b.commits - a.commits || (a.id < b.id ? -1 : 1));
+  }
+
+  /** Keeps the body being replaced, then drops the versions that no longer fit. */
+  private rememberBody(db: SqlDatabase, pageId: string, body: string, at: string): void {
+    db.prepare('INSERT INTO page_history (page_id, at, body) VALUES (?, ?, ?)').run(
+      pageId,
+      at,
+      body,
+    );
+    db.prepare(
+      `DELETE FROM page_history
+        WHERE page_id = ? AND seq NOT IN (
+          SELECT seq FROM page_history WHERE page_id = ? ORDER BY seq DESC LIMIT ?
+        )`,
+    ).run(pageId, pageId, PAGE_BODY_HISTORY_LIMIT);
   }
 
   /** One page with its body, or null when there is no such page. */
@@ -209,7 +450,12 @@ export class PageStore {
     return searchDatabase(this.owner.readable(), query, options);
   }
 
-  private merge(draft: PageInput, current: PageRow | null, now: string): PageRecord {
+  private merge(
+    draft: PageInput,
+    current: PageRow | null,
+    now: string,
+    anchor: { commit: string | null; files: string[] },
+  ): PageRecord {
     const kind = draft.kind ?? (current === null ? undefined : this.kindOf(current));
     const title = draft.title ?? current?.title;
     const summary = draft.summary ?? current?.summary;
@@ -226,6 +472,8 @@ export class PageStore {
       parent: draft.parent === undefined ? (current?.parent ?? null) : draft.parent,
       status,
       pin: draft.pin ?? current?.pin === 1,
+      sourceCommit: anchor.commit,
+      sourceFiles: anchor.files,
       createdAt: current?.created_at ?? now,
       updatedAt: now,
     };
@@ -241,6 +489,8 @@ export class PageStore {
       parent: row.parent,
       status: this.statusOf(row),
       pin: row.pin === 1,
+      sourceCommit: row.source_commit,
+      sourceFiles: decodeSourceFiles(row.source_files),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };

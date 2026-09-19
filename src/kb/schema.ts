@@ -45,6 +45,16 @@ export const SUMMARY_MAX_CHARS = 200;
 /** A page orients an agent; a 200 KB page is a file dump, and the repository already holds the files. */
 export const BODY_MAX_CHARS = 20_000;
 
+/**
+ * Previous bodies kept per page, newest first.
+ *
+ * Enough to undo a rewrite made this session and to answer "what did this page say
+ * before", which is the loss the history exists to prevent. A body is the largest
+ * thing stored here, so the trail is deliberately short and the oldest entry is
+ * dropped on the write that overflows it.
+ */
+export const PAGE_BODY_HISTORY_LIMIT = 10;
+
 /** A deeper chain than this is a cycle somebody made by hand, not a tree. */
 export const PARENT_DEPTH_LIMIT = 100;
 
@@ -89,6 +99,14 @@ export interface PageRecord {
   parent: string | null;
   status: PageStatus;
   pin: boolean;
+  /**
+   * The commit this body was written against, and the project files it names. Both are
+   * derived on write, never sent by a caller: the agent does not know HEAD, and the file
+   * list is read out of the body so it cannot disagree with it. A null commit means the
+   * project has no repository to anchor to, which is not the same as "nothing changed".
+   */
+  sourceCommit: string | null;
+  sourceFiles: string[];
   createdAt: string;
   updatedAt: string;
 }

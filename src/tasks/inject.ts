@@ -164,7 +164,11 @@ export function readInjection(rootDir: string, options: InjectionOptions = {}): 
     const head = readTaskHead(
       db,
       dbPath,
-      options.subagent === true ? renderTaskBrief : renderTaskHead,
+      options.subagent === true
+        ? renderTaskBrief
+        : // A prompt is not a read: it carries Σ on every turn of the task, so it drops the
+          // archived steps and, above the threshold, everything but the step in flight.
+          (task) => renderTaskHead(task, { injected: true }),
     );
     if (head.unreadable !== null) return { kind: 'unreadable', reason: head.unreadable };
     const brief = options.brief === true ? renderDatabaseBrief(db) : null;

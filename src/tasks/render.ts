@@ -1,17 +1,29 @@
 import { isPlainObject } from '../core/state.js';
-import type { StateDict } from '../core/types.js';
+import type { StateDict, StateValue } from '../core/types.js';
 import { notationReminder } from './notation.js';
 import type { StoredTask } from './store.js';
 
 /** Above this size Σ stops being an O(1) prompt component, so the agent is told to compress it. */
 export const STATE_SIZE_HINT_CHARS = 4000;
 
+/**
+ * Above this size an injected Σ is cut down to the step in flight, `next` and `blockers`.
+ *
+ * Σ is injected on every prompt, so a state that grew past this is a tax on every turn of
+ * the task, and "compress it" alone does not pay for itself: the agent that could shrink Σ
+ * mid-step usually does not. What the injection keeps is what the next action can be read
+ * from; everything else is one `task_show` away, and the note says exactly what was left out
+ * and how big the state that holds it is.
+ */
+export const STATE_DELTA_THRESHOLD_CHARS = 6000;
+
 export function stateSizeHint(state: unknown): string {
   const compact = JSON.stringify(state);
   if (compact.length <= STATE_SIZE_HINT_CHARS) return '';
   return (
-    `Σ is ${compact.length} chars — compress it: keep only what future steps need ` +
-    'and reduce finished work to its outcome.'
+    `Σ is ${compact.length} chars — compress it: keep only what future steps need, ` +
+    'reduce finished work to its outcome, and archive the plan steps whose outcome is ' +
+    'already in decisions ({"plan[0].archived":true}) so the injection stops carrying them.'
   );
 }
 
@@ -20,13 +32,177 @@ export function taskStatus(state: StateDict): string {
   return typeof state.status === 'string' && state.status !== '' ? state.status : 'unknown';
 }
 
-/** Task header plus the compact single-line Σ; shared by the MCP tools and the CLI. */
-export function renderTaskHead(task: StoredTask): string {
+export interface RenderOptions {
+  /**
+   * Render what a prompt carries, rather than what a read answers. An injected Σ drops the
+   * plan steps marked `archived` and, above `STATE_DELTA_THRESHOLD_CHARS`, everything but the
+   * step in flight. A tool answer keeps the whole state: it is the confirmation of a write,
+   * and `task_show` is the call whose contract is to return all of Σ.
+   */
+  injected?: boolean;
+}
+
+/** Σ as a prompt carries it, plus the lines that say what was left out of it. */
+export interface InjectedView {
+  state: StateDict;
+  notes: string[];
+  /** True when the notes already carry the size complaint, so the plain hint stays out. */
+  reportsSize: boolean;
+}
+
+/** Σ without the plan steps marked archived, and how many that removed. */
+export function dropArchivedSteps(state: StateDict): { state: StateDict; archived: number } {
+  const plan = state.plan;
+  if (!Array.isArray(plan)) return { state, archived: 0 };
+  const kept = plan.filter((item) => !(isPlainObject(item) && item.archived === true));
+  const archived = plan.length - kept.length;
+  // The array itself is never rewritten in Σ: an archived step keeps its index and its id,
+  // so a path key written before the archiving still addresses the same step afterwards.
+  if (archived === 0) return { state, archived: 0 };
+  return { state: { ...state, plan: kept }, archived };
+}
+
+/** How many entries a field holds, whether it is an array or a map; 0 for anything else. */
+function sizeOf(state: StateDict, field: string): number {
+  const value = state[field];
+  if (Array.isArray(value)) return value.length;
+  if (isPlainObject(value)) return Object.keys(value).length;
+  return 0;
+}
+
+/** Plan items counted by status, as "5 done, 2 pending": what a cut injection still owes. */
+function planCounts(plan: readonly StateValue[]): string {
+  const counts = new Map<string, number>();
+  for (const item of plan) {
+    if (!isPlainObject(item)) continue;
+    const status = typeof item.status === 'string' && item.status !== '' ? item.status : 'unknown';
+    counts.set(status, (counts.get(status) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([status, count]) => `${count} ${status}`).join(', ');
+}
+
+/**
+ * The injected view of Σ: archived steps out, and above the threshold only the delta.
+ *
+ * Both cuts are reported in the same breath as the state, because an injection that quietly
+ * held less than Σ would be worse than a large one: a resumed session reads this text as the
+ * authoritative record of its progress, so it has to be told what it is NOT seeing.
+ */
+export function injectedView(state: StateDict): InjectedView {
+  const kept = dropArchivedSteps(state);
+  const archivedNote =
+    kept.archived === 0
+      ? []
+      : [
+          `+${kept.archived} archived plan step(s) left out of this injection — task_show lists every one.`,
+        ];
+
+  const total = JSON.stringify(state).length;
+  if (JSON.stringify(kept.state).length <= STATE_DELTA_THRESHOLD_CHARS) {
+    return { state: kept.state, notes: archivedNote, reportsSize: false };
+  }
+
+  const plan = Array.isArray(kept.state.plan) ? kept.state.plan : [];
+  const inFlight = plan.filter((item) => isPlainObject(item) && item.status === 'in_progress');
+  const leftOutSteps = plan.filter((item) => !inFlight.includes(item));
+  const delta: StateDict = {};
+  for (const field of ['goal', 'status', 'blockers', 'next'] as const) {
+    if (kept.state[field] !== undefined) delta[field] = kept.state[field];
+  }
+  if (inFlight.length > 0) delta.plan = inFlight;
+
+  const leftOut = [
+    leftOutSteps.length > 0
+      ? `${leftOutSteps.length} plan step(s) (${planCounts(leftOutSteps)})`
+      : null,
+    sizeOf(kept.state, 'artifacts') > 0 ? `${sizeOf(kept.state, 'artifacts')} artifacts` : null,
+    sizeOf(kept.state, 'decisions') > 0 ? `${sizeOf(kept.state, 'decisions')} decisions` : null,
+    sizeOf(kept.state, 'verifications') > 0
+      ? `${sizeOf(kept.state, 'verifications')} verifications`
+      : null,
+  ].filter((entry): entry is string => entry !== null);
+
+  return {
+    state: delta,
+    notes: [
+      `Σ is ${total} chars, so this injection carries only the step in flight, next and blockers — ` +
+        `left out: ${leftOut.length === 0 ? 'nothing else' : leftOut.join(', ')}` +
+        `${kept.archived === 0 ? '' : `, plus ${kept.archived} archived step(s)`}. ` +
+        'task_show returns all of it; compress Σ so the injection can carry it again.',
+    ],
+    reportsSize: true,
+  };
+}
+
+/** What one top-level field of Σ costs, as `task_show {"view":"size"}` reports it. */
+export interface FieldSize {
+  field: string;
+  /** Characters the field takes inside Σ, its key included. */
+  chars: number;
+  /** Items of an array or keys of a map; null for a scalar field. */
+  entries: number | null;
+}
+
+/**
+ * Every field of Σ with its size, largest first.
+ *
+ * "Compress it" without a breakdown is an invitation to rewrite the state on guesswork, and
+ * a rewrite is the most expensive thing an agent can do to Σ: it retypes what it was trying
+ * to shorten. Naming the field that costs most turns that into one targeted edit.
+ */
+export function stateSizes(state: StateDict): FieldSize[] {
+  const sizes: FieldSize[] = [];
+  for (const [field, value] of Object.entries(state)) {
+    sizes.push({
+      field,
+      chars: `${JSON.stringify(field)}:${JSON.stringify(value)}`.length,
+      entries: Array.isArray(value)
+        ? value.length
+        : isPlainObject(value)
+          ? Object.keys(value).length
+          : null,
+    });
+  }
+  return sizes.sort((a, b) => b.chars - a.chars || (a.field < b.field ? -1 : 1));
+}
+
+/** The size report: what Σ costs in total and which field to shorten first. */
+export function renderStateSize(state: StateDict): string {
+  const sizes = stateSizes(state);
+  const total = JSON.stringify(state).length;
+  const width = sizes.reduce((widest, size) => Math.max(widest, size.field.length), 0);
+
+  const lines = sizes.map((size) => {
+    const share = total === 0 ? 0 : Math.round((size.chars / total) * 100);
+    const entries = size.entries === null ? '' : `, ${size.entries} item(s)`;
+    return `- ${size.field.padEnd(width)} ${String(size.chars).padStart(6)} chars (${String(share).padStart(3)}%${entries})`;
+  });
+
   return [
-    `Task ${task.meta.id} [${task.meta.skill}] (${taskStatus(task.state)}):`,
-    JSON.stringify(task.state),
+    `Σ is ${total} chars over ${sizes.length} field(s), largest first:`,
+    ...lines,
+    'Shorten the top of this list: a field earns its size only if the next step reads it, and ' +
+      'Σ is carried on every prompt of this task.',
+    'Archiving a finished plan step ({"plan[0].archived":true}) leaves it in Σ but drops it ' +
+      'from the injection; task_show {"view":"state"} reads Σ itself.',
+  ].join('\n');
+}
+
+/** Task header plus the compact single-line Σ; shared by the MCP tools and the CLI. */
+export function renderTaskHead(task: StoredTask, options: RenderOptions = {}): string {
+  const view: InjectedView =
+    options.injected === true
+      ? injectedView(task.state)
+      : { state: task.state, notes: [], reportsSize: false };
+
+  return [
+    `Task ${task.meta.id} [${task.meta.skill}] (${taskStatus(view.state)}):`,
+    JSON.stringify(view.state),
+    ...view.notes,
     notationReminder(task.meta.notation),
-    stateSizeHint(task.state),
+    // The hint is about the stored Σ, not about the view: compressing a rendering would
+    // change nothing on disk, and the delta view already said how big the state is.
+    view.reportsSize ? '' : stateSizeHint(task.state),
   ]
     .filter((line) => line !== '')
     .join('\n');

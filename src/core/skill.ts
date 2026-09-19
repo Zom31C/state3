@@ -4,6 +4,10 @@ export interface SchemaIssue {
   code: string;
   path: readonly PropertyKey[];
   message: string;
+  /** Present on a size refusal (`too_big`): the bound the value went past. */
+  maximum?: number | bigint;
+  /** Present on a size refusal (`too_small`): the bound the value fell short of. */
+  minimum?: number | bigint;
 }
 
 /**

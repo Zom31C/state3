@@ -48,7 +48,11 @@ export function validatePatch(skill: Skill, state: StateDict, patch: StateDict):
   if (issue === undefined) {
     return { ok: false, category: 'schema', message: 'State schema validation failed.' };
   }
-  return { ok: false, category: issueCategory(issue.code), message: formatIssue(issue) };
+  return {
+    ok: false,
+    category: issueCategory(issue.code),
+    message: formatIssue(issue, candidate),
+  };
 }
 
 /**
@@ -67,7 +71,52 @@ export function issueCategory(code: string): ValidationErrorCategory {
   }
 }
 
-function formatIssue(issue: SchemaIssue): string {
+/** The value a size refusal is about, found by walking the issue's path into `subject`. */
+function valueAtPath(subject: unknown, path: readonly PropertyKey[]): unknown {
+  let node: unknown = subject;
+  for (const key of path) {
+    if (typeof node !== 'object' || node === null) return undefined;
+    node = (node as Record<PropertyKey, unknown>)[key];
+  }
+  return node;
+}
+
+/**
+ * How far past the limit the sent value actually was, or null when the issue is not a
+ * size one.
+ *
+ * A limit quoted without the value that crossed it leaves the caller shortening blindly
+ * and retrying — and on a refused write the text it typed is already gone, so each retry
+ * costs the whole field again. `"summary" is 214 chars, limit 200` is one line and ends
+ * the guessing. Exported because the knowledge base validates with zod too and must
+ * report its limits the same way.
+ */
+export function issueSizeDetail(issue: SchemaIssue, subject: unknown): string | null {
+  const bound =
+    issue.code === 'too_big'
+      ? issue.maximum
+      : issue.code === 'too_small'
+        ? issue.minimum
+        : undefined;
+  if (bound === undefined) return null;
+
+  const value = valueAtPath(subject, issue.path);
+  const name = issue.path.length === 0 ? 'the value' : `"${issue.path.join('.')}"`;
+  const word = issue.code === 'too_big' ? 'limit' : 'minimum';
+
+  if (typeof value === 'string') return `${name} is ${value.length} chars, ${word} ${bound}`;
+  if (Array.isArray(value)) return `${name} has ${value.length} item(s), ${word} ${bound}`;
+  if (typeof value === 'number' || typeof value === 'bigint') {
+    return `${name} is ${String(value)}, ${word} ${String(bound)}`;
+  }
+  return null;
+}
+
+function formatIssue(issue: SchemaIssue, subject: unknown): string {
   const at = issue.path.length > 0 ? `at "${issue.path.join('.')}" ` : '';
-  return `State validation failed ${at}(${issue.code}): ${issue.message}`;
+  const size = issueSizeDetail(issue, subject);
+  return (
+    `State validation failed ${at}(${issue.code}): ${issue.message}` +
+    (size === null ? '' : ` — ${size}`)
+  );
 }

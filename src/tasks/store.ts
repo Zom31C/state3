@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { gitHead } from '../core/git.js';
+import { projectDirOf } from '../core/paths.js';
 import type { RejectCategory } from '../core/rejections.js';
 import type { Skill } from '../core/skill.js';
 import { expandPathPatch, isPlainObject, mergeState } from '../core/state.js';
@@ -13,6 +15,7 @@ import type { Notation } from './notation.js';
 import { composeProcedure } from './procedure.js';
 import { builtinSkillRegistry } from './registry.js';
 import type { SkillRegistry } from './registry.js';
+import { stampVerifications } from './verifications.js';
 
 /** A finished task has no next step; its outcome lives in `decisions`. */
 const FINISHED_NEXT_ACTION = 'None — task finished; the outcome is the last decisions entry.';
@@ -129,6 +132,15 @@ export class TaskStore {
   /** Absolute path of the database file this store reads and writes. */
   get dbPath(): string {
     return join(this.rootDir, STATE_DB_FILENAME);
+  }
+
+  /**
+   * The project this root belongs to. The knowledge base borrows it to anchor pages to a
+   * commit, and the task store stamps verifications with it: both are facts about the tree,
+   * not about the state directory.
+   */
+  projectDir(): string {
+    return projectDirOf(this.rootDir);
   }
 
   /**
@@ -421,6 +433,12 @@ export class TaskStore {
     if (!validation.ok) return reject(validation.category, validation.message);
 
     const merged = mergeState(state, expanded.patch);
+    // Stamped before validation, so the stamps are checked like everything else the write
+    // produces, and before the transaction, so a refused patch spawns no git subprocess.
+    stampVerifications(state, merged, () => ({
+      at: now,
+      commit: gitHead(projectDirOf(this.rootDir)),
+    }));
     const parsed = skill.schema.safeParse(merged);
     if (!parsed.success) {
       const issue = parsed.error.issues[0];

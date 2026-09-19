@@ -1,17 +1,23 @@
 import { isRejectCategory } from '../core/rejections.js';
 import type { RejectCategory } from '../core/rejections.js';
 import { LINK_DIRECTIONS, type KbResolver, type KbStores, type LinkRef } from '../kb/ports.js';
-import type { LinkDirection } from '../kb/ports.js';
+import type { LinkDirection, PageFreshness, StalePage } from '../kb/ports.js';
 import { SUGGESTED_LINK_RELS } from '../kb/links.js';
+import { MAX_BODY_EDITS, parseBodyEdits } from '../kb/body.js';
 import {
+  BODY_MAX_CHARS,
+  PAGE_BODY_HISTORY_LIMIT,
   PAGE_KINDS,
   PAGE_STATUSES,
   SINGLETON_PAGE_KINDS,
+  SUMMARY_MAX_CHARS,
+  TITLE_MAX_CHARS,
   isPageKind,
   isPageStatus,
 } from '../kb/schema.js';
 import type { PageRecord, PageSummary } from '../kb/schema.js';
 import { renderProjectBrief } from '../kb/brief.js';
+import { STALE_PAGES_LIMIT, STALE_SCAN_LIMIT } from '../kb/store.js';
 import { initPages, renderInitReport } from '../kb/templates.js';
 import type { SearchHit } from '../kb/search.js';
 import { MAX_SEARCH_LIMIT } from '../kb/search.js';
@@ -40,6 +46,10 @@ type EdgeList = readonly string[];
 export const PAGE_OPS = [
   'get',
   'put',
+  'patch',
+  'append',
+  'history',
+  'stale',
   'list',
   'delete',
   'init',
@@ -54,6 +64,10 @@ export type PageOp = (typeof PAGE_OPS)[number];
 const OP_ARGS: Record<PageOp, readonly string[]> = {
   get: ['id'],
   put: ['id', 'kind', 'title', 'summary', 'body', 'parent', 'status', 'pin'],
+  patch: ['id', 'edits'],
+  append: ['id', 'body'],
+  history: ['id', 'revision'],
+  stale: ['limit'],
   list: ['kind', 'status'],
   delete: ['id'],
   init: [],
@@ -72,6 +86,7 @@ const KB_HINTS: Partial<Record<RejectCategory, string>> = {
     'remove the arguments this operation does not take; the tool description lists them per op.',
   guard:
     'a knowledge-base rule refused this write; follow the message above — a singleton page lives at its kind name, a parent must exist, and nothing may become its own ancestor.',
+  path: 'a body edit addressed text that is not there, or that is there more than once; read the page with op "get" and copy the text verbatim, adding surrounding lines until the match is unique.',
   schema:
     'check the values against the page schema: a lowercase id, one of the listed kinds, a non-empty title and summary.',
   'type-coercion':
@@ -134,7 +149,11 @@ function refText(ref: LinkRef): string {
 }
 
 /** One page in full: the header line, the fields, its edges, then the body verbatim. */
-export function renderPage(page: PageRecord, edges: EdgeList): string {
+export function renderPage(
+  page: PageRecord,
+  edges: EdgeList,
+  fresh: PageFreshness | null = null,
+): string {
   const flags = [page.status, page.pin ? 'pinned' : ''].filter((flag) => flag !== '');
   const head = [`page ${page.id} [${page.kind}] (${flags.join(', ')})`];
   const fields = [
@@ -142,10 +161,76 @@ export function renderPage(page: PageRecord, edges: EdgeList): string {
     `summary: ${page.summary}`,
     `parent:  ${page.parent ?? 'none'}`,
     `updated: ${page.updatedAt}`,
+    ...renderFreshness(fresh),
   ];
   const links =
     edges.length === 0 ? ['links:   none'] : ['links:', ...edges.map((edge) => `  ${edge}`)];
   return [...head, ...fields, ...links, '', page.body].join('\n');
+}
+
+/** How many files the source line names before it counts the rest instead. */
+const SOURCE_FILES_SHOWN = 6;
+
+/**
+ * What a page is anchored to, as the lines `page get` prints.
+ *
+ * The three answers are kept apart on purpose: "unchanged since" is a page a reader can
+ * trust, "changed since" names the commits to go and look at, and "unknown" says the question
+ * could not be asked — no repository, or a page written before anchoring existed. Collapsing
+ * the last two into silence is what let a stale page read as a current one.
+ */
+export function renderFreshness(fresh: PageFreshness | null): string[] {
+  if (fresh === null) return [];
+  const anchor = fresh.commit === null ? 'no repository' : fresh.commit;
+
+  if (fresh.files.length === 0) {
+    return [`source:  ${anchor}; names no file — nothing under it can go stale`];
+  }
+
+  const shown = fresh.files.slice(0, SOURCE_FILES_SHOWN).join(', ');
+  const rest = fresh.files.length - SOURCE_FILES_SHOWN;
+  const files = rest > 0 ? `${shown}, +${rest} more` : shown;
+
+  if (fresh.changed === null) {
+    return [`source:  ${anchor}; names ${files} — changed since: unknown (no git to ask)`];
+  }
+  if (fresh.changed.length === 0) {
+    return [`source:  current as of ${anchor}; names ${files} — unchanged since`];
+  }
+
+  // One entry per file with the newest commit that touched it: the pair a reader needs to
+  // decide whether the paragraph it was about to trust still describes the code.
+  const touched = new Map<string, string>();
+  for (const commit of fresh.changed) {
+    for (const file of commit.files) touched.set(file, commit.commit);
+  }
+  const since = [...touched.entries()].map(([file, commit]) => `${file} (${commit})`).join(', ');
+  return [
+    `source:  current as of ${anchor}; names ${files}`,
+    `changed: ${fresh.changed.length} commit(s) since — ${since}`,
+  ];
+}
+
+/** The staleness report of a whole knowledge base, worst first. */
+export function renderStaleReport(stale: readonly StalePage[], scanned: number): string {
+  if (stale.length === 0) {
+    return (
+      `no page names a file that changed after the page was written (checked the ${scanned} ` +
+      'most recently updated ones).\n' +
+      'A page with no anchor — no repository, or written before anchoring existed — cannot be ' +
+      'checked; page {"op":"get","id":"<id>"} says what one is anchored to.'
+    );
+  }
+  return [
+    `Pages describing code that moved since they were written (${stale.length}, worst first):`,
+    ...stale.map(
+      (page) =>
+        `- ${page.id}: ${page.title} — written at ${page.commit ?? 'unknown'}, ` +
+        `${page.commits} commit(s) since touched ${page.files.join(', ')}`,
+    ),
+    'Read the code before trusting a line number in one of these, then rewrite the page with ' +
+      'op "patch" or "put" — a write re-anchors it to the current commit.',
+  ].join('\n');
 }
 
 /** One line per page, and never a body: this is the cheap level of the token pyramid. */
@@ -154,6 +239,34 @@ export function renderPageLine(page: PageSummary): string {
   const status = page.status === 'current' ? '' : ` (${page.status})`;
   return `- ${page.id}${pin} [${page.kind}]${status} ${page.title} — ${page.summary}`;
 }
+
+/**
+ * What a body write answers: what was done, and what the body weighs now.
+ *
+ * The sizes are the point. A partial edit is trusted precisely because it does not
+ * retype the text, and the same property removes the only check the caller had — so
+ * the answer reports the difference instead. A model that meant to add a line and
+ * sees "4521 -> 812" stops there, where a bare "Updated" would have let it continue.
+ */
+export function bodyWriteAnswer(lead: string, page: PageRecord, bodyBefore: number): string {
+  const delta = page.body.length - bodyBefore;
+  const change = delta === 0 ? 'size unchanged' : `${delta > 0 ? '+' : ''}${delta} chars`;
+  return [
+    `${lead} — body ${bodyBefore} -> ${page.body.length} (${change})`,
+    `summary: ${page.summary}`,
+  ].join('\n');
+}
+
+/** The refusal a body edit gets when the page it names is not there. */
+function noPageToEdit(id: string, op: PageOp): string {
+  return (
+    `No page "${id}" to ${op}.\n` +
+    'List what exists with op "list", or write the page with op "put".'
+  );
+}
+
+/** How many previous bodies a page keeps, so a listing can say whether it is complete. */
+const KEPT_BODIES_NOTE = `at most ${PAGE_BODY_HISTORY_LIMIT} are kept`;
 
 export function renderHit(hit: SearchHit): string {
   return `- ${hit.kind}:${hit.id} ${hit.title}: ${hit.snippet}`;
@@ -212,7 +325,10 @@ async function pageOp(kb: KbResolver, args: Record<string, unknown>): Promise<To
               ? `-[${edge.rel}]-> ${refText(edge.dst)}`
               : `${refText(edge.src)} -[${edge.rel}]->`,
           );
-        return success(renderPage(page, edges));
+        // Asked for on the read, not stored on the page: freshness is a property of the tree
+        // right now, and a page that says "current" because nobody asked would be worse than
+        // one that says nothing.
+        return success(renderPage(page, edges, pages.freshness(page.id)));
       }
 
       case 'put': {
@@ -233,6 +349,90 @@ async function pageOp(kb: KbResolver, args: Record<string, unknown>): Promise<To
           `${verb} page ${stored.id} [${stored.kind}] (${stored.status})\n` +
             `title:   ${stored.title}\nsummary: ${stored.summary}`,
         );
+      }
+
+      case 'patch': {
+        const id = requireString(args, 'id');
+        if (!id.ok) return failure(id.message);
+        if (args.edits === undefined) return failure('missing required argument: edits');
+        const parsed = parseBodyEdits(args.edits);
+        if (!parsed.ok) return failure(parsed.message);
+
+        const before = pages.get(id.value);
+        if (before === null) return failure(noPageToEdit(id.value, 'patch'));
+        const stored = pages.patchBody(id.value, parsed.edits);
+        const edits = parsed.edits.length;
+        return success(
+          bodyWriteAnswer(
+            `Patched page ${stored.id} (${edits} edit${edits === 1 ? '' : 's'})`,
+            stored,
+            before.body.length,
+          ),
+        );
+      }
+
+      case 'append': {
+        const id = requireString(args, 'id');
+        if (!id.ok) return failure(id.message);
+        const body = requireString(args, 'body');
+        if (!body.ok) return failure(body.message);
+
+        const before = pages.get(id.value);
+        if (before === null) return failure(noPageToEdit(id.value, 'append'));
+        const stored = pages.appendBody(id.value, body.value);
+        return success(
+          bodyWriteAnswer(
+            `Appended ${body.value.length} chars to page ${stored.id}`,
+            stored,
+            before.body.length,
+          ),
+        );
+      }
+
+      case 'history': {
+        const id = requireString(args, 'id');
+        if (!id.ok) return failure(id.message);
+        const revision = optionalPositiveInt(args, 'revision');
+        if (!revision.ok) return failure(revision.message);
+        if (pages.get(id.value) === null) {
+          return failure(
+            `No page "${id.value}".\nList what exists with op "list", or write it with op "put".`,
+          );
+        }
+
+        if (revision.value !== undefined) {
+          const stored = pages.bodyRevision(id.value, revision.value);
+          if (stored === null) {
+            return failure(
+              `Page ${id.value} has no body version #${revision.value} (${KEPT_BODIES_NOTE}).\n` +
+                `List the versions it has with page {"op":"history","id":"${id.value}"}.`,
+            );
+          }
+          return success(
+            `page ${id.value}, body as of ${stored.at} ` +
+              `(#${revision.value}, ${stored.body.length} chars):\n\n${stored.body}`,
+          );
+        }
+
+        const kept = pages.bodyHistory(id.value);
+        if (kept.length === 0) {
+          return success(
+            `Page ${id.value} has no previous body: a version is kept each time its body changes, ` +
+              'and this one has not changed since it was written.',
+          );
+        }
+        return success(
+          `Previous bodies of page ${id.value} (${kept.length}, newest first; ${KEPT_BODIES_NOTE}):\n` +
+            kept.map((entry) => `- #${entry.seq} ${entry.at} — ${entry.chars} chars`).join('\n') +
+            `\nRead one with page {"op":"history","id":"${id.value}","revision":<seq>}.`,
+        );
+      }
+
+      case 'stale': {
+        const limit = optionalPositiveInt(args, 'limit');
+        if (!limit.ok) return failure(limit.message);
+        const stale = pages.stalePages(limit.value);
+        return success(renderStaleReport(stale, STALE_SCAN_LIMIT));
       }
 
       case 'list': {
@@ -409,7 +609,7 @@ const PAGE_SCHEMA: Record<string, unknown> = {
       type: 'string',
       enum: [...PAGE_OPS],
       description:
-        'get: read one page with its body and its links (id). put: create or update a page (id, and any of kind/title/summary/body/parent/status/pin — a field you omit keeps its value). list: page ids with their one-line summaries, no bodies (optional kind, status). delete: remove a page (id); its children become root pages. init: scaffold the reserved pages project, user-intent and onboarding as templates to fill in, leaving any that already exist untouched (no other arguments). link/unlink: add or remove an edge (from, rel, to). links: the edges of a node (ref, optional direction).',
+        'get: read one page with its body and its links (id). put: create or update a page (id, and any of kind/title/summary/body/parent/status/pin — a field you omit keeps its value). patch: change part of a body without resending it (id, edits). append: add text at the end of a body (id, body). history: the previous bodies a page had, newest first, or one of them in full (id, optional revision). stale: the pages whose files changed in git after the page was written, worst first (optional limit). list: page ids with their one-line summaries, no bodies (optional kind, status). delete: remove a page (id); its children become root pages. init: scaffold the reserved pages project, user-intent and onboarding as templates to fill in, leaving any that already exist untouched (no other arguments). link/unlink: add or remove an edge (from, rel, to). links: the edges of a node (ref, optional direction).',
     },
     id: {
       type: 'string',
@@ -421,16 +621,42 @@ const PAGE_SCHEMA: Record<string, unknown> = {
       enum: [...PAGE_KINDS],
       description: `What the page is. ${SINGLETON_PAGE_KINDS.join(', ')} exist once per project and their id is the kind; feature, decision and note may repeat.`,
     },
-    title: { type: 'string', description: 'Short human title, up to 200 chars.' },
+    title: { type: 'string', description: `Short human title, at most ${TITLE_MAX_CHARS} chars.` },
     summary: {
       type: 'string',
       description:
-        'One line, up to 200 chars, saying what this page holds. This is what a cold agent sees before deciding to read the body, so it carries the weight.',
+        `One line of at most ${SUMMARY_MAX_CHARS} chars, saying what this page holds. ` +
+        'This is what a cold agent sees before deciding to read the body, so it carries the weight.',
     },
     body: {
       type: 'string',
       description:
-        'The page itself in markdown, up to 20000 chars. Point at the code that matters instead of copying it.',
+        `The page itself in markdown, at most ${BODY_MAX_CHARS} chars. Point at the code that ` +
+        'matters instead of copying it. For a change to an existing body prefer op "patch" ' +
+        'or "append": they cost the edit, not the whole text.',
+    },
+    edits: {
+      type: 'array',
+      minItems: 1,
+      maxItems: MAX_BODY_EDITS,
+      items: { type: 'object' },
+      description:
+        `Body edits for op "patch", applied in order, at most ${MAX_BODY_EDITS}. Each edit is exactly one of: ` +
+        '{"find":"…","replace":"…"} — find must match the current body exactly once; ' +
+        '{"after":"<a heading or line>","insert":"…"} — the anchor must match exactly once, and the text goes on the line below it; ' +
+        '{"section":"<heading text>","body":"…"} — replaces everything from that heading up to the next heading of the same or higher level, and an empty body clears the section. ' +
+        'A refused edit names its number and reason, and the body is left as it was.',
+    },
+    revision: {
+      type: 'integer',
+      minimum: 1,
+      description:
+        'Which previous body op "history" should print in full: the #seq its listing showed. Omit it to list the versions instead.',
+    },
+    limit: {
+      type: 'integer',
+      minimum: 1,
+      description: `At most this many pages for op "stale" (default ${STALE_PAGES_LIMIT}), worst first.`,
     },
     parent: {
       type: ['string', 'null'],

@@ -18,8 +18,12 @@ import { PageStore } from './store.js';
  */
 export const DEFAULT_BRIEF_BUDGET_CHARS = 4000;
 
-/** Kept back for the closing line, so a full brief never grows past its budget. */
-const FOOTER_RESERVE_CHARS = 160;
+/**
+ * Kept back for the closing line, so a full brief never grows past its budget. Exported
+ * because the budget is accounted with it: a test that sizes a brief has to add it back to
+ * compare against what the rendering actually measures.
+ */
+export const FOOTER_RESERVE_CHARS = 160;
 
 /** Kinds that get their own section, in the order a newcomer needs them. */
 const SECTION_KINDS: readonly PageKind[] = PAGE_KINDS.filter(
@@ -127,7 +131,8 @@ export function buildBrief(pages: readonly PageSummary[], options: BriefOptions 
   const header = [
     '# Project brief',
     'One line per page: what this project is, what the user wants from it, and what is documented. ' +
-      'Nothing here is a body — read a page with page {"op":"get","id":"<id>"} and find anything with search {"query":"…"}.',
+      'Nothing here is a body — read a page with page {"op":"get","id":"<id>"} and find anything with search {"query":"…"}. ' +
+      'Pages are anchored to a commit; page {"op":"stale"} lists those whose code moved.',
   ];
 
   const entries = orderedEntries(pages);

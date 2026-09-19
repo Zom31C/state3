@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { buildBrief, briefLine, renderProjectBrief } from '../../src/kb/brief.js';
+import {
+  FOOTER_RESERVE_CHARS,
+  buildBrief,
+  briefLine,
+  renderProjectBrief,
+} from '../../src/kb/brief.js';
 import { PageStore } from '../../src/kb/store.js';
 import type { PageSummary } from '../../src/kb/schema.js';
 import { TaskStore } from '../../src/tasks/store.js';
@@ -114,8 +119,13 @@ describe('buildBrief', () => {
   });
 
   it('keeps the reserved pages even when the budget barely fits them', () => {
+    // Measured, not hard-coded: the header grows as the brief learns to say more, and a
+    // fixed number here would quietly turn this into a test that nothing fits at all. The
+    // budget accounts for the footer reserve, which the rendered text does not contain.
+    const justEnough = buildBrief(reserved).length + FOOTER_RESERVE_CHARS;
+
     const brief = buildBrief([...reserved, page({ id: 'extra', kind: 'note' })], {
-      budgetChars: 500,
+      budgetChars: justEnough,
     });
 
     expect(brief).toContain('- project: What this project is.');

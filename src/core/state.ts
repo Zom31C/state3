@@ -29,17 +29,22 @@ export function mergeState(current: StateDict, patch: StateDict): StateDict {
 }
 
 /**
- * A patch key addressing one element of an array field: `plan[2]`,
- * `plan[2].status`, `plan[+]` (append). Only array fields are addressable —
- * plain objects already merge recursively, and dotted keys over them would be
- * ambiguous (`artifacts` keys are file paths).
+ * A patch key addressing one element of an array field: `plan[2]`, `plan[2].status`,
+ * `plan[+]` (append), and `plan[id=5].status` (the element whose own `id` is "5").
+ * Only array fields are addressable — plain objects already merge recursively, and
+ * dotted keys over them would be ambiguous (`artifacts` keys are file paths).
  */
-const PATH_KEY = /^([A-Za-z_][A-Za-z0-9_-]*)\[(\d+|\+)\]((?:\.[A-Za-z_][A-Za-z0-9_-]*)*)$/;
+const PATH_KEY = /^([A-Za-z_][A-Za-z0-9_-]*)\[([^\]]+)\]((?:\.[A-Za-z_][A-Za-z0-9_-]*)*)$/;
+
+/** An index is a position, an id is a name; `[id=…]` exists because they are not the same. */
+const ID_SELECTOR = /^id=(.+)$/;
 
 export interface PathTarget {
   field: string;
-  /** `'append'` for `[+]`, otherwise the element index. */
-  index: number | 'append';
+  /** The element index, `'append'` for `[+]`, or null when the key selects by id. */
+  index: number | 'append' | null;
+  /** The id named by `[id=…]`, or null for an index and for an append. */
+  id: string | null;
   /** Object keys below the element; empty when the whole element is addressed. */
   tail: readonly string[];
 }
@@ -49,12 +54,29 @@ export function parsePathKey(key: string): PathTarget | null {
   const match = PATH_KEY.exec(key);
   if (match === null) return null;
   const field = match[1];
-  const rawIndex = match[2];
+  const selector = match[2];
   const rawTail = match[3];
-  if (field === undefined || rawIndex === undefined || rawTail === undefined) return null;
+  if (field === undefined || selector === undefined || rawTail === undefined) return null;
+
+  let index: number | 'append' | null = null;
+  let id: string | null = null;
+  if (selector === '+') {
+    index = 'append';
+  } else if (/^\d+$/.test(selector)) {
+    index = Number(selector);
+  } else {
+    const byId = ID_SELECTOR.exec(selector);
+    const named = byId?.[1]?.trim();
+    // Anything else (`plan[foo]`, `plan[]`) is not a path key at all: it stays an
+    // unknown top-level key, which the schema refuses with a message that names it.
+    if (named === undefined || named === '') return null;
+    id = named;
+  }
+
   return {
     field,
-    index: rawIndex === '+' ? 'append' : Number(rawIndex),
+    index,
+    id,
     tail: rawTail === '' ? [] : rawTail.slice(1).split('.'),
   };
 }
@@ -174,24 +196,17 @@ export function expandPathPatch(state: StateDict, patch: StateDict): PathPatchRe
       continue;
     }
 
-    const index = target.index;
-    if (index >= array.length) {
-      return {
-        ok: false,
-        message:
-          `path "${key}": index ${index} is out of range, "${target.field}" has ` +
-          `${array.length} item(s) — use ${target.field}[+] to append`,
-      };
-    }
+    const located = locate(array, target, key);
+    if (!located.ok) return located;
+    const index = located.index;
 
     if (target.tail.length === 0) {
       if (value === null) {
-        return {
-          ok: false,
-          message:
-            `path "${key}": null cannot remove an array item — send the whole ` +
-            `"${target.field}" array without it`,
-        };
+        // Removing an item shifts every index below it, so a patch that removes two
+        // items is applied in the order its keys were written — the order the rest of
+        // the patch is read in, and the only one the caller can predict.
+        array.splice(index, 1);
+        continue;
       }
       array[index] = structuredClone(value);
       continue;
@@ -210,6 +225,69 @@ export function expandPathPatch(state: StateDict, patch: StateDict): PathPatchRe
 
   for (const [field, array] of arrays) expanded[field] = array;
   return { ok: true, patch: expanded };
+}
+
+type Located = { ok: true; index: number } | { ok: false; message: string };
+
+/** How many index → id pairs a refusal prints before it becomes noise itself. */
+const LIST_LIMIT = 20;
+
+/**
+ * The array position a path key addresses.
+ *
+ * An index is checked against the length; an id is looked up among the items. They are
+ * not interchangeable, and confusing them is easy: a plan step whose id is "5" sits at
+ * index 4 as soon as the plan is written, so `plan[5].status` is out of range while
+ * `plan[id=5].status` names the step the agent meant. Both refusals therefore print the
+ * pairing, which is the one thing that turns the refusal into a corrected retry.
+ */
+function locate(array: readonly StateValue[], target: PathTarget, key: string): Located {
+  // The caller handles `[+]` before getting here, so an index that is not a number is an id.
+  const index = target.index;
+  if (typeof index === 'number') {
+    if (index < array.length) return { ok: true, index };
+    return {
+      ok: false,
+      message:
+        `path "${key}": index ${index} is out of range, "${target.field}" has ` +
+        `${array.length} item(s)${indexIdList(array)} — use ${target.field}[+] to append, ` +
+        `or ${target.field}[id=…] to name an item by its id`,
+    };
+  }
+
+  const id = target.id ?? '';
+  const matches: number[] = [];
+  array.forEach((item, index) => {
+    if (isPlainObject(item) && item.id === id) matches.push(index);
+  });
+
+  const first = matches[0];
+  if (matches.length === 1 && first !== undefined) return { ok: true, index: first };
+  if (matches.length === 0) {
+    return {
+      ok: false,
+      message:
+        `path "${key}": no item of "${target.field}" has id "${id}" — an id is not an ` +
+        `index${indexIdList(array)}`,
+    };
+  }
+  return {
+    ok: false,
+    message:
+      `path "${key}": ${matches.length} items of "${target.field}" have id "${id}" (indexes ` +
+      `${matches.join(', ')}) — send the whole array to change more than one`,
+  };
+}
+
+/** ` (index → id: 0→"1", 1→"2")`, or an empty string for an array whose items have no id. */
+function indexIdList(array: readonly StateValue[]): string {
+  const pairs: string[] = [];
+  array.forEach((item, index) => {
+    if (index >= LIST_LIMIT) return;
+    if (isPlainObject(item) && typeof item.id === 'string') pairs.push(`${index}→"${item.id}"`);
+  });
+  if (pairs.length === 0) return '';
+  return ` (index → id: ${pairs.join(', ')}${array.length > LIST_LIMIT ? ', …' : ''})`;
 }
 
 /**

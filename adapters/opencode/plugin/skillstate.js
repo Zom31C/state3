@@ -154,7 +154,7 @@ function leadFor(purpose) {
 
 /** The two rules a host that injects Σ without the procedure P still has to carry. */
 const REMINDERS = [
-  'After every meaningful step call the task_patch tool with only the changed fields (null deletes a key; arrays are replaced wholesale; exactly one plan item in_progress).',
+  'After every meaningful step call the task_patch tool with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one, {"verifications[2]":null} removes one, {"plan[id=5].notes":"…"} names a step by its own id — without resending the array; exactly one plan item in_progress, and a finished step whose outcome is already in decisions may be marked {"plan[0].archived":true} to leave this injection).',
   'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.',
 ];
 

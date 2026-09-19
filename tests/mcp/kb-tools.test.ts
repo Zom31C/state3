@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { KbResolver } from '../../src/kb/ports.js';
 import { LinkStore } from '../../src/kb/links.js';
+import { BODY_MAX_CHARS, SUMMARY_MAX_CHARS } from '../../src/kb/schema.js';
 import { PageStore } from '../../src/kb/store.js';
 import { createKbTools } from '../../src/mcp/kb-tools.js';
 import type { TaskToolDefinition, ToolResult } from '../../src/mcp/tools.js';
@@ -68,6 +69,10 @@ describe('the tool surface', () => {
     expect(properties.op?.enum).toEqual([
       'get',
       'put',
+      'patch',
+      'append',
+      'history',
+      'stale',
       'list',
       'delete',
       'init',
@@ -179,6 +184,313 @@ describe('page put and get', () => {
   it('refuses an op it does not have, and a missing op', async () => {
     expect((await call('page', { op: 'fetch', id: 'p' })).content).toContain('op must be one of');
     expect((await call('page', {})).content).toContain('missing required argument: op');
+  });
+});
+
+describe('page patch and append', () => {
+  const combatBody = [
+    '# Car combat',
+    '',
+    'Status: the code is not written yet.',
+    '',
+    '## Damage',
+    '',
+    'Damage is applied in scripts/Car.cs.',
+    '',
+    '## What is left',
+    '',
+    '- armour',
+    '- ammo',
+    '',
+  ].join('\n');
+
+  beforeEach(async () => {
+    await call('page', {
+      op: 'put',
+      id: 'car-combat',
+      kind: 'feature',
+      title: 'Car combat',
+      summary: 'How a car takes and deals damage.',
+      body: combatBody,
+    });
+  });
+
+  it('changes two lines of a long body without resending it', async () => {
+    const patched = await call('page', {
+      op: 'patch',
+      id: 'car-combat',
+      edits: [
+        { find: 'the code is not written yet.', replace: 'step 1 is implemented.' },
+        { find: '- armour', replace: '- armour (done)' },
+      ],
+    });
+
+    expect(patched.ok).toBe(true);
+    expect(patched.content).toContain('Patched page car-combat (2 edits)');
+    expect(patched.content).toContain(`body ${combatBody.length} -> `);
+
+    const body = pages.get('car-combat')?.body ?? '';
+    expect(body).toContain('step 1 is implemented.');
+    expect(body).toContain('- armour (done)');
+    // The point of the op: everything the edits did not name survives.
+    expect(body).toContain('Damage is applied in scripts/Car.cs.');
+    expect(body).toContain('- ammo');
+    expect(body.length).toBeGreaterThan(combatBody.length);
+  });
+
+  it('replaces a section between headings, and appends below an anchor', async () => {
+    await call('page', {
+      op: 'patch',
+      id: 'car-combat',
+      edits: [{ section: 'Damage', body: 'Damage is applied in scripts/CarCombat.cs.' }],
+    });
+    const appended = await call('page', {
+      op: 'patch',
+      id: 'car-combat',
+      edits: [{ after: '## What is left', insert: '- hull repair' }],
+    });
+
+    expect(appended.ok).toBe(true);
+    const body = pages.get('car-combat')?.body ?? '';
+    expect(body).toContain('scripts/CarCombat.cs.');
+    expect(body).not.toContain('scripts/Car.cs.');
+    expect(body).toContain('## What is left\n- hull repair\n');
+  });
+
+  it('refuses an edit that does not match, numbering it and leaving the body alone', async () => {
+    const refused = await call('page', {
+      op: 'patch',
+      id: 'car-combat',
+      edits: [
+        { find: '- armour', replace: '- armour (done)' },
+        { find: '- weapons', replace: '- weapons (done)' },
+      ],
+    });
+
+    expect(refused.ok).toBe(false);
+    expect(refused.content).toContain('Refused (path): edit 2 of 2 refused');
+    expect(refused.content).toContain('matches nothing');
+    expect(refused.content).toContain('Nothing was written.');
+    expect(pages.get('car-combat')?.body).toBe(combatBody);
+  });
+
+  it('refuses a body edit for a page that is not there, instead of creating it', async () => {
+    const refused = await call('page', {
+      op: 'patch',
+      id: 'nope',
+      edits: [{ find: 'a', replace: 'b' }],
+    });
+
+    expect(refused.ok).toBe(false);
+    expect(refused.content).toContain('No page "nope" to patch');
+    expect(pages.get('nope')).toBeNull();
+  });
+
+  it('refuses a malformed edit list, and a missing one', async () => {
+    expect((await call('page', { op: 'patch', id: 'car-combat' })).content).toContain(
+      'missing required argument: edits',
+    );
+    expect((await call('page', { op: 'patch', id: 'car-combat', edits: [] })).content).toContain(
+      'at least one edit',
+    );
+    const refused = await call('page', {
+      op: 'patch',
+      id: 'car-combat',
+      edits: [{ find: '- armour' }],
+    });
+    expect(refused.content).toContain('edit 1');
+    expect(pages.get('car-combat')?.body).toBe(combatBody);
+  });
+
+  it('takes no whole body with a patch, which is what keeps the two ops apart', async () => {
+    const refused = await call('page', {
+      op: 'patch',
+      id: 'car-combat',
+      edits: [{ find: '- armour', replace: '- armour (done)' }],
+      body: 'rewritten',
+    });
+
+    expect(refused.ok).toBe(false);
+    expect(refused.content).toContain('op "patch" does not take "body"');
+  });
+
+  it('re-indexes a patched body for search, like any other write', async () => {
+    await call('page', {
+      op: 'patch',
+      id: 'car-combat',
+      edits: [{ find: '- armour', replace: '- integritas' }],
+    });
+
+    const hits = await call('search', { query: 'integritas' });
+    expect(hits.ok).toBe(true);
+    expect(hits.content).toContain('page:car-combat');
+  });
+
+  it('refuses a patch that would grow the body past its limit', async () => {
+    await call('page', { op: 'put', id: 'big', kind: 'note', title: 'B', summary: 'S', body: 'x' });
+    const refused = await call('page', {
+      op: 'patch',
+      id: 'big',
+      edits: [{ find: 'x', replace: `x${'y'.repeat(BODY_MAX_CHARS)}` }],
+    });
+
+    expect(refused.ok).toBe(false);
+    expect(refused.content).toContain('Refused (schema)');
+    expect(pages.get('big')?.body).toBe('x');
+  });
+
+  it('appends to the end of a body, one blank line below what was there', async () => {
+    const addition = '## Measurement of 2026-09-18\n\n60 fps at 1080p.';
+    const appended = await call('page', { op: 'append', id: 'car-combat', body: addition });
+
+    expect(appended.ok).toBe(true);
+    expect(appended.content).toContain(`Appended ${addition.length} chars to page car-combat`);
+    const body = pages.get('car-combat')?.body ?? '';
+    expect(body.startsWith(combatBody.trimEnd())).toBe(true);
+    expect(body).toContain('- ammo\n\n## Measurement of 2026-09-18');
+    expect((await call('page', { op: 'append', id: 'nope', body: 'x' })).content).toContain(
+      'No page "nope" to append',
+    );
+  });
+});
+
+describe('page history', () => {
+  beforeEach(async () => {
+    await call('page', { ...projectPage, body: 'the first body' });
+    await call('page', { op: 'put', id: 'project', body: 'the second body' });
+  });
+
+  it('lists the previous bodies with their size, and says how to read one', async () => {
+    const listed = await call('page', { op: 'history', id: 'project' });
+
+    expect(listed.ok).toBe(true);
+    expect(listed.content).toContain('Previous bodies of page project (1, newest first');
+    expect(listed.content).toContain('— 14 chars');
+    expect(listed.content).not.toContain('the first body');
+    expect(listed.content).toContain('"op":"history","id":"project","revision":');
+  });
+
+  it('prints one stored body in full, addressed by the seq the listing showed', async () => {
+    const listed = await call('page', { op: 'history', id: 'project' });
+    const seq = Number(/#(\d+)/.exec(listed.content)?.[1] ?? '');
+
+    const one = await call('page', { op: 'history', id: 'project', revision: seq });
+
+    expect(one.ok).toBe(true);
+    expect(one.content).toContain(`(#${seq}, 14 chars)`);
+    expect(one.content).toContain('the first body');
+  });
+
+  it('refuses a version the page does not have, and points at the listing', async () => {
+    const refused = await call('page', { op: 'history', id: 'project', revision: 999999 });
+
+    expect(refused.ok).toBe(false);
+    expect(refused.content).toContain('no body version #999999');
+    expect(refused.content).toContain('"op":"history","id":"project"');
+  });
+
+  it('says when a page has never been rewritten, instead of listing nothing', async () => {
+    await call('page', {
+      op: 'put',
+      id: 'fresh',
+      kind: 'note',
+      title: 'F',
+      summary: 'S',
+      body: 'written once',
+    });
+
+    const listed = await call('page', { op: 'history', id: 'fresh' });
+
+    expect(listed.ok).toBe(true);
+    expect(listed.content).toContain('has no previous body');
+  });
+
+  it('refuses a page that is not there', async () => {
+    expect((await call('page', { op: 'history', id: 'nope' })).content).toContain('No page "nope"');
+  });
+});
+
+describe('a refused size, reported with the number that crossed it', () => {
+  it('says how long the summary was and what the limit is', async () => {
+    const summary = 'x'.repeat(SUMMARY_MAX_CHARS + 14);
+    const refused = await call('page', {
+      op: 'put',
+      id: 'car-api-surface',
+      kind: 'feature',
+      title: 'Car API',
+      summary,
+    });
+
+    expect(refused.ok).toBe(false);
+    expect(refused.content).toContain('Refused (schema)');
+    expect(refused.content).toContain(
+      `"summary" is ${SUMMARY_MAX_CHARS + 14} chars, limit ${SUMMARY_MAX_CHARS}`,
+    );
+    expect(pages.count()).toBe(0);
+  });
+
+  it('says the same for a body a patch would grow past its limit', async () => {
+    await call('page', { op: 'put', id: 'big', kind: 'note', title: 'B', summary: 'S', body: 'x' });
+    const refused = await call('page', {
+      op: 'patch',
+      id: 'big',
+      edits: [{ find: 'x', replace: 'y'.repeat(BODY_MAX_CHARS + 1) }],
+    });
+
+    expect(refused.content).toContain(
+      `"body" is ${BODY_MAX_CHARS + 1} chars, limit ${BODY_MAX_CHARS}`,
+    );
+  });
+});
+
+describe('what a page is anchored to', () => {
+  it('names the files a page describes, and says when the answer cannot be known', async () => {
+    await call('page', {
+      op: 'put',
+      id: 'car-api',
+      kind: 'feature',
+      title: 'Car API',
+      summary: 'What the controller exposes.',
+      body: 'Speed is set in scripts/Car.cs:2 and the bar in scripts/Hud.cs.',
+    });
+
+    const got = await call('page', { op: 'get', id: 'car-api' });
+
+    // This root is a temporary directory with no repository, so "unknown" is reported
+    // rather than the "nothing changed" a reader would otherwise assume.
+    expect(got.content).toContain(
+      'source:  no repository; names scripts/Car.cs, scripts/Hud.cs — changed since: unknown',
+    );
+  });
+
+  it('says a page that names no file has nothing to go stale', async () => {
+    await call('page', {
+      ...projectPage,
+      body: 'A page about intent and decisions.',
+    });
+
+    expect((await call('page', { op: 'get', id: 'project' })).content).toContain(
+      'names no file — nothing under it can go stale',
+    );
+  });
+
+  it('reports the pages whose code moved, through the tool', async () => {
+    await call('page', { ...projectPage, body: 'Physics lives in scripts/Car.cs.' });
+
+    const stale = await call('page', { op: 'stale' });
+
+    expect(stale.ok).toBe(true);
+    expect(stale.content).toContain('no page names a file that changed after the page was written');
+    expect(stale.content).toContain('page {"op":"get","id":"<id>"}');
+  });
+
+  it('takes a limit for stale, and no id for it', async () => {
+    const refused = await call('page', { op: 'stale', id: 'project' });
+    expect(refused.ok).toBe(false);
+    expect(refused.content).toContain('op "stale" does not take "id"');
+
+    const limited = await call('page', { op: 'stale', limit: 3 });
+    expect(limited.ok).toBe(true);
   });
 });
 

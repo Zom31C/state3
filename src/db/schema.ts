@@ -21,9 +21,41 @@
  * wrote it, and this build cannot know what it must preserve. A LOWER version is
  * migrated forward by `MIGRATIONS` below.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 3;
 
-/** Statements run in order, inside one transaction, to create version 1. */
+/**
+ * Previous bodies of a page, newest last, kept by the write path in `PageStore`.
+ *
+ * Σ has an audit trail and pages did not: a page could only be read as it is now,
+ * so a paragraph lost to a careless rewrite was lost for good, and "who changed
+ * this, and when" had no answer. Bodies are the largest thing here, so the store
+ * keeps only the last few per page (`PAGE_BODY_HISTORY_LIMIT`) and nothing indexes
+ * them — a stale version must never answer a search.
+ */
+const PAGE_HISTORY_SQL: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS page_history (
+    seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+    page_id TEXT NOT NULL REFERENCES page (id) ON DELETE CASCADE,
+    at      TEXT NOT NULL,
+    body    TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS page_history_page ON page_history (page_id, seq DESC)`,
+];
+
+/**
+ * The commit a page was written against, and the files its body names.
+ *
+ * A page that says "the integrity bar is in scripts/Hud.cs:43" is a claim about a tree, and
+ * the tree moves: an hour later the line is elsewhere and the page still reads as current.
+ * Storing the anchor costs two columns and makes the claim checkable — `page get` reports
+ * what changed since, and `page {"op":"stale"}` reports it for the whole knowledge base.
+ */
+const PAGE_SOURCE_SQL: readonly string[] = [
+  `ALTER TABLE page ADD COLUMN source_commit TEXT`,
+  `ALTER TABLE page ADD COLUMN source_files TEXT NOT NULL DEFAULT ''`,
+];
+
+/** Statements run in order, inside one transaction, to create the current version. */
 export const SCHEMA_SQL: readonly string[] = [
   // Free-form per-project settings and counters that do not deserve a table.
   `CREATE TABLE IF NOT EXISTS meta (
@@ -78,11 +110,15 @@ export const SCHEMA_SQL: readonly string[] = [
     parent     TEXT REFERENCES page (id) ON DELETE SET NULL,
     status     TEXT NOT NULL DEFAULT 'current',
     pin        INTEGER NOT NULL DEFAULT 0,
+    source_commit TEXT,
+    source_files  TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS page_kind ON page (kind, pin DESC, id)`,
   `CREATE INDEX IF NOT EXISTS page_parent ON page (parent)`,
+
+  ...PAGE_HISTORY_SQL,
 
   /**
    * Directed, typed edges between anything addressable (task→page, page→page).
@@ -146,11 +182,16 @@ export const SCHEMA_SQL: readonly string[] = [
 
 /**
  * Forward migrations keyed by the version they UPGRADE FROM. Each entry brings the
- * database to `key + 1`. Empty for now: version 1 is the first versioned schema,
- * and a database created before versioning existed is handled by the JSON migrator
- * rather than by a SQL migration.
+ * database to `key + 1`, and every entry is also part of `SCHEMA_SQL`, so a database
+ * created today and one migrated from an older build end up identical. A database
+ * created before versioning existed is handled by the JSON migrator instead.
  */
-export const MIGRATIONS: ReadonlyMap<number, readonly string[]> = new Map();
+export const MIGRATIONS: ReadonlyMap<number, readonly string[]> = new Map([
+  // 1 -> 2: pages gained a body history, so a careless rewrite can be undone.
+  [1, PAGE_HISTORY_SQL],
+  // 2 -> 3: pages gained the commit and the files they describe, so a stale one says so.
+  [2, PAGE_SOURCE_SQL],
+]);
 
 /** Tables `doctor` checks for dangling `link` edges. */
 export const LINKABLE_KINDS = ['task', 'page'] as const;

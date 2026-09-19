@@ -1,11 +1,13 @@
 import { isRejectCategory } from '../core/rejections.js';
 import type { RejectCategory } from '../core/rejections.js';
+import { projectDirOf } from '../core/paths.js';
 import type { StateDict } from '../core/types.js';
 import { formatRuntimeInfo, runtimeInfo } from '../runtime-info.js';
+import { artifactWarnings, missingArtifactPaths } from '../tasks/artifacts.js';
 import { isNotation, NOTATIONS } from '../tasks/notation.js';
 import type { ProjectEntry, StoreResolver, TaskStorePort } from '../tasks/ports.js';
 import { describeProjects } from '../tasks/projects.js';
-import { renderTaskHead } from '../tasks/render.js';
+import { renderStateSize, renderTaskHead } from '../tasks/render.js';
 import type { HistoryEntry, StartOptions, StoredTask, TaskSummary } from '../tasks/store.js';
 
 export type { ProjectEntry, StoreResolver, TaskStorePort } from '../tasks/ports.js';
@@ -50,6 +52,9 @@ export function classifyError(err: unknown): ClassifiedError {
 const REMINDER =
   'Keep this state current: after every meaningful step call task_patch with only the fields that changed. ' +
   'Call task_show to reload the state and the procedure whenever the session was compacted or restarted.';
+
+/** What `task_show` answers with: Σ and the procedure, or the cost of each field of Σ. */
+export const TASK_SHOW_VIEWS = ['state', 'size'] as const;
 
 const NO_TASK_HINT = 'Start one with task_start, or list existing tasks with task_list.';
 
@@ -287,11 +292,35 @@ async function showTask(
 
   const id = optionalString(args, 'id');
   if (!id.ok) return failure(id.message);
+  const view = optionalString(args, 'view');
+  if (!view.ok) return failure(view.message);
+  if (view.value !== undefined && !(TASK_SHOW_VIEWS as readonly string[]).includes(view.value)) {
+    return failure(`argument view must be one of: ${TASK_SHOW_VIEWS.join(', ')}`);
+  }
   try {
-    return success(renderStateWithProcedure(store, await store.show(id.value)));
+    const task = await store.show(id.value);
+    // The size report answers "what should I compress", so it carries no Σ and no procedure:
+    // both are what it is measuring, and repeating them would cost what the call saves.
+    if (view.value === 'size') return success(renderStateSize(task.state));
+    return success(renderStateWithProcedure(store, task));
   } catch (err) {
     return failureFromError(err, rootNote(store));
   }
+}
+
+/**
+ * The artifact paths a patch just wrote that are not on disk, as a note under the answer.
+ *
+ * Checked only when the patch touched `artifacts`: a warning repeated on every patch of a
+ * task that carries one stale path trains the agent to skip the tail of the answer, and the
+ * tail is where the refusals live.
+ */
+function artifactNote(store: TaskStorePort, state: StateDict, patch: StateDict): string {
+  if (!('artifacts' in patch)) return '';
+  const rootDir = store.rootDir;
+  if (rootDir === undefined) return '';
+  const lines = artifactWarnings(missingArtifactPaths(state, projectDirOf(rootDir)));
+  return lines.length === 0 ? '' : `\n${lines.join('\n')}`;
 }
 
 async function patchTask(
@@ -308,7 +337,10 @@ async function patchTask(
   if (!id.ok) return failure(id.message);
   try {
     const task = await store.patch(patch.value, id.value);
-    return success(`Patched task ${task.meta.id}.\n\n${renderState(task)}`);
+    return success(
+      `Patched task ${task.meta.id}.\n\n${renderState(task)}` +
+        artifactNote(store, task.state, patch.value),
+    );
   } catch (err) {
     return failure(patchFailureMessage(classifyError(err), rootNote(store)));
   }
@@ -423,6 +455,12 @@ const SHOW_SCHEMA: Record<string, unknown> = {
   type: 'object',
   properties: {
     id: { type: 'string', description: 'Task id. Defaults to the active task.' },
+    view: {
+      type: 'string',
+      enum: [...TASK_SHOW_VIEWS],
+      description:
+        'state (default): Σ with the procedure for keeping it. size: no Σ — how many characters each field of Σ costs, largest first, which is what to shorten when the state has grown.',
+    },
     project: PROJECT_ARG,
   },
   required: [],

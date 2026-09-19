@@ -3,10 +3,14 @@ import type { StateDict } from '../../src/core/types.js';
 import type { Notation } from '../../src/tasks/notation.js';
 import type { DevTaskState } from '../../src/tasks/schema.js';
 import {
+  STATE_DELTA_THRESHOLD_CHARS,
   STATE_SIZE_HINT_CHARS,
+  injectedView,
+  renderStateSize,
   renderTaskBrief,
   renderTaskHead,
   stateSizeHint,
+  stateSizes,
 } from '../../src/tasks/render.js';
 import type { StoredTask } from '../../src/tasks/store.js';
 
@@ -74,6 +78,139 @@ describe('renderTaskHead', () => {
     const stateless = makeTask(makeState());
     stateless.state = { goal: 'x' };
     expect(renderTaskHead(stateless).split('\n')[0]).toBe('Task task-9 [dev-task] (unknown):');
+  });
+});
+
+describe('the injected view of Σ', () => {
+  const plan = [
+    {
+      id: '1',
+      task: 'Read the feedback',
+      status: 'done' as const,
+      notes: 'four files',
+      archived: true,
+    },
+    { id: '2', task: 'Build the reader', status: 'done' as const, notes: 'shipped' },
+    { id: '3', task: 'Wire the hook', status: 'in_progress' as const, notes: 'half way' },
+    { id: '4', task: 'Write the docs', status: 'pending' as const, notes: '' },
+  ];
+
+  it('leaves a tool answer whole: archived steps are part of Σ, not of a prompt', () => {
+    const text = renderTaskHead(makeTask(makeState({ plan })));
+
+    expect(text).toContain('Read the feedback');
+    expect(text).not.toContain('archived plan step');
+  });
+
+  it('drops the archived steps from an injection, and says how many it dropped', () => {
+    const lines = renderTaskHead(makeTask(makeState({ plan })), { injected: true }).split('\n');
+
+    expect(lines[1]).not.toContain('Read the feedback');
+    expect(lines[1]).toContain('Build the reader');
+    expect(lines[1]).toContain('Wire the hook');
+    expect(lines[1]).toContain('Write the docs');
+    expect(lines.some((line) => line.startsWith('+1 archived plan step(s)'))).toBe(true);
+    expect(lines.some((line) => line.includes('task_show lists every one'))).toBe(true);
+  });
+
+  it('keeps the plan array of Σ untouched, so a path key still addresses the same step', () => {
+    const state = makeState({ plan });
+    const view = injectedView(state as unknown as StateDict);
+
+    expect((view.state.plan as unknown[]).map((item) => (item as { id: string }).id)).toEqual([
+      '2',
+      '3',
+      '4',
+    ]);
+    // Σ itself is what task_show and the next patch read; the cut is a rendering.
+    expect(state.plan).toHaveLength(4);
+    expect(state.plan[0]?.id).toBe('1');
+  });
+
+  it('falls back to the step in flight once Σ outgrows the threshold', () => {
+    const large = makeTask(
+      makeState({
+        plan,
+        decisions: ['x'.repeat(STATE_DELTA_THRESHOLD_CHARS)],
+        artifacts: { 'src/a.ts': 'reader' },
+        verifications: [{ check: 'npm test', status: 'pass' }],
+      }),
+    );
+
+    const lines = renderTaskHead(large, { injected: true }).split('\n');
+    const injected = JSON.parse(lines[1] ?? '') as StateDict;
+
+    expect(Object.keys(injected).sort()).toEqual(['blockers', 'goal', 'next', 'plan', 'status']);
+    expect(injected.plan).toHaveLength(1);
+    expect(lines[1]).not.toContain('xxxx');
+    expect(lines[1]).not.toContain('src/a.ts');
+    expect(lines[1]).not.toContain('npm test');
+  });
+
+  it('names what the delta left out and how big the state holding it is', () => {
+    const large = makeTask(
+      makeState({
+        plan,
+        decisions: ['x'.repeat(STATE_DELTA_THRESHOLD_CHARS)],
+        artifacts: { 'src/a.ts': 'reader', 'src/b.ts': 'writer' },
+        blockers: ['needs the user'],
+      }),
+    );
+
+    const text = renderTaskHead(large, { injected: true });
+
+    expect(text).toContain('needs the user');
+    expect(text).toContain(`Σ is ${JSON.stringify(large.state).length} chars`);
+    expect(text).toContain('2 artifacts');
+    expect(text).toContain('1 decisions');
+    expect(text).toContain('2 plan step(s) (1 done, 1 pending)');
+    expect(text).toContain('plus 1 archived step(s)');
+    expect(text).toContain('task_show returns all of it');
+    // The delta note already complains about the size, so the plain hint does not repeat it.
+    expect(text.split('\n').filter((line) => line.includes('chars —'))).toHaveLength(0);
+  });
+
+  it('keeps a state under the threshold in full even when it is over the hint size', () => {
+    const medium = makeTask(makeState({ decisions: ['y'.repeat(STATE_SIZE_HINT_CHARS + 10)] }));
+
+    const text = renderTaskHead(medium, { injected: true });
+
+    expect(text).toContain('yyyy');
+    expect(text).toContain('compress it');
+  });
+});
+
+describe('the size report', () => {
+  const state = makeState({
+    plan: [{ id: '1', task: 'a long step description', status: 'done', notes: 'and its outcome' }],
+    decisions: ['d'.repeat(200), 'another decision'],
+    artifacts: { 'src/a.ts': 'the reader' },
+    verifications: [{ check: 'npm test', status: 'pass' }],
+  });
+
+  it('orders the fields by what they cost, so the first line is the one to shorten', () => {
+    const sizes = stateSizes(state as unknown as StateDict);
+
+    expect(sizes[0]?.field).toBe('decisions');
+    expect(sizes.map((size) => size.chars)).toEqual(
+      [...sizes.map((size) => size.chars)].sort((a, b) => b - a),
+    );
+    expect(sizes.find((size) => size.field === 'decisions')?.entries).toBe(2);
+    expect(sizes.find((size) => size.field === 'artifacts')?.entries).toBe(1);
+    // A scalar field has no entries to count.
+    expect(sizes.find((size) => size.field === 'goal')?.entries).toBeNull();
+  });
+
+  it('says the total, the share of each field, and how to make it smaller', () => {
+    const text = renderStateSize(state as unknown as StateDict);
+    const total = JSON.stringify(state).length;
+
+    expect(text).toContain(`Σ is ${total} chars over 8 field(s)`);
+    expect(text).toMatch(/decisions\s+\d+ chars \(\s*\d+%, 2 item\(s\)\)/);
+    expect(text).toContain('"plan[0].archived":true');
+    expect(text).toContain('task_show {"view":"state"}');
+    // The report measures Σ; carrying Σ in it would cost what the call saves.
+    expect(text).not.toContain('d'.repeat(200));
   });
 });
 

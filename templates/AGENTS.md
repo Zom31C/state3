@@ -105,18 +105,24 @@ blocker found. Not at the end: the end is exactly when the transcript gets compa
   `{"artifacts.src/old.ts":null}` names no field and is rejected as `unknown-key`.
 - Cheaper for arrays — a **path key** touches one element: `{"plan[1].status":"done"}`,
   `{"plan[0].notes":"reopened: the fix regressed"}`, `{"decisions[+]":"…"}`,
-  `{"rounds[0].verdict":"accepted"}`, and `{"plan[+]":{…}}` appends. Indexes count from 0 and
-  the form works for any array field of your skill's Σ. Path keys are expanded before the
-  guard and the schema run, so they cannot bypass a domain rule; they cannot remove an element
-  (send the array without it); and one field cannot be sent both wholesale and by path in the
-  same patch.
+  `{"rounds[0].verdict":"accepted"}`, and `{"plan[+]":{…}}` appends. `{"verifications[2]":null}`
+  removes an element; a removal shifts the indexes below it, so a patch removing two applies in
+  the order its keys were written. An element may be named by its own id instead of its position
+  — `{"plan[id=5].notes":"…"}`, `{"plan[id=5]":null}` — which is safer, because a step's id and
+  its index differ as soon as a step is added or removed, and a refusal prints the pairing.
+  Indexes count from 0 and the form works for any array field of your skill's Σ. Path keys are
+  expanded before the guard and the schema run, so they cannot bypass a domain rule; they do not
+  address plain objects (those already merge recursively); and one field cannot be sent both
+  wholesale and by path in the same patch.
 - `plan` — finished item `done`, next item `in_progress`, concrete step in `next.action`: one
   patch. Reopening a `done` item needs the reason in its `notes`.
 - `artifacts` — one line per touched file or resource, saying what it is **now**. Delete stale
   entries with `null`; merging alone never shrinks Σ.
 - `verifications` — the literal command and its **real** status (`evidence` in
   `supervise-task`). Never `pass` without output you actually saw; a check you did not run is
-  recorded as not run.
+  recorded as not run. The runtime stamps every entry with `at` and `commit` (the project's git
+  HEAD, `null` outside a repository) — send neither yourself, so a `pass` stays tied to the tree
+  it passed on.
 - `decisions` — the choices later steps must respect, one line each, with the reason.
 - `blockers` plus `status:"blocked"` when progress stops; clear them when it resumes.
   `blocked` with no blocker is refused.
@@ -129,7 +135,11 @@ past a guard: the guard is the domain rule, and `task_history` keeps every rejec
 
 **Σ is re-injected on every turn, so its size is a recurring cost.** Store what future steps
 need and compress finished work into its outcome — one line in `decisions`, not a narrative of
-how you got there. When the runtime tells you Σ is too long, believe it and cut.
+how you got there. When the runtime tells you Σ is too long, believe it and cut:
+`task_show {"view":"size"}` answers with no Σ at all, only what each field costs, largest first,
+and marking a finished step `{"plan[0].archived":true}` keeps it in Σ while dropping it from the
+injection. Past a threshold the injection carries only the step in flight, `next` and `blockers`,
+and names what it left out — `task_show {"view":"state"}` still returns all of Σ.
 
 ## Delegating to subagents
 

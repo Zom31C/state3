@@ -4,8 +4,8 @@ This extension adds an external task state (Σ) for long-horizon work, based on 
 
 Tools (MCP server `skillstate`; Qwen Code exposes them as `mcp__skillstate__*`):
 
-- Tasks: `task_start`, `task_show`, `task_patch`, `task_finish`, `task_list`, `task_history`. `task_start` also takes a `skill` (owner of the Σ schema, rules and procedure): `dev-task` (default) does work in this project, `supervise-task` reviews another agent's work; and a `notation`: `compact` = compressed pseudocode, one line per entry, paths and commands verbatim.
-- Knowledge: `project_brief` (the map of the project, inside a fixed budget), `page` (one tool chosen by `op`: `get`, `put`, `list`, `delete`, `init`, `link`, `unlink`, `links`), `search` (full text over tasks and pages, hits with snippets).
+- Tasks: `task_start`, `task_show`, `task_patch`, `task_finish`, `task_list`, `task_history`. `task_start` also takes a `skill` (owner of the Σ schema, rules and procedure): `dev-task` (default) does work in this project, `supervise-task` reviews another agent's work; and a `notation`: `compact` = compressed pseudocode, one line per entry, paths and commands verbatim. `task_show {"view":"size"}` answers with no Σ at all: how many characters each field costs, largest first.
+- Knowledge: `project_brief` (the map of the project, inside a fixed budget), `page` (one tool chosen by `op`: `get`, `put`, `patch`, `append`, `history`, `stale`, `list`, `delete`, `init`, `link`, `unlink`, `links`), `search` (full text over tasks and pages, hits with snippets).
 
 All nine take an optional `project`: another state root the user declared (`SKILLSTATE_PROJECTS`), to supervise a worker elsewhere. Only declared roots are reachable; `task_list` prints them and the skills.
 
@@ -13,12 +13,15 @@ Task rules:
 
 - When work needs more than a handful of steps (refactors, migrations, multi-file features, investigations, resuming earlier work), call `task_start` with a one-sentence goal, the skill that fits, and an ordered plan.
 - After every meaningful step (file edited, check run, decision made, blocker found) call `task_patch` with only the changed fields. `null` deletes a key; arrays are replaced wholesale; keep exactly one plan item `in_progress`.
-- Arrays are cheaper by path: `{"plan[1].status":"done"}` edits one element, `{"plan[+]":{…}}` appends one (indexes from 0). They are expanded before the guard, so a path key cannot bypass a domain rule or remove an item (send the array without it).
+- Arrays are cheaper by path: `{"plan[1].status":"done"}` edits one element, `{"plan[+]":{…}}` appends one, `{"verifications[2]":null}` removes one (indexes from 0; removals shift the ones below, so a patch removing two applies in the order its keys were written). They are expanded before the guard, so a path key cannot bypass a domain rule.
+- An element may be named by its own id instead of its position: `{"plan[id=5].notes":"…"}`. Prefer it — a step's id and its index differ as soon as a step is added or removed, and a refusal prints the `index → id` pairs so the mistake is visible.
+- Archive a finished step once its outcome is in `decisions`: `{"plan[3].status":"done","plan[3].archived":true}`. Σ keeps it (indexes do not move, `task_show` lists it), but the state injected on every prompt drops it and says how many it dropped. Above 6000 chars the injection carries only the step in flight, `next` and `blockers`, and names what it left out.
 - Treat the injected task state as authoritative when the transcript is incomplete — after `/compact` or a restart, call `task_show` first: it returns Σ plus the full procedure (P).
 - A rejected patch never modifies the state. Read the returned diagnostic (`unknown-key`, `type-coercion`, `guard`, `path`, `schema`, `skill`), fix the patch, and retry.
-- Record real verification commands and their actual statuses in `verifications` (`evidence` in `supervise-task`); never mark a check `pass` without output confirming it.
+- Record real verification commands and their actual statuses in `verifications` (`evidence` in `supervise-task`); never mark a check `pass` without output confirming it. The runtime stamps every entry you add or change with `at` and `commit` (the project's git HEAD, `null` outside a repository) — send neither yourself, so a `pass` stays tied to the tree it passed on.
 - `next.risk` marks the next action as `safe`, `destructive`, or `external`. Ask the user for confirmation before executing a destructive or external action, and never execute it silently.
-- Store only what future steps need; compress finished work into its outcome instead of narrating how you got there.
+- Store only what future steps need; compress finished work into its outcome instead of narrating how you got there. When Σ grows, `task_show {"view":"size"}` says which field to shorten first.
+- `artifacts` keys that look like paths are checked against the project on write: a missing one is reported as a note under the answer, never as a refusal, because an artifact may also be a page, a URL or a resource outside the tree.
 - Tools name the state root they use (`no tasks (state root: …)`, `Started task <id> [<skill>] at <path>`). If that root is not inside your project, stop and tell the user instead of creating or patching tasks there: the host starts the server in its own startup directory, and `SKILLSTATE_STATE_DIR` pins the right one.
 
 Knowledge rules:
@@ -26,4 +29,7 @@ Knowledge rules:
 - Read cheap first: `project_brief` before `search`, `search` before opening a page in full. The injected brief is a session-start snapshot, so a page written since then is newer than the brief.
 - Write down what you learn as you learn it, not at the end: a `decision` page for a choice and the reason behind it, a `feature` page for something you built, and update `project` when the layout or the commands changed.
 - Keep a page `summary` to one informative line — it is all a cold session sees before deciding whether to open the page — and point at the code that matters instead of copying it into a body.
+- Change a body with `page {"op":"patch","id":…,"edits":[…]}` or `{"op":"append"}`, not by resending it with `put`. An edit is `{"find":"…","replace":"…"}`, `{"after":"<heading or line>","insert":"…"}` or `{"section":"<heading>","body":"…"}`; `find` and `after` must match the body exactly once, or the edit is refused by number and the body is left as it was. A write keeps the last 10 previous bodies — `{"op":"history"}` lists them and reads one back by its `#seq`.
+- Refer to **symbols**, not line numbers: `Car.OnBodyEntered`, `Hud.UpdateIntegrity` survive any shift, and grep finds them. Leave a `path:line` only where there is no symbol to name (a constant in a `.tscn`, a section of a `.bat`).
+- A page is anchored to the commit its body was written at, with the files it names extracted from the body. `page {"op":"get"}` prints that anchor and what has changed under it since; `page {"op":"stale"}` reports it for the whole knowledge base, worst first. Run `stale` at a cold start before trusting a page that describes code, and rewrite (which re-anchors) the pages it names. "Changed since: unknown" means the project has no git — not that nothing changed.
 - In a project with no pages, `page {"op":"init"}` scaffolds the three reserved ones (`project`, `user-intent`, `onboarding`) as templates marked `stale`: fill in their `<…>` placeholders and set `status` to `current` in the same `put`. `init` never overwrites a page that exists; rewriting one is an explicit `put`.

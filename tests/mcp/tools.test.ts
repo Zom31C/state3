@@ -490,6 +490,28 @@ describe('task_show', () => {
     expect(result.content).toContain('id');
   });
 
+  it('answers the size of each field instead of Σ when asked for the size view', async () => {
+    const { store, call } = setup();
+    await store.start('ship it', { plan: ['a', 'b'] });
+
+    const result = await call('task_show', { view: 'size' });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('field(s), largest first');
+    expect(result.content).toContain('- plan');
+    // The report measures Σ and P; carrying either would cost what the call saves.
+    expect(result.content).not.toContain('"goal":"ship it"');
+    expect(result.content).not.toContain('## How to keep this state (P)');
+    expect(result.content).toContain('task_show {"view":"state"}');
+  });
+
+  it('rejects a view it does not have', async () => {
+    const { call } = setup();
+    const result = await call('task_show', { view: 'brief' });
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain('view must be one of: state, size');
+  });
+
   it('normalizes a non-object argument payload instead of throwing', async () => {
     const { tool } = setup();
     const result = await tool('task_show').handler(null as unknown as Dict);
@@ -525,6 +547,31 @@ describe('task_patch', () => {
     expect(result.ok).toBe(true);
     expect(result.content).not.toContain('## How to keep this state (P)');
     expect(store.callCount('instructionsFor')).toBe(0);
+  });
+
+  it('notes an artifact path that is not in the project, without refusing the patch', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+
+    const result = await call('task_patch', {
+      patch: { artifacts: { 'src/reader.ts': 'the reader', 'src/writer.ts': 'the writer' } },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('Patched task task-1.');
+    expect(result.content).toContain('not found in the project');
+    expect(result.content).toContain('"src/writer.ts"');
+  });
+
+  it('says nothing about artifacts on a patch that does not touch them', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+    await call('task_patch', { patch: { artifacts: { 'src/absent.ts': 'x' } } });
+
+    const result = await call('task_patch', { patch: { goal: 'renamed' } });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).not.toContain('not found in the project');
   });
 
   it('applies a path key that changes one plan item', async () => {

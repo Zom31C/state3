@@ -19,11 +19,26 @@ export interface PlanItem {
   task: string;
   status: PlanItemStatus;
   notes: string;
+  /**
+   * Set once this step's outcome is folded into `decisions` and its own text no longer
+   * earns a place in the prompt. An archived step stays in Σ — indexes do not move, and
+   * `task_show` lists every one — but the injected view leaves it out and reports how
+   * many it left out. This is the only field whose purpose is to make Σ cheaper.
+   */
+  archived?: boolean | undefined;
 }
 
 export interface Verification {
   check: string;
   status: VerificationStatus;
+  /**
+   * When this result was recorded, and the commit it was recorded against. Both are
+   * written by the runtime, not sent by the agent: the agent does not know the commit, and
+   * a check reported without them cannot be told apart from one reported before the fix.
+   * `commit` is null outside a git repository.
+   */
+  at?: string | undefined;
+  commit?: string | null | undefined;
 }
 
 export interface NextStep {
@@ -47,11 +62,14 @@ const planItemSchema = z.strictObject({
   task: z.string().min(1),
   status: z.enum(PLAN_ITEM_STATUSES),
   notes: z.string(),
+  archived: z.boolean().optional(),
 });
 
 const verificationSchema = z.strictObject({
   check: z.string().min(1),
   status: z.enum(VERIFICATION_STATUSES),
+  at: z.string().optional(),
+  commit: z.string().nullish(),
 });
 
 export const nextStepSchema = z.strictObject({
@@ -122,15 +140,16 @@ const DEV_TASK_INTRO: string = `You are a software engineering agent working on 
 const DEV_TASK_STATE_DICT: string = `State dictionary (all keys required, strict schema — unknown keys are rejected):
 - goal: one-sentence description of the objective.
 - status: "active" | "blocked" | "done".
-- plan: array of { id, task, status, notes }. ids are sequential strings "1", "2", … Exactly one item may be "in_progress" at a time.
+- plan: array of { id, task, status, notes } plus an optional "archived": true. ids are sequential strings "1", "2", … Exactly one item may be "in_progress" at a time. An archived item stays in the array — its index and its id do not move — but the state injected into the prompt leaves it out and says how many it left out.
 - artifacts: map from file path (or resource key) to a one-line description of what it is / what changed.
-- verifications: array of { check, status } where check is the literal command ("npm test", "npm run lint", …) and status is "pass" | "fail" | "pending". Never mark "pass" without real output confirming it.
+- verifications: array of { check, status } where check is the literal command ("npm test", "npm run lint", …) and status is "pass" | "fail" | "pending". Never mark "pass" without real output confirming it. The runtime stamps every entry you add or change with "at" (when) and "commit" (the project's git HEAD, null outside a repository) — send neither yourself, and an entry you leave unchanged keeps the stamp it already had.
 - decisions: append-only log of significant choices, one line each.
 - blockers: list of things preventing progress (empty when not blocked).
 - next: { action, risk } — the very next concrete step and its risk level.`;
 
 const DEV_TASK_RULES: string = `Task rules:
 - Move the finished plan item to "done" and exactly one other item to "in_progress" in the same patch.
+- Once a finished step's outcome is recorded in decisions, archive it in the same patch: {"plan[3].status":"done","plan[3].archived":true}. Archiving is what stops Σ from growing with every step you complete — the injected state drops archived steps and says how many, while task_show still lists all of them.
 - When blocked: set status "blocked" and add at least one entry to blockers; clear them when work resumes.
 - Set status "done" only after every plan item is "done" or "skipped" and the key verifications are "pass".`;
 

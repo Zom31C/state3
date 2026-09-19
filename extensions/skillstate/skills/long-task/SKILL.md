@@ -39,7 +39,10 @@ blocker found — call `task_patch` with only the fields that changed:
 - `artifacts`: one line per touched file or resource — what it is now. Remove
   stale entries with `null` (for example `{"artifacts": {"src/old.ts": null}}`).
 - `verifications`: the literal command (`npm test`, `npm run lint`, …) and its
-  real status. Never mark `pass` without output confirming it.
+  real status. Never mark `pass` without output confirming it. The runtime stamps
+  every entry with `at` and `commit` (the project's git HEAD, `null` outside a
+  repository) — send neither yourself, so a `pass` stays tied to the tree it
+  passed on.
 - `decisions`: append the choices future steps must respect, one line each, with
   the reason. Do not narrate the work.
 - `blockers` + `status: "blocked"` when progress stops; clear them when it
@@ -49,18 +52,25 @@ Arrays are replaced wholesale, so changing one `plan` item means resending the
 whole array — unless you address that item with a **path key**:
 `{"plan[1].status": "done"}` sets one field of one element,
 `{"plan[0].notes": "reopened: the fix regressed"}` another, and
-`{"plan[+]": {…}}` appends an element. Indexes count from 0, and the same form
-works for any array field of your skill's Σ — `{"decisions[+]": "…"}`,
+`{"plan[+]": {…}}` appends an element. `{"verifications[2]": null}` removes one
+— a removal shifts the indexes below it, so a patch removing two applies in the
+order its keys were written. An element may be named by its own id instead of
+its position: `{"plan[id=5].notes": "…"}`, `{"plan[id=5]": null}`. Prefer it — a
+step's id and its index differ as soon as a step is added or removed, and a
+refusal prints the pairing. Indexes count from 0, and the same form works for any
+array field of your skill's Σ — `{"decisions[+]": "…"}`,
 `{"rounds[0].verdict": "accepted"}`. Path keys are expanded before the guard and
-the schema run, so they cannot bypass a domain rule; they cannot remove an
-element (send the array without it), they do not address plain objects (those
-already merge recursively), and one field cannot be sent both wholesale and by
-path in the same patch.
+the schema run, so they cannot bypass a domain rule; they do not address plain
+objects (those already merge recursively), and one field cannot be sent both
+wholesale and by path in the same patch.
 
 Store only what future steps need. Compress finished work into its outcome. If
 the task uses compact notation, write Σ values as compressed pseudocode: one
 line per entry, symbols instead of prose, paths and commands verbatim, and never
-a compressed-away constraint or failing command.
+a compressed-away constraint or failing command. When Σ grows,
+`task_show {"view":"size"}` says which field to shorten first, and
+`{"plan[0].archived": true}` keeps a finished step in Σ but drops it from the
+injection on every prompt.
 
 A rejected patch never modifies the state. Read the diagnostic category
 (`unknown-key`, `type-coercion`, `guard`, `path`, `schema`, `skill`), fix the

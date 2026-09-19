@@ -315,11 +315,126 @@ describe('TaskStore.patch with path keys', () => {
     expect(hist[0]?.error?.category).toBe('path');
   });
 
+  it('addresses a step by its own id, which is not its index', async () => {
+    const task = await store.start('Id path test', { plan: ['one', 'two', 'three'] });
+
+    // Step "3" sits at index 2: the id form reaches it, and index 3 is out of range.
+    const patched = await store.patch({ 'plan[id=3].status': 'in_progress' }, task.meta.id);
+    expect(dev(patched).plan.map((item) => item.status)).toEqual([
+      'pending',
+      'pending',
+      'in_progress',
+    ]);
+
+    await expect(store.patch({ 'plan[3].status': 'done' }, task.meta.id)).rejects.toThrow(
+      /out of range/,
+    );
+  });
+
+  it('refuses an id the plan does not have, naming the pairing that would have worked', async () => {
+    const task = await store.start('Unknown id', { plan: ['one', 'two'] });
+    const before = rawRow(task.meta.id);
+
+    try {
+      await store.patch({ 'plan[id=9].status': 'done' }, task.meta.id);
+      throw new Error('expected the patch to be rejected');
+    } catch (e) {
+      expect((e as TaskPatchError).category).toBe('path');
+      expect((e as TaskPatchError).message).toContain('no item of "plan" has id "9"');
+      expect((e as TaskPatchError).message).toContain('index → id: 0→"1", 1→"2"');
+    }
+    expect(rawRow(task.meta.id)).toEqual(before);
+  });
+
+  it('removes an array element on null, and the derived counters follow', async () => {
+    const task = await store.start('Removal test', { plan: ['one', 'two'] });
+    await store.patch({ 'plan[0].status': 'done' }, task.meta.id);
+    await store.patch(
+      {
+        verifications: [
+          { check: 'npm test', status: 'pass' },
+          { check: 'old check', status: 'fail' },
+        ],
+      },
+      task.meta.id,
+    );
+
+    const patched = await store.patch(
+      { 'verifications[1]': null, 'plan[id=1]': null },
+      task.meta.id,
+    );
+
+    const kept = dev(patched).verifications;
+    expect(kept).toHaveLength(1);
+    expect(kept[0]?.check).toBe('npm test');
+    // The entry the patch added carries the runtime's stamp; this root is not a repository.
+    expect(typeof kept[0]?.at).toBe('string');
+    expect(kept[0]?.commit).toBeNull();
+    expect(dev(patched).plan.map((item) => item.id)).toEqual(['2']);
+
+    const listed = await store.list();
+    const summary = listed.find((entry) => entry.id === task.meta.id);
+    // Progress is derived from Σ, so a removed step cannot leave the counters behind.
+    expect(summary?.progressTotal).toBe(1);
+    expect(summary?.progressDone).toBe(0);
+
+    const hist = await store.history(task.meta.id);
+    expect(hist[hist.length - 1]?.patch).toEqual({
+      'verifications[1]': null,
+      'plan[id=1]': null,
+    });
+  });
+
   it('rejects a field sent both wholesale and by path', async () => {
     const task = await store.start('Mixed patch', { plan: ['one'] });
     await expect(store.patch({ plan: [], 'plan[0].status': 'done' }, task.meta.id)).rejects.toThrow(
       /both wholesale and by path/,
     );
+  });
+});
+
+describe('verification stamps', () => {
+  const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it('stamps an entry when it is recorded, and leaves the stamp alone while it stands', async () => {
+    const task = await store.start('Stamp test');
+
+    const recorded = await store.patch(
+      { verifications: [{ check: 'npm test', status: 'pass' }] },
+      task.meta.id,
+    );
+    const first = dev(recorded).verifications[0];
+    expect(typeof first?.at).toBe('string');
+    // This root is a temporary directory, not a repository: absent is reported, not guessed.
+    expect(first?.commit).toBeNull();
+
+    const later = await store.patch({ decisions: ['and then'] }, task.meta.id);
+    expect(dev(later).verifications[0]).toEqual(first);
+  });
+
+  it('re-stamps an entry whose result changed, tying a pass to the tree it passed on', async () => {
+    const task = await store.start('Re-stamp test');
+    const recorded = await store.patch(
+      { verifications: [{ check: 'npm test', status: 'fail' }] },
+      task.meta.id,
+    );
+    const before = dev(recorded).verifications[0];
+
+    await delay(10);
+    const flipped = await store.patch({ 'verifications[0].status': 'pass' }, task.meta.id);
+    const after = dev(flipped).verifications[0];
+
+    expect(after?.status).toBe('pass');
+    expect(after?.at).not.toBe(before?.at);
+    expect(after?.commit).toBeNull();
+  });
+
+  it('stamps nothing on a patch that records no verification, so no git subprocess runs', async () => {
+    const task = await store.start('No verification');
+
+    const patched = await store.patch({ decisions: ['a choice'] }, task.meta.id);
+
+    expect(dev(patched).verifications).toEqual([]);
   });
 });
 

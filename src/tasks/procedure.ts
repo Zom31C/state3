@@ -16,7 +16,10 @@ export const PATCH_SEMANTICS: string = `Patch semantics (ΔΣ merged into Σ wit
 - A null value deletes the key. Example: {"artifacts": {"src/old.ts": null}} removes that artifact. Keys of an object are addressed nested like this, never by a dotted top-level key: {"artifacts.src/old.ts": null} names no field and is rejected as unknown-key.
 - Arrays are replaced wholesale. To change one item you may send the entire array with the updated element.
 - Nested plain objects merge recursively; scalars replace.
-- Cheaper for arrays — a path key touches one element: {"plan[1].status": "done"}, {"rounds[0].verdict": "accepted"}, and {"plan[+]": {…}} appends an item. Indexes count from 0. Prefer this over resending the array. It cannot remove an item (send the array without it), and one field cannot be sent both wholesale and by path in the same patch.
+- Cheaper for arrays — a path key touches one element: {"plan[1].status": "done"}, {"rounds[0].verdict": "accepted"}, and {"plan[+]": {…}} appends an item. Indexes count from 0.
+- An element may also be named by its own id: {"plan[id=5].notes": "…"}, {"plan[id=5]": null}. Safer than an index, because a step's id and its position differ as soon as a step is added or removed.
+- A path key with null and no keys below it removes that element: {"verifications[2]": null}. Removal shifts the indexes below it, so a patch removing two elements is applied in the order its keys were written.
+- Prefer a path key over resending the array. One field cannot be sent both wholesale and by path in the same patch.
 - A rejected patch never modifies the state. Read the diagnostic category (${patchCategoryList()}), fix the patch, and retry.`;
 
 export const STATE_HYGIENE: string = `State hygiene:

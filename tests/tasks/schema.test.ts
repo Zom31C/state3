@@ -46,6 +46,28 @@ describe('devTaskSchema', () => {
     expect(devTaskSchema.safeParse(state).success).toBe(false);
   });
 
+  it('accepts an archived plan step, but only as a boolean flag', () => {
+    const archived = makeState({
+      plan: [{ id: '1', task: 'x', status: 'done', notes: '', archived: true }],
+    });
+    expect(devTaskSchema.safeParse(archived).success).toBe(true);
+
+    const notAFlag = makeState({
+      plan: [{ id: '1', task: 'x', status: 'done', notes: '', archived: 'yes' }],
+    });
+    expect(devTaskSchema.safeParse(notAFlag).success).toBe(false);
+  });
+
+  it('reads a state written before archived existed, which is every state so far', () => {
+    const state = makeState({ plan: [{ id: '1', task: 'x', status: 'done', notes: '' }] });
+    expect(devTaskSchema.safeParse(state).success).toBe(true);
+  });
+
+  it('tells the agent to archive, since a field nobody sets saves nothing', () => {
+    expect(DEV_TASK_INSTRUCTIONS).toContain('archived');
+    expect(DEV_TASK_INSTRUCTIONS).toContain('{"plan[3].status":"done","plan[3].archived":true}');
+  });
+
   it('rejects a wrong type (status: 1)', () => {
     expect(devTaskSchema.safeParse(makeState({ status: 1 })).success).toBe(false);
   });

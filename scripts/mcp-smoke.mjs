@@ -345,6 +345,134 @@ try {
   const deleted = await call('page', { op: 'delete', id: 'auth' });
   check('page delete removes the page', text(deleted).includes('Deleted page auth'), text(deleted));
 
+  // Partial body edits, their trail and the anchor. A build that predates these ops does not
+  // have them at all, which makes this block the gate that catches a server still serving an
+  // older dist — the failure mode measured in §9 and again in §14.9.
+  await call('page', {
+    op: 'put',
+    id: 'car',
+    kind: 'note',
+    title: 'Car physics',
+    summary: 'What the integrity bar reads.',
+    body: '# Car\n\nSpeed lives in scripts/Car.cs.\n\n## Hud\n\nThe bar is drawn from scripts/Hud.cs.',
+  });
+
+  const patchedBody = await call('page', {
+    op: 'patch',
+    id: 'car',
+    edits: [
+      { find: 'Speed lives', replace: 'Top speed lives' },
+      { after: 'Top speed lives in scripts/Car.cs.', insert: 'Grip lives beside it.' },
+    ],
+  });
+  check(
+    'page patch edits a body in place, each edit seeing what the previous one wrote',
+    patchedBody.isError !== true && text(patchedBody).includes('Patched page car (2 edits)'),
+    text(patchedBody).split('\n')[0],
+  );
+
+  const ambiguous = await call('page', {
+    op: 'patch',
+    id: 'car',
+    edits: [
+      { find: 'Grip lives beside it.', replace: 'Grip lives beside the speed.' },
+      { find: 'scripts/', replace: 'src/' },
+    ],
+  });
+  check(
+    'an edit whose address is not unique is refused by number',
+    ambiguous.isError === true &&
+      text(ambiguous).includes('edit 2') &&
+      text(ambiguous).includes('matches 2 times'),
+    text(ambiguous).split('\n')[0],
+  );
+
+  const afterRefusal = await call('page', { op: 'get', id: 'car' });
+  check(
+    'a refused edit left the body exactly as it was',
+    text(afterRefusal).includes('Grip lives beside it.') &&
+      text(afterRefusal).includes('scripts/Hud.cs'),
+  );
+
+  const appended = await call('page', { op: 'append', id: 'car', body: 'Measured on the ramp.' });
+  check(
+    'page append adds to the end of a body and reports the size it reached',
+    appended.isError !== true && text(appended).includes('chars to page car'),
+    text(appended).split('\n')[0],
+  );
+
+  const versions = await call('page', { op: 'history', id: 'car' });
+  check(
+    'page history lists the bodies the page had',
+    text(versions).includes('Previous bodies of page car (') && text(versions).includes('#1'),
+    text(versions).split('\n')[0],
+  );
+
+  const revision = await call('page', { op: 'history', id: 'car', revision: 1 });
+  check(
+    'page history reads one previous body back by its #seq',
+    revision.isError !== true &&
+      text(revision).includes('body as of') &&
+      text(revision).includes('Speed lives in scripts/Car.cs.'),
+    text(revision).split('\n')[0],
+  );
+
+  const anchored = await call('page', { op: 'get', id: 'car' });
+  check(
+    'page get says what the body is anchored to',
+    text(anchored).includes('source:') && text(anchored).includes('scripts/Car.cs'),
+    text(anchored)
+      .split('\n')
+      .find((line) => line.startsWith('source:')) ?? '',
+  );
+
+  const stale = await call('page', { op: 'stale' });
+  check(
+    'page stale answers for a tree with no repository to ask',
+    stale.isError !== true && text(stale).includes('no page names a file that changed'),
+    text(stale).split('\n')[0],
+  );
+
+  // The Σ half of the same review: a step archived by id, a verification stamped by the runtime,
+  // an element removed by a path key, and the size report that says what to compress first.
+  const compressed = await call('task_patch', {
+    patch: {
+      'plan[id=1].archived': true,
+      'verifications[+]': { check: 'npm run lint', status: 'pass' },
+    },
+  });
+  check(
+    'a path key archives a finished step by its id and appends a verification',
+    compressed.isError !== true &&
+      text(compressed).includes('"archived":true') &&
+      text(compressed).includes('npm run lint'),
+    text(compressed).split('\n')[0],
+  );
+  check(
+    'the runtime stamps a verification with the time and the commit it was recorded at',
+    text(compressed).includes('"at":"') && text(compressed).includes('"commit":'),
+    text(compressed).split('\n')[0],
+  );
+
+  const removed = await call('task_patch', { patch: { 'verifications[0]': null } });
+  check(
+    'a path key with null removes one array element',
+    removed.isError !== true &&
+      !text(removed).includes('npm test') &&
+      text(removed).includes('npm run lint'),
+    text(removed).split('\n')[0],
+  );
+
+  const sizes = await call('task_show', { view: 'size' });
+  check(
+    'task_show {"view":"size"} reports the fields by cost and carries no Σ',
+    sizes.isError !== true &&
+      text(sizes).includes('largest first') &&
+      !text(sizes).includes('"goal"') &&
+      !text(sizes).includes('## How to keep this state (P)'),
+    text(sizes).split('\n')[0],
+  );
+
   const history = await call('task_history', { limit: 10 });
   check(
     'task_history audits both rejected patches',
