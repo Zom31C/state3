@@ -40,6 +40,30 @@ function severities(report: { findings: { severity: string }[] }): string[] {
 }
 
 describe('inspectStateRoot', () => {
+  it('warns about a file artifact that changed after Σ was written', async () => {
+    const store = await storeWithTask();
+    await writeFile(path.join(dir, 'a.ts'), 'one');
+    await store.patch({ artifacts: { 'a.ts': 'the reader' } });
+    await writeFile(path.join(dir, 'a.ts'), 'one two three, edited by hand overnight');
+    store.close();
+
+    const report = await inspectStateRoot(dir);
+    const text = formatDoctorReport(report);
+
+    expect(severities(report)).toContain('warn');
+    expect(text).toContain('describes a file that moved since Σ was written');
+    expect(text).toContain('a.ts (modified');
+  });
+
+  it('says nothing about artifacts while the tree still matches Σ', async () => {
+    const store = await storeWithTask();
+    await writeFile(path.join(dir, 'a.ts'), 'one');
+    await store.patch({ artifacts: { 'a.ts': 'the reader' } });
+    store.close();
+
+    expect(formatDoctorReport(await inspectStateRoot(dir))).not.toContain('file that moved');
+  });
+
   it('reports an empty root without creating anything', async () => {
     const report = await inspectStateRoot(dir);
 

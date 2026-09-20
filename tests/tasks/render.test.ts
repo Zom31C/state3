@@ -177,6 +177,69 @@ describe('the injected view of Σ', () => {
 
     expect(text).toContain('yyyy');
     expect(text).toContain('compress it');
+    expect(text).not.toContain('Injection mode');
+  });
+
+  it('says which mode was applied when Σ is over the budget but the prompt is under it', () => {
+    // Archiving is what brings the prompt back under the budget, so the two sizes straddle
+    // it: Σ is over, what the prompt carries is not. This is the case that reads as a broken
+    // gate from the inside, and the line that names it is the whole fix.
+    const kept = 'y'.repeat(STATE_DELTA_THRESHOLD_CHARS - 1200);
+    const archived = 'x'.repeat(1600);
+    const straddling = makeTask(
+      makeState({
+        plan: [
+          { id: '1', task: 'Done long ago', status: 'done', notes: archived, archived: true },
+          { id: '2', task: 'In flight', status: 'in_progress', notes: '' },
+        ],
+        decisions: [kept],
+      }),
+    );
+    const total = JSON.stringify(straddling.state).length;
+    // Guard the premise: without it a change to the base state would test nothing.
+    expect(total).toBeGreaterThan(STATE_DELTA_THRESHOLD_CHARS);
+
+    const view = injectedView(straddling.state);
+    expect(view.mode).toEqual({
+      kind: 'full',
+      total,
+      injected: JSON.stringify(view.state).length,
+      archived: 1,
+    });
+    expect(view.mode.injected).toBeLessThanOrEqual(STATE_DELTA_THRESHOLD_CHARS);
+
+    const text = renderTaskHead(straddling, { injected: true });
+    expect(text).toContain('Injection mode: full');
+    expect(text).toContain(`Σ is ${total} chars and this prompt carries ${view.mode.injected}`);
+    // Everything but the archived step is still there: nothing was cut to fit.
+    expect(text).toContain('In flight');
+    expect(text).toContain('yyyy');
+    expect(text).not.toContain('left out:');
+  });
+
+  it('names the delta mode and the budget it exceeded', () => {
+    const large = makeTask(
+      makeState({ plan, decisions: ['x'.repeat(STATE_DELTA_THRESHOLD_CHARS)] }),
+    );
+
+    const view = injectedView(large.state);
+    const text = renderTaskHead(large, { injected: true });
+
+    expect(view.mode.kind).toBe('delta');
+    expect(view.mode.total).toBe(JSON.stringify(large.state).length);
+    expect(text).toContain('Injection mode: delta');
+    expect(text).toContain(`${STATE_DELTA_THRESHOLD_CHARS}-char budget`);
+    expect(text).toContain('this injection carries only the step in flight, next and blockers');
+  });
+
+  it('prints no mode line for a tool answer, which carries Σ whole', () => {
+    const task = makeTask(makeState({ plan }));
+
+    const answer = renderTaskHead(task);
+
+    expect(answer).not.toContain('Injection mode');
+    // Σ whole: the archived step is part of the state a read returns.
+    expect(answer).toContain('Read the feedback');
   });
 });
 

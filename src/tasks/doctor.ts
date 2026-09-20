@@ -1,15 +1,20 @@
 import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { projectDirOf } from '../core/paths.js';
 import { isPlainObject } from '../core/state.js';
 import type { StateValue } from '../core/types.js';
 import { STATE_DB_FILENAME, openStateDatabase } from '../db/database.js';
 import type { SqlDatabase } from '../db/database.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
+import { describeDrift, driftedArtifacts, storedArtifactStamps } from './artifact-stamps.js';
 import { readLegacyRoot } from './legacy.js';
 import { builtinSkillRegistry } from './registry.js';
 import type { SkillRegistry } from './registry.js';
 
 export type FindingSeverity = 'ok' | 'warn' | 'fail';
+
+/** How many drifted artifacts one report names; `doctor` answers for every task in the root. */
+const DRIFT_FINDINGS_LIMIT = 10;
 
 export interface Finding {
   severity: FindingSeverity;
@@ -155,6 +160,8 @@ export async function inspectStateRoot(
       skill: string;
       state: string;
     }[];
+    const projectDir = projectDirOf(rootDir);
+    const drifted: { id: string; text: string }[] = [];
     for (const row of rows) {
       const skill = registry.get(row.skill);
       if (skill === undefined) {
@@ -185,6 +192,25 @@ export async function inspectStateRoot(
           }`,
         });
       }
+
+      // Σ describes a tree, and a file somebody changed by hand between sessions is the one
+      // thing Σ cannot report about itself. Read defensively: a root from before stamps
+      // existed has no table to read, which is not a defect worth a finding.
+      if (drifted.length >= DRIFT_FINDINGS_LIMIT) continue;
+      try {
+        for (const item of driftedArtifacts(state, storedArtifactStamps(db, row.id), projectDir)) {
+          drifted.push({ id: row.id, text: describeDrift(item) });
+          if (drifted.length >= DRIFT_FINDINGS_LIMIT) break;
+        }
+      } catch {
+        // No stamp table, or a file that cannot be stat'ed: nothing to compare against.
+      }
+    }
+    for (const item of drifted) {
+      findings.push({
+        severity: 'warn',
+        text: `task ${item.id} describes a file that moved since Σ was written: ${item.text}`,
+      });
     }
     for (const task of report.unreadableTasks) {
       findings.push({

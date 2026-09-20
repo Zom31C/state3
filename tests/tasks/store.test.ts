@@ -9,7 +9,7 @@ import type { DevTaskState } from '../../src/tasks/schema.js';
 import { superviseTaskSchema } from '../../src/tasks/supervise.js';
 import type { SuperviseTaskState } from '../../src/tasks/supervise.js';
 import { TaskNotFoundError, TaskPatchError, TaskStore } from '../../src/tasks/store.js';
-import type { StoredTask } from '../../src/tasks/store.js';
+import type { PatchReport, StoredTask } from '../../src/tasks/store.js';
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -435,6 +435,62 @@ describe('verification stamps', () => {
     const patched = await store.patch({ decisions: ['a choice'] }, task.meta.id);
 
     expect(dev(patched).verifications).toEqual([]);
+  });
+
+  it('keeps the stamp when the whole array is resent with the fields in another order', async () => {
+    const task = await store.start('Wholesale resend');
+    const recorded = await store.patch(
+      { verifications: [{ check: 'npm test', status: 'pass' }] },
+      task.meta.id,
+    );
+    const before = dev(recorded).verifications[0];
+
+    await delay(10);
+    const resent = await store.patch(
+      { verifications: [{ status: 'pass', check: 'npm test' }] },
+      task.meta.id,
+    );
+
+    expect(dev(resent).verifications[0]).toEqual(before);
+  });
+
+  it('reports the stamp a compression detached, and keeps it in the history', async () => {
+    const task = await store.start('Compression');
+    const recorded = await store.patch(
+      { verifications: [{ check: 'dev.bat check -> ALL CHECKS PASSED', status: 'pass' }] },
+      task.meta.id,
+    );
+    const before = dev(recorded).verifications[0];
+
+    await delay(10);
+    const report: PatchReport = {};
+    const compressed = await store.patch(
+      { verifications: [{ check: 'dev.bat check PASSED', status: 'pass' }] },
+      task.meta.id,
+      report,
+    );
+
+    // A reworded entry is a new claim and is stamped again — but not silently: the stamp it
+    // replaced exists nowhere else, so the report and the audit trail both carry it.
+    expect(dev(compressed).verifications[0]?.at).not.toBe(before?.at);
+    expect(report.stamps?.superseded).toEqual([
+      { check: 'dev.bat check -> ALL CHECKS PASSED', at: before?.at, commit: null },
+    ]);
+
+    const entries = await store.history(task.meta.id);
+    const note = entries[entries.length - 1]?.note ?? '';
+    expect(note).toContain('1 verification stamp(s) superseded');
+    expect(note).toContain(`was at ${before?.at ?? 'nothing'} commit null`);
+  });
+
+  it('records no note for a patch that left every stamp attached', async () => {
+    const task = await store.start('Quiet patch');
+    await store.patch({ verifications: [{ check: 'npm test', status: 'pass' }] }, task.meta.id);
+
+    await store.patch({ decisions: ['and then'] }, task.meta.id);
+
+    const entries = await store.history(task.meta.id);
+    expect(entries.every((entry) => entry.note === undefined)).toBe(true);
   });
 });
 

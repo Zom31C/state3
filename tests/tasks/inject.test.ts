@@ -6,6 +6,7 @@ import { STATE_DB_FILENAME } from '../../src/db/database.js';
 import { PageStore } from '../../src/kb/store.js';
 import { readInjection } from '../../src/tasks/inject.js';
 import type { Injection } from '../../src/tasks/inject.js';
+import { STATE_DELTA_THRESHOLD_CHARS } from '../../src/tasks/render.js';
 import { TaskStore } from '../../src/tasks/store.js';
 
 let dir: string;
@@ -329,6 +330,28 @@ describe('readInjection compaction', () => {
     expect(text).toContain('this injection carries only the step in flight, next and blockers');
     expect(text).toContain('1 artifacts');
   });
+
+  it('names the mode when Σ is over the budget but dropping archived steps fits it', () => {
+    const state = JSON.parse(heavyState(['a short decision'])) as { plan: { notes: string }[] };
+    // One archived step, big enough to push Σ over the budget on its own: dropping it is
+    // what brings the prompt back under, so the two sizes straddle the threshold.
+    const archived = state.plan[0];
+    if (archived === undefined) throw new Error('heavyState has no archived step');
+    archived.notes = 'x'.repeat(STATE_DELTA_THRESHOLD_CHARS - 200);
+    expect(JSON.stringify(state).length).toBeGreaterThan(STATE_DELTA_THRESHOLD_CHARS);
+
+    forceRow('task-1', { state: JSON.stringify(state) });
+    store.close();
+
+    const text = taskOf(readInjection(dir));
+
+    expect(text).toContain('Injection mode: full');
+    expect(text).toContain('budget measures what a prompt carries, not all of Σ');
+    // Nothing but the archived step was cut: what the next action reads is all still there.
+    expect(text).toContain('src/a.ts');
+    expect(text).toContain('npm test');
+    expect(text).not.toContain('xxxx');
+  });
 });
 
 describe('readInjection subagent', () => {
@@ -353,5 +376,56 @@ describe('readInjection subagent', () => {
     const injection = readInjection(dir, { subagent: true });
 
     expect(injection.kind).toBe('unreadable');
+  });
+});
+
+describe('readInjection drift', () => {
+  /** Σ naming a file in this root, stamped by a patch, then changed behind its back. */
+  async function taskWithADriftedFile(): Promise<void> {
+    await writeFile(path.join(dir, 'a.ts'), 'one');
+    const task = await store.start('Ship it');
+    await store.patch({ artifacts: { 'a.ts': 'the reader' } }, task.meta.id);
+    await writeFile(path.join(dir, 'a.ts'), 'one two three, changed by hand overnight');
+    store.close();
+  }
+
+  it('names an artifact the disk disagrees with, at the moment the transcript holds nothing', async () => {
+    await taskWithADriftedFile();
+
+    const text = taskOf(readInjection(dir, { drift: true }));
+
+    expect(text).toContain('Artifacts changed on disk since Σ was last written');
+    expect(text).toContain('a.ts (modified');
+    expect(text).toContain('git status');
+  });
+
+  it('says nothing on a prompt, which would repeat the same line all session', async () => {
+    await taskWithADriftedFile();
+
+    const text = taskOf(readInjection(dir));
+
+    expect(text).not.toContain('Artifacts changed on disk');
+    // Σ itself is the same either way: the option adds a line, it never cuts the state.
+    expect(text).toContain('the reader');
+  });
+
+  it('says nothing when the tree still matches what Σ was written against', async () => {
+    await writeFile(path.join(dir, 'a.ts'), 'one');
+    const task = await store.start('Ship it');
+    await store.patch({ artifacts: { 'a.ts': 'the reader' } }, task.meta.id);
+    store.close();
+
+    const text = taskOf(readInjection(dir, { drift: true }));
+
+    expect(text).not.toContain('Artifacts changed on disk');
+  });
+
+  it('leaves a subagent orientation without it: those artifacts are not its work', async () => {
+    await taskWithADriftedFile();
+
+    const text = taskOf(readInjection(dir, { drift: true, subagent: true }));
+
+    expect(text).not.toContain('Artifacts changed on disk');
+    expect(text).toContain('goal: Ship it');
   });
 });

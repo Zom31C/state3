@@ -331,7 +331,8 @@ export function formatHistory(entries: readonly HistoryEntry[]): string {
       const verdict = e.ok
         ? 'ok'
         : `rejected (${e.error?.category ?? 'error'}: ${e.error?.message ?? 'unknown reason'})`;
-      return `${e.at}  ${verdict}  ${JSON.stringify(e.patch)}`;
+      const note = e.ok && e.note !== undefined ? `  note: ${e.note}` : '';
+      return `${e.at}  ${verdict}  ${JSON.stringify(e.patch)}${note}`;
     })
     .join('\n');
 }

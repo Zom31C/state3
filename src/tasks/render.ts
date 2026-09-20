@@ -48,6 +48,38 @@ export interface InjectedView {
   notes: string[];
   /** True when the notes already carry the size complaint, so the plain hint stays out. */
   reportsSize: boolean;
+  /** Which cut was applied, and the two sizes that decided it. */
+  mode: InjectionMode;
+}
+
+/**
+ * The cut an injection applied, with both sizes that could have decided it.
+ *
+ * Reported because the two disagree in the case an agent cannot resolve on its own: Σ can be
+ * over the budget while what the prompt carries is under it, because archiving plan steps
+ * already paid for the difference. Reading "Σ is 7294 chars" next to a full injection looks
+ * like a broken gate, and the only way to tell a measured decision from a bug is to see the
+ * number the gate actually compared.
+ */
+export interface InjectionMode {
+  /** `full` carries every field of Σ; `delta` carries the step in flight, next and blockers. */
+  kind: 'full' | 'delta';
+  /** Characters of Σ as stored — what the size hint complains about. */
+  total: number;
+  /** Characters of the state this injection carries — what the budget measures. */
+  injected: number;
+  /** Archived plan steps dropped before measuring. */
+  archived: number;
+}
+
+/** The one line that says which mode was applied when the two sizes straddle the budget. */
+function modeNote(mode: InjectionMode): string {
+  return (
+    `Injection mode: ${mode.kind} — Σ is ${mode.total} chars and this prompt carries ` +
+    `${mode.injected} of them; the ${STATE_DELTA_THRESHOLD_CHARS}-char budget measures what a ` +
+    'prompt carries, not all of Σ, and above it only the step in flight, next and blockers ' +
+    'are injected.'
+  );
 }
 
 /** Σ without the plan steps marked archived, and how many that removed. */
@@ -84,9 +116,13 @@ function planCounts(plan: readonly StateValue[]): string {
 /**
  * The injected view of Σ: archived steps out, and above the threshold only the delta.
  *
- * Both cuts are reported in the same breath as the state, because an injection that quietly
- * held less than Σ would be worse than a large one: a resumed session reads this text as the
- * authoritative record of its progress, so it has to be told what it is NOT seeing.
+ * The budget is measured against what the prompt would actually carry, that is after the
+ * archived steps are out: archiving is the cheap cut and it is the one the agent was already
+ * asked for, so a state it brought back under the budget needs no second cut hiding the
+ * artifacts and decisions the next step may read. Both cuts are reported in the same breath
+ * as the state, because an injection that quietly held less than Σ would be worse than a
+ * large one: a resumed session reads this text as the authoritative record of its progress,
+ * so it has to be told what it is NOT seeing.
  */
 export function injectedView(state: StateDict): InjectedView {
   const kept = dropArchivedSteps(state);
@@ -98,8 +134,24 @@ export function injectedView(state: StateDict): InjectedView {
         ];
 
   const total = JSON.stringify(state).length;
-  if (JSON.stringify(kept.state).length <= STATE_DELTA_THRESHOLD_CHARS) {
-    return { state: kept.state, notes: archivedNote, reportsSize: false };
+  const injected = JSON.stringify(kept.state).length;
+  const mode: InjectionMode = {
+    kind: injected <= STATE_DELTA_THRESHOLD_CHARS ? 'full' : 'delta',
+    total,
+    injected,
+    archived: kept.archived,
+  };
+
+  if (mode.kind === 'full') {
+    // Σ over the budget while the prompt is under it is the one case that reads as a broken
+    // gate from the inside, so it is the only case that costs a line to explain itself.
+    const straddles = total > STATE_DELTA_THRESHOLD_CHARS;
+    return {
+      state: kept.state,
+      notes: straddles ? [...archivedNote, modeNote(mode)] : archivedNote,
+      reportsSize: false,
+      mode,
+    };
   }
 
   const plan = Array.isArray(kept.state.plan) ? kept.state.plan : [];
@@ -125,12 +177,14 @@ export function injectedView(state: StateDict): InjectedView {
   return {
     state: delta,
     notes: [
-      `Σ is ${total} chars, so this injection carries only the step in flight, next and blockers — ` +
-        `left out: ${leftOut.length === 0 ? 'nothing else' : leftOut.join(', ')}` +
+      `Injection mode: delta — Σ is ${total} chars, over the ${STATE_DELTA_THRESHOLD_CHARS}-char ` +
+        'budget for what one prompt carries, so this injection carries only the step in flight, ' +
+        `next and blockers — left out: ${leftOut.length === 0 ? 'nothing else' : leftOut.join(', ')}` +
         `${kept.archived === 0 ? '' : `, plus ${kept.archived} archived step(s)`}. ` +
         'task_show returns all of it; compress Σ so the injection can carry it again.',
     ],
     reportsSize: true,
+    mode,
   };
 }
 
@@ -188,12 +242,21 @@ export function renderStateSize(state: StateDict): string {
   ].join('\n');
 }
 
+/** Σ whole, as a tool answer carries it: nothing cut, so both sizes are the same. */
+function wholeView(state: StateDict): InjectedView {
+  const total = JSON.stringify(state).length;
+  return {
+    state,
+    notes: [],
+    reportsSize: false,
+    mode: { kind: 'full', total, injected: total, archived: 0 },
+  };
+}
+
 /** Task header plus the compact single-line Σ; shared by the MCP tools and the CLI. */
 export function renderTaskHead(task: StoredTask, options: RenderOptions = {}): string {
   const view: InjectedView =
-    options.injected === true
-      ? injectedView(task.state)
-      : { state: task.state, notes: [], reportsSize: false };
+    options.injected === true ? injectedView(task.state) : wholeView(task.state);
 
   return [
     `Task ${task.meta.id} [${task.meta.skill}] (${taskStatus(view.state)}):`,

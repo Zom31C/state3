@@ -25,17 +25,17 @@ here costs tokens on every turn. Keep additions to it short.
 Nine, from the MCP server `skillstate`. Hosts prefix them: `mcp__skillstate__task_show` in
 Qwen Code, `skillstate_task_show` in opencode.
 
-| Tool            | What it is for                                                                                 |
-| --------------- | ---------------------------------------------------------------------------------------------- |
-| `task_start`    | open Σ for a job: goal, ordered plan, `skill`, `notation`                                      |
-| `task_show`     | Σ **plus the procedure P** of its skill — the first call after a restart                       |
-| `task_patch`    | the only way Σ changes; send only what changed                                                 |
-| `task_finish`   | close the task with a summary of the outcome                                                   |
-| `task_list`     | tasks, the skills this runtime has, the declared projects, the runtime line                    |
-| `task_history`  | audit trail, including rejected patches and why                                                |
-| `project_brief` | L0 map of the project: one line per page, no bodies, inside a fixed budget                     |
-| `page`          | the knowledge base, chosen by `op`: `get` `put` `list` `delete` `init` `link` `unlink` `links` |
-| `search`        | full text over tasks and pages, best match first, hits with short snippets                     |
+| Tool            | What it is for                                                                                                                                            |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `task_start`    | open Σ for a job: goal, ordered plan, `skill`, `notation`                                                                                                 |
+| `task_show`     | Σ **plus the procedure P** of its skill — the first call after a restart                                                                                  |
+| `task_patch`    | the only way Σ changes; send only what changed                                                                                                            |
+| `task_finish`   | close the task with a summary of the outcome                                                                                                              |
+| `task_list`     | tasks, the skills this runtime has, the declared projects, the runtime line                                                                               |
+| `task_history`  | audit trail, including rejected patches and why                                                                                                           |
+| `project_brief` | L0 map of the project: one line per page, no bodies, inside a fixed budget                                                                                |
+| `page`          | the knowledge base, chosen by `op`: `get` `put` `patch` `append` `history` `stale` `coverage` `list` `delete` `init` `link` `unlink` `links`              |
+| `search`        | full text over tasks and pages — title, summary, body and a page's `symbols` — best match first, hits with short snippets; a miss names the nearest pages |
 
 Every tool takes an optional `project` — the name of another state root the user declared
 (`SKILLSTATE_PROJECTS`) — which is how a supervising session reads and patches a worker's Σ
@@ -117,12 +117,16 @@ blocker found. Not at the end: the end is exactly when the transcript gets compa
 - `plan` — finished item `done`, next item `in_progress`, concrete step in `next.action`: one
   patch. Reopening a `done` item needs the reason in its `notes`.
 - `artifacts` — one line per touched file or resource, saying what it is **now**. Delete stale
-  entries with `null`; merging alone never shrinks Σ.
+  entries with `null`; merging alone never shrinks Σ. A file you name is also stamped (`mtime`,
+  size) when Σ is written, and a read says which of them changed on disk since — that is Σ
+  telling you the tree moved under it, so look at the file before trusting what Σ says about it.
 - `verifications` — the literal command and its **real** status (`evidence` in
   `supervise-task`). Never `pass` without output you actually saw; a check you did not run is
   recorded as not run. The runtime stamps every entry with `at` and `commit` (the project's git
   HEAD, `null` outside a repository) — send neither yourself, so a `pass` stays tied to the tree
-  it passed on.
+  it passed on. Resending an entry with the same field values keeps its stamp in whatever order
+  you write them; rewording one is a new claim, is stamped again, and the answer names the stamp
+  it replaced.
 - `decisions` — the choices later steps must respect, one line each, with the reason.
 - `blockers` plus `status:"blocked"` when progress stops; clear them when it resumes.
   `blocked` with no blocker is refused.
@@ -138,8 +142,12 @@ need and compress finished work into its outcome — one line in `decisions`, no
 how you got there. When the runtime tells you Σ is too long, believe it and cut:
 `task_show {"view":"size"}` answers with no Σ at all, only what each field costs, largest first,
 and marking a finished step `{"plan[0].archived":true}` keeps it in Σ while dropping it from the
-injection. Past a threshold the injection carries only the step in flight, `next` and `blockers`,
-and names what it left out — `task_show {"view":"state"}` still returns all of Σ.
+injection. Past a threshold — measured on what a prompt would carry, that is after the archived
+steps are out — the injection carries only the step in flight, `next` and `blockers`, and names
+what it left out; it also names the mode it applied and both sizes whenever Σ and the injection
+sit on different sides of that threshold, so a full injection next to a large Σ is a measurement
+you can check rather than a broken cut to guess about. `task_show {"view":"state"}` still returns
+all of Σ.
 
 ## Delegating to subagents
 
@@ -211,6 +219,15 @@ Two habits decide whether pages are worth anything:
 - **Point at code, do not copy it.** The repository stays current; a pasted copy in a body
   does not. Write `src/kb/brief.ts trims by whole lines, never mid-line` instead of pasting
   the function.
+- **Name the symbols a reader would grep for** in the page's `symbols` field — up to 40 lines
+  of `Name — path/to/file.ext`. They are indexed as a column of their own, so `search` answers
+  with the file instead of a page that happens to mention the name in passing, and a line there
+  counts as covering that file.
+
+`page {"op":"coverage"}` answers the question nothing else can: which files of this repository
+no page names, most-changed first. That is the list to work from when you decide to write
+memory down, and it is the honest reading of a `search` miss — the knowledge base has no
+answer, the project may well have one, so grep the tree and then record what you found.
 
 Keep out of pages what is already authoritative elsewhere: git history and blame, the code
 itself, dependency manifests, and the ephemeral state of the task in flight — that last one is

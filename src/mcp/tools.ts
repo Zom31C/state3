@@ -3,12 +3,21 @@ import type { RejectCategory } from '../core/rejections.js';
 import { projectDirOf } from '../core/paths.js';
 import type { StateDict } from '../core/types.js';
 import { formatRuntimeInfo, runtimeInfo } from '../runtime-info.js';
+import { driftWarnings } from '../tasks/artifact-stamps.js';
+import type { DriftedArtifact } from '../tasks/artifact-stamps.js';
 import { artifactWarnings, missingArtifactPaths } from '../tasks/artifacts.js';
 import { isNotation, NOTATIONS } from '../tasks/notation.js';
 import type { ProjectEntry, StoreResolver, TaskStorePort } from '../tasks/ports.js';
 import { describeProjects } from '../tasks/projects.js';
 import { renderStateSize, renderTaskHead } from '../tasks/render.js';
-import type { HistoryEntry, StartOptions, StoredTask, TaskSummary } from '../tasks/store.js';
+import type {
+  HistoryEntry,
+  PatchReport,
+  StartOptions,
+  StoredTask,
+  TaskSummary,
+} from '../tasks/store.js';
+import { stampWarnings } from '../tasks/verifications.js';
 
 export type { ProjectEntry, StoreResolver, TaskStorePort } from '../tasks/ports.js';
 
@@ -237,10 +246,21 @@ async function renderCapabilities(resolver: StoreResolver, store: TaskStorePort)
   return `\n${lines.join('\n')}`;
 }
 
+/**
+ * The artifacts the disk disagrees with Σ about, as lines under a read; empty when the tree
+ * still matches, and when the store cannot answer at all.
+ */
+function driftLines(drifted: readonly DriftedArtifact[] | undefined): string[] {
+  return drifted === undefined ? [] : driftWarnings(drifted);
+}
+
 function renderHistoryEntry(entry: HistoryEntry, index: number): string {
   const keys = Object.keys(entry.patch);
   const change = keys.length === 0 ? 'empty patch' : keys.join(', ');
-  if (entry.ok) return `${index + 1}. ${entry.at} ok — patched: ${change}`;
+  if (entry.ok) {
+    const note = entry.note === undefined ? '' : ` — ${entry.note}`;
+    return `${index + 1}. ${entry.at} ok — patched: ${change}${note}`;
+  }
   const category = entry.error?.category ?? 'invalid';
   const message = entry.error?.message ?? 'patch rejected';
   return `${index + 1}. ${entry.at} REJECTED (${category}) — patched: ${change} — ${message}`;
@@ -302,7 +322,17 @@ async function showTask(
     // The size report answers "what should I compress", so it carries no Σ and no procedure:
     // both are what it is measuring, and repeating them would cost what the call saves.
     if (view.value === 'size') return success(renderStateSize(task.state));
-    return success(renderStateWithProcedure(store, task));
+    const parts = [renderStateWithProcedure(store, task)];
+    // A read is the moment to compare Σ against the tree: this is the call a resumed session
+    // makes before acting on what Σ says, and the tree may have been changed by hand while
+    // the session was gone.
+    parts.push(...driftLines(await store.driftedArtifacts?.(task.meta.id)));
+    // The build is named here and not on every answer because this is the call a resumed
+    // session makes: a host keeps the server it started, so a feature that exists in the
+    // repository may not exist in the code that is answering, and this line is the only
+    // place the difference is visible without leaving the session.
+    parts.push(formatRuntimeInfo(await runtimeInfo()));
+    return success(parts.join('\n\n'));
   } catch (err) {
     return failureFromError(err, rootNote(store));
   }
@@ -323,6 +353,20 @@ function artifactNote(store: TaskStorePort, state: StateDict, patch: StateDict):
   return lines.length === 0 ? '' : `\n${lines.join('\n')}`;
 }
 
+/**
+ * The verification stamps this patch detached, as a note under the answer.
+ *
+ * Σ cannot show it: after the write, every entry carries a stamp and nothing marks the one
+ * that was replaced. The agent sent the patch that replaced it, so the agent is the one who
+ * has to be told — silently losing "which tree this check ran on" is what makes a supervisor's
+ * audit impossible after the fact.
+ */
+function stampNote(report: PatchReport): string {
+  if (report.stamps === undefined) return '';
+  const lines = stampWarnings(report.stamps);
+  return lines.length === 0 ? '' : `\n${lines.join('\n')}`;
+}
+
 async function patchTask(
   resolver: StoreResolver,
   args: Record<string, unknown>,
@@ -336,9 +380,11 @@ async function patchTask(
   const id = optionalString(args, 'id');
   if (!id.ok) return failure(id.message);
   try {
-    const task = await store.patch(patch.value, id.value);
+    const report: PatchReport = {};
+    const task = await store.patch(patch.value, id.value, report);
     return success(
       `Patched task ${task.meta.id}.\n\n${renderState(task)}` +
+        stampNote(report) +
         artifactNote(store, task.state, patch.value),
     );
   } catch (err) {

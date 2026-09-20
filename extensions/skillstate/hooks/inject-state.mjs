@@ -201,10 +201,12 @@ async function reader() {
  * the turn would say why.
  *
  * `brief` asks for the knowledge-base brief as well, which only a session start does;
- * `subagent` asks for the delegated-agent orientation instead of Σ. A build from before the
- * subagent brief existed ignores that option and answers with Σ: costlier, but never silent.
+ * `subagent` asks for the delegated-agent orientation instead of Σ; `drift` asks which file
+ * artifacts changed on disk since Σ was written, also only at a session start. A build from
+ * before the subagent brief existed ignores that option and answers with Σ: costlier, but
+ * never silent.
  */
-async function injectionFor(rootDir, { brief = false, subagent = false } = {}) {
+async function injectionFor(rootDir, { brief = false, subagent = false, drift = false } = {}) {
   const dbPath = join(rootDir, STATE_DB_FILENAME);
   if (existsSync(dbPath)) {
     const module = await reader();
@@ -217,7 +219,7 @@ async function injectionFor(rootDir, { brief = false, subagent = false } = {}) {
     }
     let injection;
     try {
-      injection = module.readInjection(rootDir, { brief, subagent });
+      injection = module.readInjection(rootDir, { brief, subagent, drift });
     } catch (err) {
       return { warn: `cannot read ${dbPath}: ${err instanceof Error ? err.message : String(err)}` };
     }
@@ -371,10 +373,19 @@ const warnings = [];
 // injected, but not each worker's knowledge base: that would multiply the brief by the number
 // of projects, and project_brief {"project":"<name>"} is one call away when it is really needed.
 const wantBrief = eventName === 'SessionStart';
+// The same moment, for the tree rather than for the pages: a session start is when the
+// transcript holds nothing, so a file somebody changed by hand while the session was gone is
+// otherwise invisible until an edit refuses or a check fails for reasons nothing to do with
+// the work. On every other event the drift line would repeat itself for the whole session.
+const wantDrift = eventName === 'SessionStart';
 
 let primary = null;
 try {
-  primary = await injectionFor(stateDir, { brief: wantBrief, subagent: isSubagentStart });
+  primary = await injectionFor(stateDir, {
+    brief: wantBrief,
+    subagent: isSubagentStart,
+    drift: wantDrift,
+  });
 } catch {
   primary = null;
 }
@@ -423,8 +434,9 @@ if (!isSubagentStart && typeof projectsSpec === 'string' && projectsSpec.trim() 
       entries.map(async (entry) => {
         try {
           if (sameRoot(entry.rootDir, stateDir)) return null;
-          // No brief for a supervised root: see wantBrief above.
-          const injection = await injectionFor(entry.rootDir);
+          // No brief for a supervised root: see wantBrief above. Its drift is reported,
+          // because a supervisor acts on the worker's tree exactly as the worker does.
+          const injection = await injectionFor(entry.rootDir, { drift: wantDrift });
           if (injection === null) return null;
           if (injection.warn !== undefined) {
             warnings.push(injection.warn);

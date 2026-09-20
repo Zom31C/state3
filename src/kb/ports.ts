@@ -47,6 +47,35 @@ export interface StalePage {
   files: string[];
 }
 
+/** One file no page names, with what ranks it. */
+export interface UncoveredFile {
+  path: string;
+  /** Commits inside the window that touched it; 0 when none did. */
+  commits: number;
+}
+
+/**
+ * What the knowledge base covers, and what it leaves an agent to discover by reading code.
+ *
+ * `stale` looks backwards — a page that no longer matches the tree — and this is the other
+ * direction: a file the tree holds that no page mentions, which is the file a cold session
+ * has to open in full because nothing told it the file exists.
+ */
+export interface CoverageReport {
+  /** Documentable files git tracks; null when there is no repository to ask. */
+  tracked: number | null;
+  /** Of those, how many at least one page names. */
+  covered: number;
+  /** The rest, most-changed first, capped at the limit the caller asked for. */
+  uncovered: UncoveredFile[];
+  /** How many there are in all, whether the list was capped or not. */
+  uncoveredTotal: number;
+  /** Commits the ranking looked at. */
+  window: number;
+  /** Pages whose anchors were read to decide this. */
+  pages: number;
+}
+
 /** One end of a link. Polymorphic, like the `link` table: a task or a page. */
 export interface LinkRef {
   kind: string;
@@ -79,6 +108,8 @@ export interface PageStorePort {
   freshness(id: string): PageFreshness | null;
   /** Pages whose files changed after they were written, worst first. */
   stalePages(limit?: number): StalePage[];
+  /** Which documentable files no page names, most-changed first. */
+  coverage(limit?: number): CoverageReport;
   list(filter?: PageFilter): PageSummary[];
   delete(id: string): boolean;
   count(): number;

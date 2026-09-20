@@ -1,4 +1,5 @@
 import type { SqlDatabase } from '../db/database.js';
+import type { PageSummary } from './schema.js';
 
 /** One search result: what it is, and the piece of it that matched. */
 export interface SearchHit {
@@ -30,6 +31,7 @@ interface FtsRow {
   title_snippet: string;
   summary_snippet: string;
   body_snippet: string;
+  symbols_snippet: string;
 }
 
 interface LikeRow {
@@ -38,6 +40,7 @@ interface LikeRow {
   title: string;
   summary: string;
   body: string;
+  symbols: string;
 }
 
 /**
@@ -61,9 +64,20 @@ function likePattern(query: string): string {
   return `%${escaped}%`;
 }
 
-/** The column whose snippet actually contains the match; FTS5 marks it with the brackets. */
+/**
+ * The column whose snippet actually contains the match; FTS5 marks it with the brackets.
+ *
+ * Symbols first: a line there is `Name — path/to/file.ext`, so it is the only snippet that
+ * answers "where does this live" without the reader opening anything, and a match in it is
+ * the reason the field exists.
+ */
 function pickSnippet(row: FtsRow): string {
-  for (const candidate of [row.body_snippet, row.summary_snippet, row.title_snippet]) {
+  for (const candidate of [
+    row.symbols_snippet,
+    row.body_snippet,
+    row.summary_snippet,
+    row.title_snippet,
+  ]) {
     if (candidate.includes('[')) return candidate.trim();
   }
   return row.title;
@@ -71,7 +85,7 @@ function pickSnippet(row: FtsRow): string {
 
 function fallbackSnippet(row: LikeRow, query: string): string {
   const needle = query.toLowerCase();
-  for (const text of [row.body, row.summary, row.title]) {
+  for (const text of [row.symbols, row.body, row.summary, row.title]) {
     const at = text.toLowerCase().indexOf(needle);
     if (at < 0) continue;
     const from = Math.max(0, at - FALLBACK_CHARS);
@@ -115,17 +129,19 @@ export function searchDatabase(
   const expression = ftsExpression(trimmed);
   if (expression !== '') {
     try {
-      // Weights per column (ref_kind, ref_id, title, summary, body): a word in the title says
-      // more about a page than the same word buried in a body. bm25 ranks ascending.
+      // Weights per column (ref_kind, ref_id, title, summary, body, symbols): a word in the
+      // title says more about a page than the same word buried in a body, and a word in the
+      // symbol list is the one that names a file. bm25 ranks ascending.
       const rows = db
         .prepare(
           `SELECT ref_kind, ref_id, title,
                   snippet(search, 2, '[', ']', ' … ', ${SNIPPET_TOKENS}) AS title_snippet,
                   snippet(search, 3, '[', ']', ' … ', ${SNIPPET_TOKENS}) AS summary_snippet,
-                  snippet(search, 4, '[', ']', ' … ', ${SNIPPET_TOKENS}) AS body_snippet
+                  snippet(search, 4, '[', ']', ' … ', ${SNIPPET_TOKENS}) AS body_snippet,
+                  snippet(search, 5, '[', ']', ' … ', ${SNIPPET_TOKENS}) AS symbols_snippet
            FROM search
            WHERE search MATCH ?${kindFilter}
-           ORDER BY bm25(search, 0, 0, 10, 5, 1)
+           ORDER BY bm25(search, 0, 0, 10, 5, 1, 8)
            LIMIT ?`,
         )
         .all(expression, ...kindParams, limit) as FtsRow[];
@@ -146,11 +162,12 @@ export function searchDatabase(
   const pattern = likePattern(trimmed);
   const rows = db
     .prepare(
-      `SELECT ref_kind, ref_id, title, summary, body FROM search
-       WHERE (title LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')${kindFilter}
+      `SELECT ref_kind, ref_id, title, summary, body, symbols FROM search
+       WHERE (title LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\'
+              OR symbols LIKE ? ESCAPE '\\')${kindFilter}
        LIMIT ?`,
     )
-    .all(pattern, pattern, pattern, ...kindParams, limit) as LikeRow[];
+    .all(pattern, pattern, pattern, pattern, ...kindParams, limit) as LikeRow[];
 
   return rows.map((row) => ({
     kind: row.ref_kind,
@@ -158,4 +175,70 @@ export function searchDatabase(
     title: row.title,
     snippet: fallbackSnippet(row, trimmed),
   }));
+}
+
+/** How many pages a miss names as the nearest by topic. */
+export const NEAREST_PAGES_LIMIT = 3;
+
+/** Shorter words carry no topic: "the", "как" and "a" are in every page and say nothing. */
+const MIN_TOPIC_WORD_CHARS = 3;
+
+/** One page a miss points at, and the query words that made it the nearest. */
+export interface NearestPage {
+  id: string;
+  title: string;
+  summary: string;
+  /** Query words this page's title or summary also holds. */
+  shared: string[];
+}
+
+/** The words of a text that could carry a topic: letters and digits, lowercased, long enough. */
+function topicWords(text: string): Set<string> {
+  const words = new Set<string>();
+  for (const word of text.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+    if (word.length >= MIN_TOPIC_WORD_CHARS) words.add(word);
+  }
+  return words;
+}
+
+/**
+ * True when a query word and a page word are the same word as far as a topic goes.
+ *
+ * Prefix rather than equality, because the queries that miss are usually identifiers — and
+ * `RoadNetwork` has to be near a page titled "Road network", which no exact match would ever
+ * connect. Prefix and not substring, so `car` does not become a match inside `scar`.
+ */
+function sameTopic(query: string, word: string): boolean {
+  return query.startsWith(word) || word.startsWith(query);
+}
+
+/**
+ * The pages nearest to a query that matched nothing, nearest first.
+ *
+ * A miss is the expensive answer to search for: on its own it says only that the knowledge
+ * base cannot help, and the next move is a guess. Naming the pages that at least share the
+ * query's vocabulary turns it into a choice — read one of those, or accept that the topic is
+ * not written down and go to the tree.
+ */
+export function nearestPages(
+  pages: readonly PageSummary[],
+  query: string,
+  limit: number = NEAREST_PAGES_LIMIT,
+): NearestPage[] {
+  const wanted = [...topicWords(query)];
+  if (wanted.length === 0) return [];
+
+  const scored: NearestPage[] = [];
+  for (const page of pages) {
+    const words = topicWords(`${page.title} ${page.summary}`);
+    if (words.size === 0) continue;
+    const shared = wanted.filter((word) =>
+      [...words].some((candidate) => sameTopic(word, candidate)),
+    );
+    if (shared.length === 0) continue;
+    scored.push({ id: page.id, title: page.title, summary: page.summary, shared });
+  }
+  return scored
+    .sort((a, b) => b.shared.length - a.shared.length || (a.id < b.id ? -1 : 1))
+    .slice(0, Math.max(limit, 1));
 }

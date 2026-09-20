@@ -40,6 +40,57 @@ export function gitHead(cwd: string): string | null {
   return head;
 }
 
+/**
+ * How many commits a churn ranking looks at.
+ *
+ * A window rather than the whole history: the question is which files cost the most to
+ * rediscover NOW, and a file last touched three years ago is not that. The bound is also
+ * what keeps the answer cheap — one subprocess with a predictable amount of output, on a
+ * call an agent makes once per session at most.
+ */
+export const CHURN_COMMIT_WINDOW = 200;
+
+/**
+ * Paths git would otherwise quote, so a knowledge base in the user's language matches the
+ * tree: without this a file named `документация.md` is printed as `"\320\264..."`, which no
+ * page body will ever contain.
+ */
+const UNQUOTED: readonly string[] = ['-c', 'core.quotePath=false'];
+
+/** Every file this repository tracks, with `/` separators, or null when there is none. */
+export function gitTrackedFiles(cwd: string): string[] | null {
+  const out = git(cwd, [...UNQUOTED, 'ls-files']);
+  if (out === null) return null;
+  if (out === '') return [];
+  return out
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+}
+
+/**
+ * How many commits inside the last `window` touched each file, or null when there is no
+ * repository to ask.
+ *
+ * Counted from one `git log` rather than one call per file: a project has hundreds of files
+ * and a report that spent a subprocess on each would not be run twice.
+ */
+export function gitFileChurn(
+  cwd: string,
+  window: number = CHURN_COMMIT_WINDOW,
+): Map<string, number> | null {
+  const out = git(cwd, [...UNQUOTED, 'log', '-n', String(window), '--format=', '--name-only']);
+  if (out === null) return null;
+
+  const churn = new Map<string, number>();
+  for (const line of out.split('\n')) {
+    const file = line.trim();
+    if (file === '') continue;
+    churn.set(file, (churn.get(file) ?? 0) + 1);
+  }
+  return churn;
+}
+
 /** One commit that touched the given paths, and which of them it touched. */
 export interface CommitTouch {
   commit: string;

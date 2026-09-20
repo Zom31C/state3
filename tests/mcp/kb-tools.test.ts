@@ -73,6 +73,7 @@ describe('the tool surface', () => {
       'append',
       'history',
       'stale',
+      'coverage',
       'list',
       'delete',
       'init',
@@ -80,6 +81,20 @@ describe('the tool surface', () => {
       'unlink',
       'links',
     ]);
+  });
+
+  it('says in the op description what each one is for, since the enum alone cannot', () => {
+    const description = String(
+      (
+        (byName.get('page')?.inputSchema.properties ?? {}) as Record<
+          string,
+          { description?: string }
+        >
+      ).op?.description,
+    );
+    for (const op of ['stale', 'coverage', 'history', 'links']) {
+      expect(description).toContain(`${op}:`);
+    }
   });
 
   it('briefs the project through the tool, without any page body', async () => {
@@ -128,6 +143,21 @@ describe('page put and get', () => {
     expect(got.content).toContain('page project [project] (current)');
     expect(got.content).toContain('The runtime lives in src/.');
     expect(got.content).toContain(`-[documents]-> task:${task.meta.id}`);
+  });
+
+  it('accepts a symbol list on put and shows it on get', async () => {
+    // Through the tool, not the store: `put` takes only the arguments it declares, so a field
+    // missing from that list is refused here and nowhere else.
+    const stored = await call('page', {
+      ...projectPage,
+      symbols: ['TokenVerifier — src/auth/verify.ts'],
+    });
+
+    expect(stored.ok).toBe(true);
+
+    const got = await call('page', { op: 'get', id: 'project' });
+    expect(got.content).toContain('symbols:');
+    expect(got.content).toContain('  TokenVerifier — src/auth/verify.ts');
   });
 
   it('reports a missing page as an error with a way forward, not as an empty answer', async () => {
@@ -492,6 +522,22 @@ describe('what a page is anchored to', () => {
     const limited = await call('page', { op: 'stale', limit: 3 });
     expect(limited.ok).toBe(true);
   });
+
+  it('answers coverage through the tool, with the same argument rules as stale', async () => {
+    const refused = await call('page', { op: 'coverage', id: 'project' });
+    expect(refused.ok).toBe(false);
+    expect(refused.content).toContain('op "coverage" does not take "id"');
+
+    expect((await call('page', { op: 'coverage', limit: 0 })).ok).toBe(false);
+
+    const coverage = await call('page', { op: 'coverage' });
+    expect(coverage.ok).toBe(true);
+    // This root is not a repository, so there is nothing to list — which must not read as
+    // "everything is documented".
+    expect(coverage.content).toContain('this project has none to ask');
+
+    expect((await call('page', { op: 'coverage', limit: 5 })).ok).toBe(true);
+  });
 });
 
 describe('page list and delete', () => {
@@ -743,6 +789,50 @@ describe('search', () => {
     expect(found.ok).toBe(true);
     expect(found.content).toContain('nothing matches "kubernetes"');
     expect(found.content).toContain('Every word must appear');
+  });
+
+  it('names the nearest pages on a miss, and the move that ends the miss', async () => {
+    const stored = await call('page', {
+      op: 'put',
+      id: 'roads',
+      kind: 'feature',
+      title: 'Road network',
+      summary: 'How the roads are laid out.',
+    });
+    expect(stored.ok).toBe(true);
+
+    const found = await call('search', { query: 'RoadNetwork' });
+
+    expect(found.ok).toBe(true);
+    expect(found.content).toContain('nothing matches "RoadNetwork"');
+    expect(found.content).toContain('Nearest pages by topic');
+    expect(found.content).toContain('- roads: Road network');
+    expect(found.content).toContain('(shares: roadnetwork)');
+    expect(found.content).toContain('"symbols"');
+  });
+
+  it('points a task-only miss at nothing but tasks, since pages were not being searched', async () => {
+    await call('page', {
+      op: 'put',
+      id: 'roads',
+      kind: 'feature',
+      title: 'Road network',
+      summary: 'How the roads are laid out.',
+    });
+
+    const found = await call('search', { query: 'RoadNetwork', kind: 'task' });
+
+    expect(found.ok).toBe(true);
+    expect(found.content).not.toContain('Nearest pages');
+  });
+
+  it('says a project with no pages has no knowledge base, rather than reporting a clean miss', async () => {
+    const found = await call('search', { query: 'anything at all' });
+
+    expect(found.ok).toBe(true);
+    expect(found.content).toContain('this project has no knowledge base yet');
+    expect(found.content).toContain('op":"init"');
+    expect(found.content).not.toContain('Nearest pages');
   });
 
   it('takes a kind and a limit, and refuses anything else', async () => {

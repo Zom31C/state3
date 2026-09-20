@@ -46,6 +46,18 @@ export const SUMMARY_MAX_CHARS = 200;
 export const BODY_MAX_CHARS = 20_000;
 
 /**
+ * How many symbols one page lists.
+ *
+ * The field is an index, not a symbol table: enough entries to answer "where does this live"
+ * for the things the page is about, and a hard stop before it becomes a dump of every name in
+ * a file — which is what `search` over the repository is for, and what a page must not cost.
+ */
+export const SYMBOLS_LIMIT = 40;
+
+/** A symbol line is `Name — path/to/file.ext`; longer than this is prose, and prose is the body's job. */
+export const SYMBOL_MAX_CHARS = 200;
+
+/**
  * Previous bodies kept per page, newest first.
  *
  * Enough to undo a rewrite made this session and to answer "what did this page say
@@ -82,6 +94,7 @@ export const pageInputSchema = z.strictObject({
   title: z.string().min(1).max(TITLE_MAX_CHARS).optional(),
   summary: z.string().min(1).max(SUMMARY_MAX_CHARS).optional(),
   body: z.string().max(BODY_MAX_CHARS).optional(),
+  symbols: z.array(z.string().min(1).max(SYMBOL_MAX_CHARS)).max(SYMBOLS_LIMIT).optional(),
   parent: z.string().regex(PAGE_ID).nullish(),
   status: z.enum(PAGE_STATUSES).optional(),
   pin: z.boolean().optional(),
@@ -107,6 +120,14 @@ export interface PageRecord {
    */
   sourceCommit: string | null;
   sourceFiles: string[];
+  /**
+   * The symbols this page documents, each as `Name — path/to/file.ext`.
+   *
+   * Structured rather than left in the prose because it is the one field that answers "where
+   * does this live" without reading anything: the search index carries it as a column of its
+   * own, so a hit names the file instead of naming a page that mentions the name somewhere.
+   */
+  symbols: string[];
   createdAt: string;
   updatedAt: string;
 }

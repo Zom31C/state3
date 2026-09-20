@@ -151,6 +151,42 @@ describe('openStateDatabase', () => {
 
 describe('migrating an older database forward', () => {
   /**
+   * The search index as version 5 had it: five columns, because the sixth (`symbols`) only
+   * arrives with the rebuild in 5 -> 6. Recreated by hand, like the triggers inside it,
+   * because a migration test is worth nothing against a file that is not really behind — and
+   * because the rebuild has to REPLACE these: `CREATE TRIGGER IF NOT EXISTS` would leave them
+   * in place, and every symbol written afterwards would be missing from the search, silently.
+   */
+  const INDEX_WITHOUT_SYMBOLS_SQL: readonly string[] = [
+    `CREATE VIRTUAL TABLE search USING fts5(
+      ref_kind UNINDEXED,
+      ref_id   UNINDEXED,
+      title,
+      summary,
+      body,
+      tokenize = 'unicode61 remove_diacritics 2'
+    )`,
+    `CREATE TRIGGER search_task_insert AFTER INSERT ON task BEGIN
+      INSERT INTO search (ref_kind, ref_id, title, summary, body)
+      VALUES ('task', new.id, new.goal, '', new.state);
+    END`,
+    `CREATE TRIGGER search_task_update AFTER UPDATE ON task BEGIN
+      DELETE FROM search WHERE ref_kind = 'task' AND ref_id = old.id;
+      INSERT INTO search (ref_kind, ref_id, title, summary, body)
+      VALUES ('task', new.id, new.goal, '', new.state);
+    END`,
+    `CREATE TRIGGER search_page_insert AFTER INSERT ON page BEGIN
+      INSERT INTO search (ref_kind, ref_id, title, summary, body)
+      VALUES ('page', new.id, new.title, new.summary, new.body);
+    END`,
+    `CREATE TRIGGER search_page_update AFTER UPDATE ON page BEGIN
+      DELETE FROM search WHERE ref_kind = 'page' AND ref_id = old.id;
+      INSERT INTO search (ref_kind, ref_id, title, summary, body)
+      VALUES ('page', new.id, new.title, new.summary, new.body);
+    END`,
+  ];
+
+  /**
    * A database at an older schema version, made by undoing what the later migrations add.
    * The migration path has to be exercised against a file that really is behind, because
    * every project already using skillState has one.
@@ -158,6 +194,18 @@ describe('migrating an older database forward', () => {
   function databaseAtVersion(file: string, version: number): void {
     const db = track(openStateDatabase(file));
     insertPage(db, 'project', 'Drift Ages', 'A driving game.', 'Physics lives in scripts/.');
+    if (version < 6) {
+      db.exec('DROP TRIGGER search_task_insert');
+      db.exec('DROP TRIGGER search_task_update');
+      db.exec('DROP TRIGGER search_page_insert');
+      db.exec('DROP TRIGGER search_page_update');
+      db.exec('DROP TABLE search');
+      for (const statement of INDEX_WITHOUT_SYMBOLS_SQL) db.exec(statement);
+    }
+    // SQLite will not drop a column a trigger reads, which is why the index above — and with it
+    // the triggers that mention `symbols` — is undone first.
+    if (version < 5) db.exec('ALTER TABLE page DROP COLUMN symbols');
+    if (version < 4) db.exec('DROP TABLE artifact_stamp');
     if (version < 3) {
       db.exec('ALTER TABLE page DROP COLUMN source_commit');
       db.exec('ALTER TABLE page DROP COLUMN source_files');
@@ -180,6 +228,13 @@ describe('migrating an older database forward', () => {
         .prepare('UPDATE page SET source_commit = ?, source_files = ? WHERE id = ?')
         .run('abc1234', 'scripts/Car.cs', 'project'),
     ).not.toThrow();
+    expect(() =>
+      db
+        .prepare('UPDATE page SET symbols = ? WHERE id = ?')
+        .run('Car.ApplyInput — scripts/Car.cs', 'project'),
+    ).not.toThrow();
+    // Read rather than written: a stamp row references a task, and this database has none.
+    expect(db.prepare('SELECT count(*) AS n FROM artifact_stamp').get()).toEqual({ n: 0 });
   }
 
   it('adds what the new version needs and keeps every row that was there', () => {
@@ -217,6 +272,26 @@ describe('migrating an older database forward', () => {
     databaseAtVersion(file, SCHEMA_VERSION - 2);
 
     expect(match(track(openStateDatabase(file)), 'physics')).toEqual(['page:project']);
+  });
+
+  it('repairs a database stamped 5, where the column existed but the index did not', () => {
+    // The state a build carrying only the first half of the change leaves behind, and the
+    // reason the rebuild is its own version: `page.symbols` is there, the index has no such
+    // column, and every search fails — while the version number says the schema is current.
+    const file = tempFile();
+    databaseAtVersion(file, SCHEMA_VERSION - 1);
+
+    const db = track(openStateDatabase(file));
+
+    expect(db.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
+    // The rebuild refills the index from the rows it indexes, so what was there stays findable.
+    expect(match(db, 'physics')).toEqual(['page:project']);
+
+    db.prepare('UPDATE page SET symbols = ? WHERE id = ?').run(
+      'RoadMask — scripts/RoadNetwork.cs',
+      'project',
+    );
+    expect(match(db, 'RoadMask')).toEqual(['page:project']);
   });
 });
 

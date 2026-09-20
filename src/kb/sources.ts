@@ -127,13 +127,74 @@ function normalize(token: string): string | null {
   return path.replace(/^\.\//, '').replace(/^\/+/, '');
 }
 
-/** The stored form: one path per line. Newlines cannot appear in a path, so nothing escapes. */
+/**
+ * The stored form of a list of lines: one per line, and nothing to escape.
+ *
+ * A page's file anchors and its symbol list are both stored this way, and neither can hold a
+ * newline — a path has none, and a symbol line that wrapped would be two symbols.
+ */
+export function encodeLines(lines: readonly string[]): string {
+  return lines.join('\n');
+}
+
+/** The lines of a stored list; an empty column reads as no entries. */
+export function decodeLines(stored: string | null): string[] {
+  if (stored === null || stored === '') return [];
+  return stored.split('\n').filter((line) => line !== '');
+}
+
+/** The stored form of a page's file anchors: one path per line. */
 export function encodeSourceFiles(files: readonly string[]): string {
-  return files.join('\n');
+  return encodeLines(files);
+}
+
+/**
+ * The file a symbol line points at, or null when it names none.
+ *
+ * A symbol is written `Name — path/to/file.ext`, and the path half is what makes the field
+ * worth keeping: it answers "where is this", which the name alone does not. Read through the
+ * same extractor a body goes through, so a symbol line and a sentence in prose agree about
+ * what counts as a file.
+ */
+export function symbolFile(symbol: string): string | null {
+  return extractSourceFiles(symbol)[0] ?? null;
+}
+
+/**
+ * Files no page is expected to document: a lock tool rewrites them wholesale, so a page
+ * describing one would be wrong the next time a dependency moved, and "unchurned" is not a
+ * property they have.
+ */
+const GENERATED_FILE_NAMES: ReadonlySet<string> = new Set([
+  'Cargo.lock',
+  'Gemfile.lock',
+  'composer.lock',
+  'go.sum',
+  'npm-shrinkwrap.json',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'poetry.lock',
+  'yarn.lock',
+]);
+
+/**
+ * True for a tracked path a page could be expected to name.
+ *
+ * The same rule `normalize` uses to decide that a token in a body IS a file — a known
+ * extension, or a directory in front of it — because a file a page cannot anchor to is a
+ * file the coverage report could never see covered, and listing one would ask for work that
+ * cannot be recorded.
+ */
+export function isDocumentableFile(path: string): boolean {
+  const slash = path.lastIndexOf('/');
+  const name = path.slice(slash + 1);
+  if (GENERATED_FILE_NAMES.has(name)) return false;
+  const dot = name.lastIndexOf('.');
+  const extension = dot <= 0 ? '' : name.slice(dot + 1).toLowerCase();
+  return KNOWN_EXTENSIONS.has(extension) || slash >= 0;
 }
 
 /** The paths of a stored page row; an empty column reads as no anchor. */
 export function decodeSourceFiles(stored: string | null): string[] {
-  if (stored === null || stored === '') return [];
-  return stored.split('\n').filter((path) => path !== '');
+  return decodeLines(stored);
 }

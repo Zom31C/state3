@@ -1,10 +1,12 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { projectDirOf } from '../core/paths.js';
 import { isPlainObject } from '../core/state.js';
 import type { StateDict, StateValue } from '../core/types.js';
 import { STATE_DB_FILENAME, openStateDatabase } from '../db/database.js';
 import type { SqlDatabase } from '../db/database.js';
 import { renderDatabaseBrief } from '../kb/brief.js';
+import { driftedArtifacts, driftWarnings, storedArtifactStamps } from './artifact-stamps.js';
 import { DEFAULT_NOTATION, isNotation } from './notation.js';
 import { renderTaskBrief, renderTaskHead } from './render.js';
 import { RISK_LEVELS } from './schema.js';
@@ -42,6 +44,15 @@ export interface InjectionOptions {
    * full Σ and the procedure stay behind `task_show`.
    */
   subagent?: boolean;
+  /**
+   * Also compare the task's file artifacts against the disk and say which of them moved.
+   *
+   * A session start asks for this and a prompt does not: it is the moment the transcript holds
+   * nothing, so a tree changed by hand between sessions is otherwise invisible, and Σ reads as
+   * an account of the tree as it is now. Repeating the same line on every prompt of the session
+   * would cost more than the surprise is worth — the session has already been told once.
+   */
+  drift?: boolean;
 }
 
 interface CandidateRow {
@@ -100,7 +111,9 @@ function riskOf(state: StateDict): RiskLevel | null {
 function readTaskHead(
   db: SqlDatabase,
   dbPath: string,
+  rootDir: string,
   render: (task: StoredTask) => string,
+  drift: boolean,
 ): TaskHead {
   const row = pickCandidate(db);
   if (row === null) return { text: null, risk: null, unreadable: null };
@@ -129,7 +142,30 @@ function readTaskHead(
   };
   const state = parsed as StateDict;
   const task: StoredTask = { meta, state };
-  return { text: render(task), risk: riskOf(state), unreadable: null };
+  const lines = drift ? driftLines(db, row.id, state, rootDir) : [];
+  const text = render(task);
+  return {
+    text: lines.length === 0 ? text : `${text}\n${lines.join('\n')}`,
+    risk: riskOf(state),
+    unreadable: null,
+  };
+}
+
+/**
+ * The artifacts whose file moved since Σ was written, as lines for the injection.
+ *
+ * Never throws. A drift note is a convenience on top of Σ, and a diagnostic that fails must
+ * not cost the turn the state it was annotating — least of all at a session start, where Σ
+ * is the only thing the session has.
+ */
+function driftLines(db: SqlDatabase, taskId: string, state: StateDict, rootDir: string): string[] {
+  try {
+    return driftWarnings(
+      driftedArtifacts(state, storedArtifactStamps(db, taskId), projectDirOf(rootDir)),
+    );
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -164,11 +200,15 @@ export function readInjection(rootDir: string, options: InjectionOptions = {}): 
     const head = readTaskHead(
       db,
       dbPath,
+      rootDir,
       options.subagent === true
         ? renderTaskBrief
         : // A prompt is not a read: it carries Σ on every turn of the task, so it drops the
           // archived steps and, above the threshold, everything but the step in flight.
           (task) => renderTaskHead(task, { injected: true }),
+      // Not for a subagent: it gets an orientation rather than Σ, and the artifacts of a task
+      // it does not own are context it cannot act on.
+      options.drift === true && options.subagent !== true,
     );
     if (head.unreadable !== null) return { kind: 'unreadable', reason: head.unreadable };
     const brief = options.brief === true ? renderDatabaseBrief(db) : null;

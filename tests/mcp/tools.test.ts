@@ -12,7 +12,15 @@ import type { TaskStorePort, TaskToolDefinition, ToolResult } from '../../src/mc
 import type { Notation } from '../../src/tasks/notation.js';
 import type { ProjectEntry } from '../../src/tasks/ports.js';
 import { createProjectResolver, singleStoreResolver } from '../../src/tasks/projects.js';
-import type { HistoryEntry, StartOptions, StoredTask, TaskSummary } from '../../src/tasks/store.js';
+import type { DriftedArtifact } from '../../src/tasks/artifact-stamps.js';
+import type {
+  HistoryEntry,
+  PatchReport,
+  StartOptions,
+  StoredTask,
+  TaskSummary,
+} from '../../src/tasks/store.js';
+import type { StampReport } from '../../src/tasks/verifications.js';
 
 type Dict = Record<string, unknown>;
 
@@ -158,7 +166,17 @@ class FakeTaskStore {
     return this.resolve(id, 'no active task');
   }
 
-  async patch(patch: StateDict, id?: string): Promise<StoredTask> {
+  /** What `patch` fills into a caller's report; a real store derives it from the stamps. */
+  stamps: StampReport | null = null;
+  /** What `driftedArtifacts` answers; a real store compares the disk against the stamps. */
+  drift: DriftedArtifact[] = [];
+
+  async driftedArtifacts(id?: string): Promise<DriftedArtifact[]> {
+    this.record('driftedArtifacts', [id]);
+    return this.drift;
+  }
+
+  async patch(patch: StateDict, id?: string, report?: PatchReport): Promise<StoredTask> {
     this.record('patch', [patch, id]);
     if (this.errors.patch !== undefined) throw this.errors.patch;
     const task = this.resolve(id, 'no active task');
@@ -168,6 +186,7 @@ class FakeTaskStore {
     task.state = mergeState(task.state, expanded.patch);
     task.meta.updatedAt = '2026-09-05T10:05:00.000Z';
     this.entries.push({ at: task.meta.updatedAt, patch: { ...patch }, ok: true });
+    if (report !== undefined && this.stamps !== null) report.stamps = this.stamps;
     return task;
   }
 
@@ -465,6 +484,52 @@ describe('task_show', () => {
     expect(result.content.startsWith('Task task-1 [dev-task] (active):')).toBe(true);
   });
 
+  it('names the build that answered, so a resumed session can tell a stale runtime', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+    const result = await call('task_show', {});
+    expect(result.ok).toBe(true);
+    expect(result.content).toMatch(/runtime: skillstate \S+ \(/);
+  });
+
+  it('leaves the runtime line out of the size view, which answers about Σ alone', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+    const result = await call('task_show', { view: 'size' });
+    expect(result.ok).toBe(true);
+    expect(result.content).not.toContain('runtime: skillstate');
+  });
+
+  it('names the artifacts the disk disagrees with, under the Σ that describes them', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+    store.drift = [
+      {
+        key: 'scenes/Car.tscn',
+        recordedAt: '2026-09-19T21:40:00.000Z',
+        modifiedAt: '2026-09-19T23:43:12.000Z',
+        minutesAfter: 123,
+      },
+    ];
+
+    const result = await call('task_show', {});
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('Artifacts changed on disk since Σ was last written');
+    expect(result.content).toContain('scenes/Car.tscn (modified 2026-09-19T23:43:12Z, 123 min');
+    expect(store.calledWith('driftedArtifacts')).toEqual(['task-1']);
+  });
+
+  it('leaves the answer without a drift line while the tree matches Σ', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+
+    const result = await call('task_show', {});
+
+    expect(result.ok).toBe(true);
+    expect(result.content).not.toContain('Artifacts changed on disk');
+  });
+
   it('fails without throwing when there is no active task', async () => {
     const { call } = setup();
     const result = await call('task_show', {});
@@ -572,6 +637,41 @@ describe('task_patch', () => {
 
     expect(result.ok).toBe(true);
     expect(result.content).not.toContain('not found in the project');
+  });
+
+  it('names the verification stamps the patch detached, which Σ itself cannot show', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+    store.stamps = {
+      carried: 1,
+      stamped: 1,
+      superseded: [
+        {
+          check: 'dev.bat check -> ALL CHECKS PASSED',
+          at: '2026-09-19T21:54:18.959Z',
+          commit: 'ea6f494',
+        },
+      ],
+    };
+
+    const result = await call('task_patch', { patch: { decisions: ['compressed Σ'] } });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('1 verification stamp(s) are no longer attached');
+    expect(result.content).toContain(
+      '"dev.bat check -> ALL CHECKS PASSED" was at 2026-09-19T21:54:18.959Z commit ea6f494',
+    );
+  });
+
+  it('says nothing about stamps when the patch detached none', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+    store.stamps = { carried: 2, stamped: 1, superseded: [] };
+
+    const result = await call('task_patch', { patch: { decisions: ['one more'] } });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).not.toContain('no longer attached');
   });
 
   it('applies a path key that changes one plan item', async () => {
@@ -899,6 +999,25 @@ describe('task_history', () => {
     expect(result.content).toContain('REJECTED (unknown-key)');
     expect(result.content).toContain('Unrecognized key "bogus"');
     expect(result.content).toContain('bogus');
+  });
+
+  it('keeps the note of an applied patch, so a superseded stamp stays auditable', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+    store.entries.push({
+      at: '2026-09-05T10:08:00.000Z',
+      patch: { verifications: [{ check: 'dev.bat check PASSED', status: 'pass' }] },
+      ok: true,
+      note:
+        '1 verification stamp(s) superseded: "dev.bat check -> ALL PASSED" was at ' +
+        '2026-09-19T21:54:18.959Z commit ea6f494',
+    });
+
+    const result = await call('task_history', {});
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('ok — patched: verifications — 1 verification stamp(s)');
+    expect(result.content).toContain('commit ea6f494');
   });
 
   it('reports an entry without a category as invalid', async () => {

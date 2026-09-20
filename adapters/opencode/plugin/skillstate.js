@@ -90,10 +90,14 @@ function reader() {
  * What one state root holds, ready to inject: `{ head, brief, risk }`, or `{ warn }` when the
  * root holds a database this plugin cannot read, or null when there is nothing to inject.
  *
+ * `oncePerSession` asks for the two halves that are worth one look and not a tax on every
+ * turn: the knowledge-base map, and the artifacts whose file changed on disk since Σ was
+ * written. A session that already saw them gains nothing from reading them again.
+ *
  * `warn` is reported rather than swallowed: a root that holds Σ but cannot be read means the
  * model silently stops seeing its own progress, and nothing else in the session would say why.
  */
-async function loadContext(stateDir, wantBrief) {
+async function loadContext(stateDir, oncePerSession) {
   const dbPath = join(stateDir, STATE_DB_FILENAME);
   if (existsSync(dbPath)) {
     const module = await reader();
@@ -106,7 +110,10 @@ async function loadContext(stateDir, wantBrief) {
     }
     let injection;
     try {
-      injection = module.readInjection(stateDir, { brief: wantBrief === true });
+      injection = module.readInjection(stateDir, {
+        brief: oncePerSession === true,
+        drift: oncePerSession === true,
+      });
     } catch (err) {
       return { warn: `cannot read ${dbPath}: ${err?.message ?? String(err)}` };
     }
@@ -241,8 +248,8 @@ export const Skillstate = async ({ directory, worktree, project, client }) => {
   const readBlocks = async (purpose, input) => {
     try {
       const key = typeof input?.sessionID === 'string' ? input.sessionID : 'default';
-      const wantBrief = purpose === 'compacting' || !briefed.has(key);
-      const context = await loadContext(stateDir, wantBrief);
+      const oncePerSession = purpose === 'compacting' || !briefed.has(key);
+      const context = await loadContext(stateDir, oncePerSession);
       if (context === null) return [];
       if (context.warn !== undefined) {
         await log('warn', context.warn);

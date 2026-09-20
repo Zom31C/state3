@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -227,14 +227,20 @@ try {
     text(stored).includes('Stored page project'),
     text(stored).split('\n')[0],
   );
-  await call('page', {
+  const authPage = await call('page', {
     op: 'put',
     id: 'auth',
     kind: 'feature',
     title: 'Authentication',
     summary: 'Who is asking.',
     body: 'Tokens are verified by the quixotic middleware.',
+    symbols: ['TokenVerifier — src/auth/verify.ts'],
   });
+  check(
+    'page put stores a page with its symbol list',
+    authPage.isError !== true && text(authPage).includes('Stored page auth'),
+    text(authPage).split('\n')[0],
+  );
 
   const refusal = await call('page', {
     op: 'put',
@@ -263,8 +269,10 @@ try {
 
   const got = await call('page', { op: 'get', id: 'auth' });
   check(
-    'page get returns the body and the edge',
+    'page get returns the body, the symbols and the edge',
     text(got).includes('quixotic middleware') &&
+      text(got).includes('symbols:') &&
+      text(got).includes('TokenVerifier — src/auth/verify.ts') &&
       text(got).includes(`-[documents]-> task:${taskId}`),
   );
 
@@ -273,6 +281,31 @@ try {
     'search finds the page by a word in its body',
     text(found).includes('- page:auth'),
     text(found).split('\n')[1],
+  );
+
+  // The symbol column is the one that answers "where does this live" without opening a body,
+  // so the hit has to carry the file and not just the page.
+  const bySymbol = await call('search', { query: 'TokenVerifier' });
+  check(
+    'search finds a page by a symbol and the snippet names the file',
+    text(bySymbol).includes('- page:auth') &&
+      text(bySymbol).includes('[TokenVerifier]') &&
+      text(bySymbol).includes('src/auth/verify.ts'),
+    text(bySymbol).split('\n')[1],
+  );
+
+  // A miss is the answer an agent has to act on next, so it says what is nearest and where to
+  // look instead of stopping at "nothing".
+  const miss = await call('search', { query: 'AuthenticationMiddleware' });
+  check(
+    'search names the nearest pages on a miss instead of stopping at "nothing"',
+    text(miss).includes('nothing matches "AuthenticationMiddleware"') &&
+      text(miss).includes('Nearest pages by topic') &&
+      text(miss).includes('- auth: Authentication') &&
+      text(miss).includes('symbols'),
+    text(miss)
+      .split('\n')
+      .find((line) => line.startsWith('- ')) ?? '',
   );
 
   const foundTask = await call('search', { query: 'Smoke', kind: 'task' });
@@ -317,6 +350,31 @@ try {
   check(
     'inject-state hook keeps the brief out of a prompt',
     !runHook().context.includes('## Project brief (skillstate)'),
+  );
+
+  // Σ describes a tree, and a tree can be changed by hand between sessions. The stamp a patch
+  // records is what makes that visible: without it a resumed session reads Σ as an account of
+  // the files as they are now, and reasons from a premise that stopped being true overnight.
+  const driftedFile = join(root, 'drifted.ts');
+  writeFileSync(driftedFile, 'one');
+  await call('task_patch', { patch: { artifacts: { 'drifted.ts': 'the file under test' } } });
+  check(
+    'task_show says nothing about an artifact the tree still matches',
+    !text(await call('task_show', {})).includes('Artifacts changed on disk'),
+  );
+
+  writeFileSync(driftedFile, 'one two three, changed by hand overnight');
+  const driftedShow = text(await call('task_show', {}));
+  check(
+    'task_show names an artifact whose file changed after Σ was written',
+    driftedShow.includes('Artifacts changed on disk since Σ was last written') &&
+      driftedShow.includes('drifted.ts (modified'),
+    driftedShow.split('\n').find((line) => line.includes('Artifacts changed')) ?? '',
+  );
+  check(
+    'inject-state hook carries the drift at session start, and not on every prompt',
+    runHook('SessionStart').context.includes('Artifacts changed on disk') &&
+      !runHook().context.includes('Artifacts changed on disk'),
   );
 
   // The opencode plugin is the third reader of the same file, and the one that runs under Bun in
@@ -455,12 +513,27 @@ try {
   );
 
   const removed = await call('task_patch', { patch: { 'verifications[0]': null } });
+  // The Σ line, not the whole answer: a note under it quotes what the patch cost, and a check
+  // that greps the answer would read that quote as the element still being in Σ.
+  const removedState =
+    text(removed)
+      .split('\n')
+      .find((line) => line.startsWith('{')) ?? '';
   check(
     'a path key with null removes one array element',
     removed.isError !== true &&
-      !text(removed).includes('npm test') &&
-      text(removed).includes('npm run lint'),
-    text(removed).split('\n')[0],
+      !removedState.includes('npm test') &&
+      removedState.includes('npm run lint'),
+    removedState.slice(0, 90),
+  );
+  check(
+    'removing a verification names the stamp it took with it, instead of losing it silently',
+    text(removed).includes('1 verification stamp(s) are no longer attached') &&
+      text(removed).includes('"npm test" was at'),
+    text(removed)
+      .split('\n')
+      .find((line) => line.startsWith('Note:'))
+      ?.slice(0, 90) ?? '',
   );
 
   const sizes = await call('task_show', { view: 'size' });

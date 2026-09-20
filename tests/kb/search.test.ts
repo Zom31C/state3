@@ -3,7 +3,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PageStore } from '../../src/kb/store.js';
-import { ftsExpression } from '../../src/kb/search.js';
+import { ftsExpression, nearestPages } from '../../src/kb/search.js';
+import type { PageSummary } from '../../src/kb/schema.js';
 import { TaskStore } from '../../src/tasks/store.js';
 
 let dir: string;
@@ -163,5 +164,58 @@ describe('ftsExpression', () => {
     expect(ftsExpression('plan[+] AND "x"')).toBe('"plan[+]" "AND" """x"""');
     expect(ftsExpression('  spaced   out ')).toBe('"spaced" "out"');
     expect(ftsExpression('')).toBe('');
+  });
+});
+
+describe('nearestPages', () => {
+  const page = (id: string, title: string, summary: string): PageSummary => ({
+    id,
+    kind: 'feature',
+    title,
+    summary,
+    status: 'current',
+    pin: false,
+    parent: null,
+    updatedAt: '2026-09-20T00:00:00.000Z',
+  });
+
+  const roads = page('roads', 'Road network', 'How the roads are laid out.');
+  const auth = page('auth', 'Authentication', 'Who is asking.');
+
+  it('names the page whose title shares a word with a query nothing matched', () => {
+    const nearest = nearestPages([roads, auth], 'RoadNetwork');
+
+    expect(nearest.map((hit) => hit.id)).toEqual(['roads']);
+    expect(nearest[0]?.shared).toEqual(['roadnetwork']);
+  });
+
+  it('ranks a page that shares more of the query above one that shares less', () => {
+    const layout = page('layout', 'Layout of the map', 'Where things are placed.');
+
+    const nearest = nearestPages([layout, roads], 'road network layout');
+
+    expect(nearest.map((hit) => hit.id)).toEqual(['roads', 'layout']);
+    expect(nearest[0]?.shared).toEqual(['road', 'network']);
+    expect(nearest[1]?.shared).toEqual(['layout']);
+  });
+
+  it('matches a prefix, so an identifier is near the words it is built from', () => {
+    expect(nearestPages([roads], 'RoadNetworkBuilder').map((hit) => hit.id)).toEqual(['roads']);
+  });
+
+  it('does not match inside a word, so a short query is not near every page that contains it', () => {
+    expect(nearestPages([page('scar', 'Scarborough', 'A town.')], 'car')).toEqual([]);
+  });
+
+  it('ignores words too short to carry a topic', () => {
+    expect(nearestPages([roads, auth], 'a to it')).toEqual([]);
+  });
+
+  it('honours a limit, so a large knowledge base still answers in a few lines', () => {
+    const many = Array.from({ length: 5 }, (_, index) =>
+      page(`road-${index}`, `Road ${index}`, 'S'),
+    );
+
+    expect(nearestPages(many, 'road', 2)).toHaveLength(2);
   });
 });

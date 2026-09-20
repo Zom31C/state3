@@ -1,5 +1,6 @@
 import type { StateDict } from '../core/types.js';
-import type { HistoryEntry, StartOptions, StoredTask, TaskSummary } from './store.js';
+import type { DriftedArtifact } from './artifact-stamps.js';
+import type { HistoryEntry, PatchReport, StartOptions, StoredTask, TaskSummary } from './store.js';
 
 /**
  * Structural port over the task store. The real `TaskStore` satisfies it, and a
@@ -14,11 +15,16 @@ export interface TaskStorePort {
   readonly rootDir?: string;
   start(goal: string, options?: StartOptions): Promise<StoredTask>;
   show(id?: string): Promise<StoredTask>;
-  patch(patch: StateDict, id?: string): Promise<StoredTask>;
+  patch(patch: StateDict, id?: string, report?: PatchReport): Promise<StoredTask>;
   finish(summary: string, id?: string): Promise<StoredTask>;
   list(): Promise<TaskSummary[]>;
   history(id?: string, limit?: number): Promise<HistoryEntry[]>;
   activeId(): Promise<string | null>;
+  /**
+   * File artifacts whose file moved since Σ was last written. Optional because it is a
+   * diagnostic: a store that cannot answer it costs a missing note, not a wrong one.
+   */
+  driftedArtifacts?(id?: string): Promise<DriftedArtifact[]>;
   /** Full procedure P for a task: its skill's instructions plus the notation appendix. */
   instructionsFor(task: StoredTask): string;
   /** Skills this store can create tasks for; optional so test fakes stay small. */

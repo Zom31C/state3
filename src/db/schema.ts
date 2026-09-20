@@ -21,7 +21,7 @@
  * wrote it, and this build cannot know what it must preserve. A LOWER version is
  * migrated forward by `MIGRATIONS` below.
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 6;
 
 /**
  * Previous bodies of a page, newest last, kept by the write path in `PageStore`.
@@ -53,6 +53,125 @@ const PAGE_HISTORY_SQL: readonly string[] = [
 const PAGE_SOURCE_SQL: readonly string[] = [
   `ALTER TABLE page ADD COLUMN source_commit TEXT`,
   `ALTER TABLE page ADD COLUMN source_files TEXT NOT NULL DEFAULT ''`,
+];
+
+/**
+ * What a file artifact looked like when Σ was last written.
+ *
+ * Σ says what the agent produced; it cannot say that the file was changed afterwards by
+ * somebody else. That is the case which breaks a cold start — Σ reads as current while the
+ * tree has moved — so the file's own numbers are kept beside it and compared on read.
+ *
+ * A side table rather than fields of Σ because Σ is carried on every prompt of the task:
+ * a stamp is worth one write per patch and one comparison per session start, and it is
+ * worth nothing at all if it costs tokens on every turn in between.
+ */
+const ARTIFACT_STAMP_SQL: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS artifact_stamp (
+    task_id      TEXT NOT NULL REFERENCES task (id) ON DELETE CASCADE,
+    artifact_key TEXT NOT NULL,
+    mtime_ms     INTEGER NOT NULL,
+    size         INTEGER NOT NULL,
+    at           TEXT NOT NULL,
+    PRIMARY KEY (task_id, artifact_key)
+  )`,
+];
+
+/**
+ * One full-text index over tasks and pages together, and the triggers that keep it.
+ *
+ * A single query searches the whole project, and the triggers are what make that safe: a new
+ * write path cannot forget to index, which is the failure a hand-maintained index always
+ * eventually hits. `unicode61` tokenizes Cyrillic as well as Latin — the KB is written in the
+ * user's language, and a search that only works in English would be worse than none.
+ *
+ * `symbols` is a column of its own rather than part of the body, because it is what a search
+ * is most often after — "which file holds RoadMask" — and only its own column lets the
+ * ranking put that above the same word mentioned in passing inside a paragraph. Substring
+ * search over identifiers is not FTS's job; that path uses LIKE, which is free at
+ * knowledge-base scale.
+ */
+const SEARCH_INDEX_SQL: readonly string[] = [
+  `CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
+    ref_kind UNINDEXED,
+    ref_id   UNINDEXED,
+    title,
+    summary,
+    body,
+    symbols,
+    tokenize = 'unicode61 remove_diacritics 2'
+  )`,
+
+  // A task's searchable text is its goal plus the whole Σ document: an agent must be able to
+  // find "which task decided X" without reading every state. A task holds no symbols.
+  `CREATE TRIGGER IF NOT EXISTS search_task_insert AFTER INSERT ON task BEGIN
+    INSERT INTO search (ref_kind, ref_id, title, summary, body, symbols)
+    VALUES ('task', new.id, new.goal, '', new.state, '');
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS search_task_update AFTER UPDATE ON task BEGIN
+    DELETE FROM search WHERE ref_kind = 'task' AND ref_id = old.id;
+    INSERT INTO search (ref_kind, ref_id, title, summary, body, symbols)
+    VALUES ('task', new.id, new.goal, '', new.state, '');
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS search_task_delete AFTER DELETE ON task BEGIN
+    DELETE FROM search WHERE ref_kind = 'task' AND ref_id = old.id;
+  END`,
+
+  `CREATE TRIGGER IF NOT EXISTS search_page_insert AFTER INSERT ON page BEGIN
+    INSERT INTO search (ref_kind, ref_id, title, summary, body, symbols)
+    VALUES ('page', new.id, new.title, new.summary, new.body, new.symbols);
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS search_page_update AFTER UPDATE ON page BEGIN
+    DELETE FROM search WHERE ref_kind = 'page' AND ref_id = old.id;
+    INSERT INTO search (ref_kind, ref_id, title, summary, body, symbols)
+    VALUES ('page', new.id, new.title, new.summary, new.body, new.symbols);
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS search_page_delete AFTER DELETE ON page BEGIN
+    DELETE FROM search WHERE ref_kind = 'page' AND ref_id = old.id;
+  END`,
+];
+
+/**
+ * The symbols a page documents, one per line, as `Symbol — path/to/file.ext`.
+ *
+ * A body holds symbols in prose, so answering "who builds the bridges" meant reading the
+ * page that happens to mention it. A structured field lets `search` return the file with the
+ * hit, which is the whole distance between one call and a series of greps.
+ */
+const PAGE_SYMBOLS_SQL: readonly string[] = [
+  `ALTER TABLE page ADD COLUMN symbols TEXT NOT NULL DEFAULT ''`,
+];
+
+/** Rows the rebuilt index is filled from: everything it indexes, in the shape it now has. */
+const SEARCH_REINDEX_SQL: readonly string[] = [
+  `INSERT INTO search (ref_kind, ref_id, title, summary, body, symbols)
+     SELECT 'task', id, goal, '', state, '' FROM task`,
+  `INSERT INTO search (ref_kind, ref_id, title, summary, body, symbols)
+     SELECT 'page', id, title, summary, body, symbols FROM page`,
+];
+
+/**
+ * Rebuilds the search index so that it carries `page.symbols`.
+ *
+ * Its own migration step, and not folded into the one that adds the column, because an FTS5
+ * table cannot gain a column: the index has to be dropped and refilled. A database that was
+ * stamped with the column but without the rebuild — which is what a build carrying only the
+ * first half leaves behind — is then permanently inconsistent while still reporting the
+ * current version, and `search` fails on a column the index does not have. Two steps, each
+ * with its own version, is what makes that state repairable by opening the file.
+ *
+ * The triggers go first: they are stored apart from the table they write to, so they survive
+ * `DROP TABLE` and would keep inserting five columns into a six-column index. Replacing them
+ * cannot be left to `CREATE TRIGGER IF NOT EXISTS`, which does not replace anything.
+ */
+const SEARCH_SYMBOLS_SQL: readonly string[] = [
+  'DROP TRIGGER IF EXISTS search_task_insert',
+  'DROP TRIGGER IF EXISTS search_task_update',
+  'DROP TRIGGER IF EXISTS search_page_insert',
+  'DROP TRIGGER IF EXISTS search_page_update',
+  'DROP TABLE IF EXISTS search',
+  ...SEARCH_INDEX_SQL,
+  ...SEARCH_REINDEX_SQL,
 ];
 
 /** Statements run in order, inside one transaction, to create the current version. */
@@ -112,6 +231,7 @@ export const SCHEMA_SQL: readonly string[] = [
     pin        INTEGER NOT NULL DEFAULT 0,
     source_commit TEXT,
     source_files  TEXT NOT NULL DEFAULT '',
+    symbols       TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
@@ -119,6 +239,7 @@ export const SCHEMA_SQL: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS page_parent ON page (parent)`,
 
   ...PAGE_HISTORY_SQL,
+  ...ARTIFACT_STAMP_SQL,
 
   /**
    * Directed, typed edges between anything addressable (task→page, page→page).
@@ -135,49 +256,7 @@ export const SCHEMA_SQL: readonly string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS link_dst ON link (dst_kind, dst_id)`,
 
-  /**
-   * One full-text index over tasks and pages together, so a single query searches
-   * the whole project. `unicode61` tokenizes Cyrillic as well as Latin — the KB is
-   * written in the user's language, and a search that only works in English would
-   * be worse than none. Substring search over identifiers is not FTS's job; that
-   * path uses LIKE, which is free at knowledge-base scale.
-   */
-  `CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
-    ref_kind UNINDEXED,
-    ref_id   UNINDEXED,
-    title,
-    summary,
-    body,
-    tokenize = 'unicode61 remove_diacritics 2'
-  )`,
-
-  // A task's searchable text is its goal plus the whole Σ document: an agent must
-  // be able to find "which task decided X" without reading every state.
-  `CREATE TRIGGER IF NOT EXISTS search_task_insert AFTER INSERT ON task BEGIN
-    INSERT INTO search (ref_kind, ref_id, title, summary, body)
-    VALUES ('task', new.id, new.goal, '', new.state);
-  END`,
-  `CREATE TRIGGER IF NOT EXISTS search_task_update AFTER UPDATE ON task BEGIN
-    DELETE FROM search WHERE ref_kind = 'task' AND ref_id = old.id;
-    INSERT INTO search (ref_kind, ref_id, title, summary, body)
-    VALUES ('task', new.id, new.goal, '', new.state);
-  END`,
-  `CREATE TRIGGER IF NOT EXISTS search_task_delete AFTER DELETE ON task BEGIN
-    DELETE FROM search WHERE ref_kind = 'task' AND ref_id = old.id;
-  END`,
-
-  `CREATE TRIGGER IF NOT EXISTS search_page_insert AFTER INSERT ON page BEGIN
-    INSERT INTO search (ref_kind, ref_id, title, summary, body)
-    VALUES ('page', new.id, new.title, new.summary, new.body);
-  END`,
-  `CREATE TRIGGER IF NOT EXISTS search_page_update AFTER UPDATE ON page BEGIN
-    DELETE FROM search WHERE ref_kind = 'page' AND ref_id = old.id;
-    INSERT INTO search (ref_kind, ref_id, title, summary, body)
-    VALUES ('page', new.id, new.title, new.summary, new.body);
-  END`,
-  `CREATE TRIGGER IF NOT EXISTS search_page_delete AFTER DELETE ON page BEGIN
-    DELETE FROM search WHERE ref_kind = 'page' AND ref_id = old.id;
-  END`,
+  ...SEARCH_INDEX_SQL,
 ];
 
 /**
@@ -191,6 +270,12 @@ export const MIGRATIONS: ReadonlyMap<number, readonly string[]> = new Map([
   [1, PAGE_HISTORY_SQL],
   // 2 -> 3: pages gained the commit and the files they describe, so a stale one says so.
   [2, PAGE_SOURCE_SQL],
+  // 3 -> 4: file artifacts gained a stamp, so Σ can say the tree moved under it.
+  [3, ARTIFACT_STAMP_SQL],
+  // 4 -> 5: pages gained the symbols they document.
+  [4, PAGE_SYMBOLS_SQL],
+  // 5 -> 6: the search index gained that column, which an FTS5 table cannot do in place.
+  [5, SEARCH_SYMBOLS_SQL],
 ]);
 
 /** Tables `doctor` checks for dangling `link` edges. */

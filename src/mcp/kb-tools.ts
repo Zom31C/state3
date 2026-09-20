@@ -1,7 +1,7 @@
 import { isRejectCategory } from '../core/rejections.js';
 import type { RejectCategory } from '../core/rejections.js';
 import { LINK_DIRECTIONS, type KbResolver, type KbStores, type LinkRef } from '../kb/ports.js';
-import type { LinkDirection, PageFreshness, StalePage } from '../kb/ports.js';
+import type { CoverageReport, LinkDirection, PageFreshness, StalePage } from '../kb/ports.js';
 import { SUGGESTED_LINK_RELS } from '../kb/links.js';
 import { MAX_BODY_EDITS, parseBodyEdits } from '../kb/body.js';
 import {
@@ -11,16 +11,18 @@ import {
   PAGE_STATUSES,
   SINGLETON_PAGE_KINDS,
   SUMMARY_MAX_CHARS,
+  SYMBOLS_LIMIT,
+  SYMBOL_MAX_CHARS,
   TITLE_MAX_CHARS,
   isPageKind,
   isPageStatus,
 } from '../kb/schema.js';
 import type { PageRecord, PageSummary } from '../kb/schema.js';
 import { renderProjectBrief } from '../kb/brief.js';
-import { STALE_PAGES_LIMIT, STALE_SCAN_LIMIT } from '../kb/store.js';
+import { COVERAGE_LIMIT, STALE_PAGES_LIMIT, STALE_SCAN_LIMIT } from '../kb/store.js';
 import { initPages, renderInitReport } from '../kb/templates.js';
-import type { SearchHit } from '../kb/search.js';
-import { MAX_SEARCH_LIMIT } from '../kb/search.js';
+import type { NearestPage, SearchHit } from '../kb/search.js';
+import { MAX_SEARCH_LIMIT, nearestPages } from '../kb/search.js';
 import {
   classifyError,
   failure,
@@ -50,6 +52,7 @@ export const PAGE_OPS = [
   'append',
   'history',
   'stale',
+  'coverage',
   'list',
   'delete',
   'init',
@@ -63,11 +66,12 @@ export type PageOp = (typeof PAGE_OPS)[number];
 /** Arguments each operation takes; anything else is refused rather than ignored. */
 const OP_ARGS: Record<PageOp, readonly string[]> = {
   get: ['id'],
-  put: ['id', 'kind', 'title', 'summary', 'body', 'parent', 'status', 'pin'],
+  put: ['id', 'kind', 'title', 'summary', 'body', 'symbols', 'parent', 'status', 'pin'],
   patch: ['id', 'edits'],
   append: ['id', 'body'],
   history: ['id', 'revision'],
   stale: ['limit'],
+  coverage: ['limit'],
   list: ['kind', 'status'],
   delete: ['id'],
   init: [],
@@ -79,7 +83,16 @@ const OP_ARGS: Record<PageOp, readonly string[]> = {
 const SHARED_ARGS: readonly string[] = ['op', 'project'];
 
 /** The page fields `put` forwards; `id` is handled separately because it is required. */
-const PUT_FIELDS = ['kind', 'title', 'summary', 'body', 'parent', 'status', 'pin'] as const;
+const PUT_FIELDS = [
+  'kind',
+  'title',
+  'summary',
+  'body',
+  'symbols',
+  'parent',
+  'status',
+  'pin',
+] as const;
 
 const KB_HINTS: Partial<Record<RejectCategory, string>> = {
   'unknown-key':
@@ -165,7 +178,11 @@ export function renderPage(
   ];
   const links =
     edges.length === 0 ? ['links:   none'] : ['links:', ...edges.map((edge) => `  ${edge}`)];
-  return [...head, ...fields, ...links, '', page.body].join('\n');
+  // Printed as a list and not folded into the body: this is the field a reader scans to answer
+  // "does this page know the symbol I am looking for", and buried in prose it cannot be scanned.
+  const symbols =
+    page.symbols.length === 0 ? [] : ['symbols:', ...page.symbols.map((symbol) => `  ${symbol}`)];
+  return [...head, ...fields, ...symbols, ...links, '', page.body].join('\n');
 }
 
 /** How many files the source line names before it counts the rest instead. */
@@ -230,6 +247,39 @@ export function renderStaleReport(stale: readonly StalePage[], scanned: number):
     ),
     'Read the code before trusting a line number in one of these, then rewrite the page with ' +
       'op "patch" or "put" — a write re-anchors it to the current commit.',
+  ].join('\n');
+}
+
+/**
+ * The coverage report: what the knowledge base leaves a cold session to find by reading code.
+ *
+ * It names the count before the list, and caps the list, because the honest answer for a real
+ * project is "hundreds of files, most of them not worth a page" — an agent needs the ranking,
+ * not the census.
+ */
+export function renderCoverageReport(report: CoverageReport): string {
+  if (report.tracked === null) {
+    return (
+      'coverage lists the files of a repository, and this project has none to ask: no git ' +
+      'repository, or a runtime started without a project directory. page {"op":"list"} is the ' +
+      'map that works without one.'
+    );
+  }
+  if (report.uncoveredTotal === 0) {
+    return (
+      `every documentable file this repository tracks is named by a page: ${report.covered} of ` +
+      `${report.tracked} file(s), over ${report.pages} page(s).`
+    );
+  }
+  return [
+    `Knowledge-base coverage: ${report.covered} of ${report.tracked} documentable file(s) are ` +
+      `named by a page (${report.pages} page(s) read).`,
+    `${report.uncoveredTotal} file(s) no page names, most-changed first — the first ` +
+      `${report.uncovered.length}, ranked by the last ${report.window} commits:`,
+    ...report.uncovered.map((file) => `- ${file.path} — ${file.commits} commit(s)`),
+    'Every one of these is a file a cold session opens in full, because nothing told it the ' +
+      'file exists. Naming one in a page — a line under a heading, with the symbols it holds ' +
+      '— turns that read into a search hit; op "patch" adds the line without resending a body.',
   ].join('\n');
 }
 
@@ -435,6 +485,12 @@ async function pageOp(kb: KbResolver, args: Record<string, unknown>): Promise<To
         return success(renderStaleReport(stale, STALE_SCAN_LIMIT));
       }
 
+      case 'coverage': {
+        const limit = optionalPositiveInt(args, 'limit');
+        if (!limit.ok) return failure(limit.message);
+        return success(renderCoverageReport(pages.coverage(limit.value)));
+      }
+
       case 'list': {
         const kind = optionalString(args, 'kind');
         if (!kind.ok) return failure(kind.message);
@@ -535,6 +591,51 @@ async function pageOp(kb: KbResolver, args: Record<string, unknown>): Promise<To
   }
 }
 
+/**
+ * What a search that found nothing says: that it found nothing, which pages are nearest, and
+ * where to look instead.
+ *
+ * A miss costs more than a hit if it stops there, because the caller has paid for the question
+ * and learned only that the knowledge base is not the place. Naming the nearest pages and the
+ * next move — the tree, and recording what it finds — is what keeps a miss from becoming a
+ * series of blind greps.
+ */
+export function renderSearchMiss(
+  query: string,
+  nearest: readonly NearestPage[],
+  pages: number,
+): string {
+  if (pages === 0) {
+    return (
+      `nothing matches "${query}": this project has no knowledge base yet.\n` +
+      'Scaffold the three reserved pages with page {"op":"init"}; until then the tree itself ' +
+      'is the only source.'
+    );
+  }
+
+  const lines = [
+    `nothing matches "${query}" — no page or task in this project holds every one of its words.`,
+    'Every word must appear in the same task or page; try fewer words, or a shorter fragment ' +
+      'of an identifier.',
+  ];
+  if (nearest.length > 0) {
+    lines.push(
+      `Nearest pages by topic (${nearest.length}):`,
+      ...nearest.map(
+        (page) =>
+          `- ${page.id}: ${page.title} — ${page.summary} (shares: ${page.shared.join(', ')})`,
+      ),
+    );
+  }
+  lines.push(
+    'A miss is an answer about the knowledge base, not about the project: grep the tree for the ' +
+      'word, and if what you find is worth finding again, record it — a symbol line sent as ' +
+      'page {"op":"put","id":"<id>","symbols":["Name — path/to/file.ext"]} is what makes the ' +
+      'next search answer with the file.',
+  );
+  return lines.join('\n');
+}
+
 async function searchKb(kb: KbResolver, args: Record<string, unknown>): Promise<ToolResult> {
   const resolved = resolveKb(kb, args);
   if (!resolved.ok) return resolved.result;
@@ -562,10 +663,11 @@ async function searchKb(kb: KbResolver, args: Record<string, unknown>): Promise<
       ...(limit.value === undefined ? {} : { limit: limit.value }),
     });
     if (hits.length === 0) {
-      return success(
-        `nothing matches "${query.value}".\n` +
-          'Every word must appear in the same task or page; try fewer words, or list pages with the page tool.',
-      );
+      const store = resolved.stores.pages;
+      // A task-only search was not looking at pages, so pointing at one would send the caller
+      // somewhere it just said it did not mean.
+      const nearest = kind.value === 'task' ? [] : nearestPages(store.list(), query.value);
+      return success(renderSearchMiss(query.value, nearest, store.count()));
     }
     return success(
       `${hits.length} hit(s) for "${query.value}":\n${hits.map(renderHit).join('\n')}`,
@@ -609,7 +711,7 @@ const PAGE_SCHEMA: Record<string, unknown> = {
       type: 'string',
       enum: [...PAGE_OPS],
       description:
-        'get: read one page with its body and its links (id). put: create or update a page (id, and any of kind/title/summary/body/parent/status/pin — a field you omit keeps its value). patch: change part of a body without resending it (id, edits). append: add text at the end of a body (id, body). history: the previous bodies a page had, newest first, or one of them in full (id, optional revision). stale: the pages whose files changed in git after the page was written, worst first (optional limit). list: page ids with their one-line summaries, no bodies (optional kind, status). delete: remove a page (id); its children become root pages. init: scaffold the reserved pages project, user-intent and onboarding as templates to fill in, leaving any that already exist untouched (no other arguments). link/unlink: add or remove an edge (from, rel, to). links: the edges of a node (ref, optional direction).',
+        'get: read one page with its body, its symbols and its links (id). put: create or update a page (id, and any of kind/title/summary/body/symbols/parent/status/pin — a field you omit keeps its value). patch: change part of a body without resending it (id, edits). append: add text at the end of a body (id, body). history: the previous bodies a page had, newest first, or one of them in full (id, optional revision). stale: the pages whose files changed in git after the page was written, worst first (optional limit). coverage: the repository files no page names, most-changed first, with the count of files pages do cover (optional limit). list: page ids with their one-line summaries, no bodies (optional kind, status). delete: remove a page (id); its children become root pages. init: scaffold the reserved pages project, user-intent and onboarding as templates to fill in, leaving any that already exist untouched (no other arguments). link/unlink: add or remove an edge (from, rel, to). links: the edges of a node (ref, optional direction).',
     },
     id: {
       type: 'string',
@@ -635,6 +737,16 @@ const PAGE_SCHEMA: Record<string, unknown> = {
         'matters instead of copying it. For a change to an existing body prefer op "patch" ' +
         'or "append": they cost the edit, not the whole text.',
     },
+    symbols: {
+      type: 'array',
+      items: { type: 'string', maxLength: SYMBOL_MAX_CHARS },
+      maxItems: SYMBOLS_LIMIT,
+      description:
+        `The symbols this page documents, at most ${SYMBOLS_LIMIT}, one line each as ` +
+        '"Name — path/to/file.ext". This is the field a search matches to answer "where does ' +
+        'this live" without opening a body, so name the things a reader would grep for. Omit ' +
+        'it on an update to keep the list already stored.',
+    },
     edits: {
       type: 'array',
       minItems: 1,
@@ -656,7 +768,9 @@ const PAGE_SCHEMA: Record<string, unknown> = {
     limit: {
       type: 'integer',
       minimum: 1,
-      description: `At most this many pages for op "stale" (default ${STALE_PAGES_LIMIT}), worst first.`,
+      description:
+        `At most this many entries, worst first: pages for op "stale" (default ${STALE_PAGES_LIMIT}), ` +
+        `uncovered files for op "coverage" (default ${COVERAGE_LIMIT}).`,
     },
     parent: {
       type: ['string', 'null'],

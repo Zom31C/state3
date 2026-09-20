@@ -15,7 +15,10 @@ import type { Notation } from './notation.js';
 import { composeProcedure } from './procedure.js';
 import { builtinSkillRegistry } from './registry.js';
 import type { SkillRegistry } from './registry.js';
-import { stampVerifications } from './verifications.js';
+import { driftedArtifacts, recordArtifactStamps, storedArtifactStamps } from './artifact-stamps.js';
+import type { DriftedArtifact } from './artifact-stamps.js';
+import { stampHistoryNote, stampVerifications } from './verifications.js';
+import type { StampReport } from './verifications.js';
 
 /** A finished task has no next step; its outcome lives in `decisions`. */
 const FINISHED_NEXT_ACTION = 'None — task finished; the outcome is the last decisions entry.';
@@ -44,6 +47,24 @@ export interface HistoryEntry {
   patch: StateDict;
   ok: boolean;
   error?: { category: string; message: string };
+  /**
+   * What an applied patch cost that Σ does not show — the verification stamps it detached.
+   * Recorded because the patch alone cannot answer it: an agent is told never to send `at`
+   * or `commit`, so the values a patch overwrote exist nowhere else.
+   */
+  note?: string;
+}
+
+/**
+ * What a patch did that its caller cannot read back from Σ, filled in by `patch`.
+ *
+ * An out-parameter rather than a wider return type because a patch has many callers — the
+ * tools, the CLI, the tests — and only the tool layer has an answer to put these lines in.
+ * A caller that passes nothing gets the same behaviour it always had.
+ */
+export interface PatchReport {
+  /** Verification stamps this patch carried, replaced and detached. */
+  stamps?: StampReport;
 }
 
 export interface TaskSummary {
@@ -269,6 +290,7 @@ export class TaskStore {
     patch: StateDict,
     ok: boolean,
     error?: { category: string; message: string },
+    note?: string | null,
   ): void {
     db.prepare(
       `INSERT INTO task_history (task_id, at, ok, category, message, patch)
@@ -278,7 +300,9 @@ export class TaskStore {
       at,
       ok ? 1 : 0,
       error?.category ?? null,
-      error?.message ?? null,
+      // One column, two meanings, told apart by `ok`: a rejection stores its reason, an
+      // applied patch stores what it cost. Neither can occur on the same row.
+      error?.message ?? note ?? null,
       JSON.stringify(patch),
     );
   }
@@ -398,7 +422,11 @@ export class TaskStore {
     return this.readTask(activeId);
   }
 
-  async patch(patch: StateDict, id?: string): Promise<StoredTask> {
+  /**
+   * Applies a patch to Σ. `report`, when given, is filled with what the write cost that Σ
+   * itself does not show — see `PatchReport`.
+   */
+  async patch(patch: StateDict, id?: string, report?: PatchReport): Promise<StoredTask> {
     const taskId = id ?? (await this.activeId());
     if (taskId === null) throw new TaskNotFoundError('No active task found');
 
@@ -435,7 +463,7 @@ export class TaskStore {
     const merged = mergeState(state, expanded.patch);
     // Stamped before validation, so the stamps are checked like everything else the write
     // produces, and before the transaction, so a refused patch spawns no git subprocess.
-    stampVerifications(state, merged, () => ({
+    const stamps = stampVerifications(state, merged, () => ({
       at: now,
       commit: gitHead(projectDirOf(this.rootDir)),
     }));
@@ -447,6 +475,10 @@ export class TaskStore {
       return reject('schema', `State validation failed${where}: ${why}`);
     }
 
+    // Written before the transaction so a patch that the schema then refuses leaves no
+    // note behind: nothing was superseded by a write that never happened.
+    const note = stampHistoryNote(stamps);
+
     db.transaction(() => {
       this.upsert(db, {
         id: taskId,
@@ -457,11 +489,42 @@ export class TaskStore {
         state: merged,
       });
       // The patch is recorded as sent: the history shows what the agent asked for,
-      // which is what an audit of a rejected or surprising patch needs.
-      this.insertHistory(db, taskId, now, patch, true);
+      // which is what an audit of a rejected or surprising patch needs. The note carries
+      // what the write then did to the stamps, which the patch cannot show.
+      this.insertHistory(db, taskId, now, patch, true, undefined, note);
+      // Σ was just written, so this is the moment its file artifacts are true of the tree;
+      // a later read compares the disk against what was recorded here.
+      recordArtifactStamps(db, taskId, merged, projectDirOf(this.rootDir), now);
     });
 
+    if (report !== undefined) report.stamps = stamps;
     return this.readTask(taskId);
+  }
+
+  /**
+   * The file artifacts of a task whose file is no longer what Σ was written against.
+   *
+   * Read from the raw row rather than through `readTask`: this is a diagnostic about the
+   * tree, and it has to answer for a Σ this build cannot validate too — a foreign skill's
+   * state is exactly the one a supervising session may be looking at.
+   */
+  async driftedArtifacts(id?: string): Promise<DriftedArtifact[]> {
+    const taskId = id ?? (await this.activeId());
+    if (taskId === null) return [];
+    const db = this.readable();
+    if (db === null) return [];
+    const row = this.rowOrNull(taskId);
+    if (row === null) return [];
+
+    let parsed: StateValue;
+    try {
+      parsed = JSON.parse(row.state) as StateValue;
+    } catch {
+      return [];
+    }
+    if (!isPlainObject(parsed)) return [];
+
+    return driftedArtifacts(parsed, storedArtifactStamps(db, taskId), projectDirOf(this.rootDir));
   }
 
   async finish(summary: string, id?: string): Promise<StoredTask> {
@@ -597,6 +660,8 @@ export class TaskStore {
       const entry: HistoryEntry = { at: row.at, patch, ok: row.ok !== 0 };
       if (row.category !== null && row.message !== null) {
         entry.error = { category: row.category, message: row.message };
+      } else if (row.message !== null) {
+        entry.note = row.message;
       }
       entries.push(entry);
     }

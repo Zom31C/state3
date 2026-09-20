@@ -38,11 +38,17 @@ blocker found — call `task_patch` with only the fields that changed:
   and put the concrete next step into `next.action`.
 - `artifacts`: one line per touched file or resource — what it is now. Remove
   stale entries with `null` (for example `{"artifacts": {"src/old.ts": null}}`).
+  A file you name is also stamped (`mtime`, size) when Σ is written, and a read
+  — `task_show`, or the injection at session start — says which of them changed
+  on disk since. That is Σ telling you the tree moved under it: read the file
+  before trusting what Σ says about it.
 - `verifications`: the literal command (`npm test`, `npm run lint`, …) and its
   real status. Never mark `pass` without output confirming it. The runtime stamps
   every entry with `at` and `commit` (the project's git HEAD, `null` outside a
   repository) — send neither yourself, so a `pass` stays tied to the tree it
-  passed on.
+  passed on. An entry you resend with the same field values keeps its stamp
+  whatever order you write them in; rewording one is a new claim, is stamped
+  again, and the answer names the stamp it replaced.
 - `decisions`: append the choices future steps must respect, one line each, with
   the reason. Do not narrate the work.
 - `blockers` + `status: "blocked"` when progress stops; clear them when it
@@ -70,7 +76,10 @@ line per entry, symbols instead of prose, paths and commands verbatim, and never
 a compressed-away constraint or failing command. When Σ grows,
 `task_show {"view":"size"}` says which field to shorten first, and
 `{"plan[0].archived": true}` keeps a finished step in Σ but drops it from the
-injection on every prompt.
+injection on every prompt. Past a threshold — measured on what a prompt carries,
+after the archived steps are out — the injection holds only the step in flight,
+`next` and `blockers`; it names the mode it applied and both sizes, so a full
+injection next to a large Σ is a measurement to read, not a cut to guess at.
 
 A rejected patch never modifies the state. Read the diagnostic category
 (`unknown-key`, `type-coercion`, `guard`, `path`, `schema`, `skill`), fix the
