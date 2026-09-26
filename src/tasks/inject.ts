@@ -7,7 +7,12 @@ import { STATE_DB_FILENAME, openStateDatabase } from '../db/database.js';
 import type { SqlDatabase } from '../db/database.js';
 import { renderDatabaseBrief } from '../kb/brief.js';
 import { driftedArtifacts, driftWarnings, storedArtifactStamps } from './artifact-stamps.js';
-import { migrateLegacyStateRoot, rootMigrationNote } from './migrate-root.js';
+import {
+  divergedSource,
+  divergenceNote,
+  migrateLegacyStateRoot,
+  rootMigrationNote,
+} from './migrate-root.js';
 import { DEFAULT_NOTATION, isNotation } from './notation.js';
 import { renderTaskBrief, renderTaskHead } from './render.js';
 import { RISK_LEVELS } from './schema.js';
@@ -284,8 +289,19 @@ function readTaskHead(
   // Above Σ rather than below it: the branch says which piece of a larger job the state below
   // describes, and a resumed session reads top to bottom.
   const branch = branchLines(db, row, options.queue);
+  // Both of these are the once-per-session extras, which is what `drift` gates: a surprise
+  // reported at a session start costs one line, and repeated on every prompt it costs more than
+  // the surprise was worth (§15.5).
+  const diverged = options.drift ? divergedSource(rootDir) : null;
   const drift = options.drift ? driftLines(db, row.id, state, rootDir) : [];
-  const text = [...branch, render(task), ...drift].join('\n');
+  const text = [
+    ...branch,
+    render(task),
+    // Ahead of the artifact drift: files that moved under Σ are a reason to re-read them, while
+    // a second state root still being written is a reason to doubt Σ wholesale.
+    ...(diverged === null ? [] : [divergenceNote(diverged)]),
+    ...drift,
+  ].join('\n');
   return { text, risk: riskOf(state), unreadable: null };
 }
 

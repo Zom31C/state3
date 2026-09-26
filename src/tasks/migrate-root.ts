@@ -1,4 +1,4 @@
-import { cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { STATE_DIRNAME } from '../core/paths.js';
 import { STATE_DB_FILENAME } from '../db/database.js';
@@ -99,15 +99,31 @@ export function migrateLegacyStateRoot(rootDir: string): RootMigration {
   if (pending.inUse) return { kind: 'in-use', from, to };
 
   try {
+    // Taken before the copy: the copy does not touch the source, and this is the state the
+    // divergence check below compares against later.
+    const source = statOf(join(from, STATE_DB_FILENAME));
     // `force: false` so an entry that already exists in the new root wins. Only reachable when
     // the new root holds something other than a database, and even then the state already
     // written there is the newer claim.
     cpSync(from, to, { recursive: true, force: false });
-    writeFileSync(join(to, MIGRATION_MARKER), `${from}\n${new Date().toISOString()}\n`);
+    writeFileSync(
+      join(to, MIGRATION_MARKER),
+      [from, new Date().toISOString(), source?.mtimeMs ?? '', source?.size ?? ''].join('\n') + '\n',
+    );
   } catch (err) {
     return { kind: 'failed', from, to, reason: message(err) };
   }
   return { kind: 'migrated', from, to, entries };
+}
+
+/** mtime and size of a file, or null when it is not there or cannot be read. */
+function statOf(file: string): { mtimeMs: number; size: number } | null {
+  try {
+    const stat = statSync(file);
+    return { mtimeMs: stat.mtimeMs, size: stat.size };
+  } catch {
+    return null;
+  }
 }
 
 /** One line for a tool answer, a hook warning or `doctor`; null when there is nothing to say. */
@@ -132,15 +148,89 @@ export function rootMigrationNote(result: RootMigration): string | null {
   }
 }
 
-/** What the new root says about where it came from, or null when it was not migrated. */
-export function readMigrationMarker(rootDir: string): { from: string; at: string } | null {
+/**
+ * What the new root says about where it came from, or null when it was not carried over.
+ *
+ * `source` is the mtime and size the pre-rename database had at the moment it was copied, and it
+ * is null for a root that held only legacy JSON records — there was no database to remember. A
+ * marker written before this field existed reads the same way: a line that is not a number is
+ * treated as absent rather than as zero, since zero would claim a comparison nobody can make.
+ */
+export interface CarryOverStamp {
+  from: string;
+  at: string;
+  source: { mtimeMs: number; size: number } | null;
+}
+
+export function readMigrationMarker(rootDir: string): CarryOverStamp | null {
   const marker = join(resolve(rootDir), MIGRATION_MARKER);
   if (!existsSync(marker)) return null;
   try {
-    const [from, at] = readFileSync(marker, 'utf8').split('\n');
-    if (typeof from !== 'string' || from.trim() === '') return null;
-    return { from: from.trim(), at: (at ?? '').trim() };
+    const lines = readFileSync(marker, 'utf8').split('\n');
+    const from = (lines[0] ?? '').trim();
+    if (from === '') return null;
+    const mtime = numberOr((lines[2] ?? '').trim());
+    const size = numberOr((lines[3] ?? '').trim());
+    return {
+      from,
+      at: (lines[1] ?? '').trim(),
+      source: mtime === null || size === null ? null : { mtimeMs: mtime, size },
+    };
   } catch {
     return null;
   }
+}
+
+function numberOr(text: string): number | null {
+  if (text === '') return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * The pre-rename root this one was carried over from, if it has been written to since.
+ *
+ * The carry-over copies and deliberately leaves the source in place, which buys a recoverable
+ * duplicate at the price of a second root that still looks authoritative. Anything pointed at
+ * the old one — a host that kept the pre-rename extension linked, a script with `--root
+ * .skillstate`, a second project sharing that build — writes state this root never sees, and
+ * both files read as the real one. Nothing merges them, because two histories that diverged
+ * have no honest merge; what this does is make the divergence impossible to miss.
+ *
+ * Null when there is nothing to compare: no marker, a marker without a database stamp, or an old
+ * root that has since been deleted.
+ *
+ * The comparison is mtime and size — one `stat`, no read of the file. A hash would be exact but
+ * would tax every session start, and this exists to catch a mistake made over hours, not one made
+ * inside a single filesystem tick; that is the known limit, and on a filesystem with coarse
+ * timestamps the blind window is as coarse as they are. Size alone would not do either: SQLite
+ * reuses pages, so a real write can leave the file exactly as long as it was.
+ */
+export function divergedSource(
+  rootDir: string,
+): { from: string; at: string; size: number; nowSize: number } | null {
+  const marker = readMigrationMarker(rootDir);
+  if (marker === null || marker.source === null) return null;
+  const now = statOf(join(marker.from, STATE_DB_FILENAME));
+  if (now === null) return null;
+
+  // A millisecond of slack: mtimeMs is a float and a filesystem may round it, and the question is
+  // "was it written after the copy", not "are the two floats identical".
+  if (now.mtimeMs <= marker.source.mtimeMs + 1 && now.size === marker.source.size) return null;
+  return { from: marker.from, at: marker.at, size: marker.source.size, nowSize: now.size };
+}
+
+/** The line `doctor` and a session start print when the two roots have diverged. */
+export function divergenceNote(diverged: {
+  from: string;
+  at: string;
+  size: number;
+  nowSize: number;
+}): string {
+  return (
+    `the pre-rename root ${diverged.from} was written AFTER its state was carried over here ` +
+    `(${diverged.at}; state.db ${diverged.size} -> ${diverged.nowSize} bytes). The two roots have ` +
+    'diverged and nothing merges them: something is still pointed at the old one. Read both ' +
+    'before trusting either, and repoint it at this root.'
+  );
 }

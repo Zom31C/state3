@@ -8,6 +8,7 @@ import { inspectStateRoot } from '../../src/tasks/doctor.js';
 import { readInjection } from '../../src/tasks/inject.js';
 import { migrateRootToDatabase } from '../../src/tasks/migrate.js';
 import {
+  divergedSource,
   LEGACY_STATE_DIRNAME,
   migrateLegacyStateRoot,
   pendingLegacyRoot,
@@ -36,10 +37,15 @@ afterEach(async () => {
   await rm(project, { recursive: true, force: true });
 });
 
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /** A pre-rename root holding a real database, written by the store and closed cleanly. */
 async function writeLegacyDatabase(goal = 'Task from before the rename'): Promise<void> {
   const old = new TaskStore(legacy);
   await old.start(goal);
+  // Held open long enough that the filesystem's clock has moved: a stamp taken in the same tick
+  // as the write cannot tell "before the copy" from "after" it, and the check is about order.
+  await delay(30);
   old.close();
 }
 
@@ -164,5 +170,70 @@ describe('pendingLegacyRoot', () => {
     expect(
       after.findings.some((f) => f.text.includes('carried over from the pre-rename name')),
     ).toBe(true);
+  });
+});
+
+describe('the two roots after a carry-over', () => {
+  it('remembers what it copied, and stays quiet while the old root is untouched', async () => {
+    await writeLegacyDatabase();
+    migrateLegacyStateRoot(root);
+
+    const stamp = readMigrationMarker(root);
+    expect(stamp?.from).toBe(path.resolve(legacy));
+    expect(stamp?.source).not.toBeNull();
+    expect(divergedSource(root)).toBeNull();
+    expect((await inspectStateRoot(root)).findings.some((f) => f.text.includes('diverged'))).toBe(
+      false,
+    );
+  });
+
+  it('says out loud when the pre-rename root is written after the copy', async () => {
+    await writeLegacyDatabase();
+    migrateLegacyStateRoot(root);
+
+    // What a host still linked to the old extension, or a script with --root .skillstate, does:
+    // it opens the root it was pointed at and writes, and nothing about the file says it is stale.
+    const old = new TaskStore(legacy);
+    await old.start('Written into the old root after the carry-over');
+    // Held apart in time from the copy, as a real second write would be. Note what the check
+    // actually catches: SQLite reused pages here, so the file size came back identical and only
+    // the mtime moved — a stamp of size alone would have reported nothing.
+    await delay(30);
+    old.close();
+
+    const diverged = divergedSource(root);
+    expect(diverged).not.toBeNull();
+    expect((await inspectStateRoot(root)).findings.some((f) => f.text.includes('diverged'))).toBe(
+      true,
+    );
+
+    const atStart = readInjection(root, { drift: true });
+    expect(atStart.kind).toBe('context');
+    if (atStart.kind === 'context') expect(atStart.task).toContain('diverged');
+
+    // Once per session, like artifact drift: a surprise repeated on every prompt costs more than
+    // the surprise is worth.
+    const onPrompt = readInjection(root);
+    if (onPrompt.kind === 'context') expect(onPrompt.task).not.toContain('diverged');
+  });
+
+  it('is quiet about a pre-rename root that has since been deleted', async () => {
+    await writeLegacyDatabase();
+    migrateLegacyStateRoot(root);
+    await rm(legacy, { recursive: true, force: true });
+
+    expect(divergedSource(root)).toBeNull();
+  });
+
+  it('claims no comparison it cannot make for a root that held only legacy JSON', async () => {
+    await mkdir(legacy, { recursive: true });
+    await writeFile(path.join(legacy, 'task-old.json'), '{"id":"task-old"}', 'utf-8');
+    migrateLegacyStateRoot(root);
+
+    expect(readMigrationMarker(root)?.source).toBeNull();
+    // The records were archived rather than read here, so there is no database stamp to compare
+    // against; reporting divergence would be a claim about a file nobody measured.
+    await writeFile(path.join(legacy, 'task-old.json'), '{"id":"task-old","edited":true}', 'utf-8');
+    expect(divergedSource(root)).toBeNull();
   });
 });

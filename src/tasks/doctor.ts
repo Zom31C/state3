@@ -8,7 +8,12 @@ import type { SqlDatabase } from '../db/database.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
 import { describeDrift, driftedArtifacts, storedArtifactStamps } from './artifact-stamps.js';
 import { readLegacyRoot } from './legacy.js';
-import { pendingLegacyRoot, readMigrationMarker } from './migrate-root.js';
+import {
+  divergedSource,
+  divergenceNote,
+  pendingLegacyRoot,
+  readMigrationMarker,
+} from './migrate-root.js';
 import { builtinSkillRegistry } from './registry.js';
 import type { SkillRegistry } from './registry.js';
 
@@ -99,6 +104,13 @@ export async function inspectStateRoot(
         `this root was carried over from the pre-rename name ${carriedFrom.from}` +
         `${carriedFrom.at === '' ? '' : ` at ${carriedFrom.at}`}; the old root was left in place`,
     });
+  }
+  const diverged = divergedSource(rootDir);
+  if (diverged !== null) {
+    // Louder than the carry-over note above and for the same reason: a second root that is
+    // still being written is the one failure of the rename that loses work silently, since both
+    // files answer `task list` and neither says it is the stale one.
+    findings.push({ severity: 'warn', text: divergenceNote(diverged) });
   }
   const pending = pendingLegacyRoot(rootDir);
   if (pending !== null) {
