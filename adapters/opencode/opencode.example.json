@@ -1,13 +1,13 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "skillstate": {
+    "state3": {
       "type": "local",
       "command": [
         "node",
-        "D:/Projects/skillState/extensions/skillstate/bin/skillstate-mcp.mjs",
+        "D:/Projects/skillState/extensions/state3/bin/state3-mcp.mjs",
         "--root",
-        "D:/Projects/skillState/.skillstate"
+        "D:/Projects/skillState/.state3"
       ],
       "enabled": true,
       "timeout": 10000

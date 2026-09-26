@@ -2,7 +2,7 @@ import { resolveProviderConfig } from './config.js';
 import type { BaselineKind } from './core/baselines.js';
 import { BaselineRuntime } from './core/baselines.js';
 import type { RunResult, StepRecord, TokenTally } from './core/runtime.js';
-import { SkillStateRuntime } from './core/runtime.js';
+import { State3Runtime } from './core/runtime.js';
 import type { Skill } from './core/skill.js';
 import type { StepJudgement, WarehouseEnv } from './envs/warehouse.js';
 import { WarehouseEnv as WarehouseEnvImpl } from './envs/warehouse.js';
@@ -11,9 +11,9 @@ import type { LLMProvider } from './llm/provider.js';
 import type { ActionStateUpdater } from './core/baselines.js';
 import { applyWarehouseAction, warehouseSkill } from './skills/warehouse.js';
 
-export type RuntimeKind = 'skillstate' | BaselineKind;
+export type RuntimeKind = 'state3' | BaselineKind;
 
-export const ALL_RUNTIMES: readonly RuntimeKind[] = ['skillstate', 'prompt', 'memory', 'stateful'];
+export const ALL_RUNTIMES: readonly RuntimeKind[] = ['state3', 'prompt', 'memory', 'stateful'];
 
 export interface RunOptions {
   horizon: number;
@@ -22,7 +22,7 @@ export interface RunOptions {
   runtime?: RuntimeKind;
   memoryWindow?: number;
   summarizeEvery?: number;
-  /** Provider-native structured output; applies to the skillstate runtime only. */
+  /** Provider-native structured output; applies to the state3 runtime only. */
   structured?: boolean;
   provider?: string;
   model?: string;
@@ -81,11 +81,11 @@ export async function runEpisode(
   const skill = deps.createSkill();
   const env = deps.createEnv({ horizon: options.horizon, seed: options.seed });
   const provider = deps.createProvider();
-  const kind = options.runtime ?? 'skillstate';
+  const kind = options.runtime ?? 'state3';
 
   const run: RunResult =
-    kind === 'skillstate'
-      ? await new SkillStateRuntime({
+    kind === 'state3'
+      ? await new State3Runtime({
           skill,
           env,
           provider,

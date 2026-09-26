@@ -1,8 +1,8 @@
-# skillstate — внешнее состояние задачи и база знаний проекта
+# state3 — внешнее состояние задачи и база знаний проекта
 
 Расширение даёт агенту внешний детерминированный слой состояния Σ из статьи
 SKILL.state (arXiv:2608.26263) и базу знаний проекта рядом с ним: вместо
-растущего транскрипта прогресс длинной задачи живёт в `.skillstate/state.db`
+растущего транскрипта прогресс длинной задачи живёт в `.state3/state.db`
 проекта, патчи валидируются схемой и guard'ом, а компактная Σ инжектируется в
 каждый ход — поэтому прогресс переживает `/compact` и перезапуск сессии. На
 старте сессии к Σ добавляется бриф базы знаний: по одной строке на страницу,
@@ -10,15 +10,41 @@ SKILL.state (arXiv:2608.26263) и базу знаний проекта рядо�
 
 ## Что добавляется
 
-| Механизм                | Что делает                                                                                                                                                                                                                                         |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| MCP-сервер `skillstate` | девять инструментов: `task_start`, `task_show`, `task_patch`, `task_finish`, `task_list`, `task_history` и `project_brief`, `page`, `search`                                                                                                       |
-| Хук `UserPromptSubmit`  | добавляет в ход блок `## Active task state (skillstate)` с компактной Σ и коротким напоминанием                                                                                                                                                    |
-| Хук `PreCompact`        | передаёт Σ в контекст сжатия, чтобы состояние попало в саммаризацию                                                                                                                                                                                |
-| Хук `SessionStart`      | восстанавливает Σ после старта/возобновления/сжатия сессии (`startup\|resume\|clear\|compact`), добавляет блок `## Project brief (skillstate)` — карту базы знаний — и сообщает, какие файлы из `artifacts` изменились на диске с момента записи Σ |
-| Хук `SubagentStart`     | даёт делегированному сабагенту ориентацию вместо Σ: задача, цель, пункт плана в работе, следующий шаг и его риск (`SKILLSTATE_SUBAGENT_STATE=off` — не давать ничего)                                                                              |
-| Skill `/long-task`      | процедура ведения длинной задачи: когда начинать, как патчить, как подтверждать опасные действия, как возобновляться                                                                                                                               |
-| Контекст `QWEN.md`      | короткое напоминание о инструментах и правилах (полный текст P возвращает `task_show`)                                                                                                                                                             |
+| Механизм               | Что делает                                                                                                                                                                                                                                     |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| MCP-сервер `state3`    | девять инструментов: `task_start`, `task_show`, `task_patch`, `task_finish`, `task_list`, `task_history` и `project_brief`, `page`, `search`                                                                                                   |
+| Хук `UserPromptSubmit` | добавляет в ход блок `## Active task state (state3)` с компактной Σ задачи на фронте работ, коротким напоминанием и строками ветки и очереди над Σ                                                                                             |
+| Хук `PreCompact`       | передаёт Σ в контекст сжатия, чтобы состояние попало в саммаризацию                                                                                                                                                                            |
+| Хук `SessionStart`     | восстанавливает Σ после старта/возобновления/сжатия сессии (`startup\|resume\|clear\|compact`), добавляет блок `## Project brief (state3)` — карту базы знаний — и сообщает, какие файлы из `artifacts` изменились на диске с момента записи Σ |
+| Хук `SubagentStart`    | даёт делегированному сабагенту ориентацию вместо Σ: ветка, задача, цель, пункт плана в работе, следующий шаг и его риск — но не очередь за ним (`STATE3_SUBAGENT_STATE=off` — не давать ничего)                                                |
+| Skill `/long-task`     | процедура ведения длинной задачи: когда начинать, как патчить, как подтверждать опасные действия, как возобновляться                                                                                                                           |
+| Контекст `QWEN.md`     | короткое напоминание о инструментах и правилах (полный текст P возвращает `task_show`)                                                                                                                                                         |
+
+## Дерево задач
+
+Работа — дерево, а не список. `task_start {"parent":…}` (в CLI `--parent <task>`)
+отделяет кусок в подзадачу со своей Σ вместо того, чтобы добавлять его в план
+задачи, которая ещё в работе: подзадача создаётся со статусом `pending` и встаёт в
+очередь за текущим куском. Статусы задачи — `pending | active | blocked | done`,
+порядок очереди — порядок создания, поэтому три подзадачи, созданные подряд,
+отдаются по одной, начиная с первой.
+
+Инструменты и инжекция действуют на **фронте работ** — открытой задаче, под
+которой ничего не открыто. Раздробленная задача является контейнером, и её Σ в
+промпт не попадает. Промпт несёт ветку: строку
+`Branch: <цель корня> [status] -> … -> this task` и строку
+`Queued after this: "<цель>" (<id>) + N more` — обе над Σ задачи в работе, Σ
+братьев не инжектируется вовсе. Делегированный сабагент получает `Branch:`, но не
+строку очереди: ему вручили один кусок.
+
+Задачу с открытыми подзадачами нельзя перевести в `done` — ни `task_patch`, ни
+`task_finish`; подзадачу нельзя создать под несуществующим или закрытым
+родителем. Декомпозиция закрывается последней: сначала закрыть или пропустить
+подзадачи, затем родителя, записав итог целого в `decisions`. `task_list` печатает
+дерево (отступ — вложенность, на родителе счётчик `(N subtasks, M open)`),
+`task_show {"view":"tree"}` (в CLI `--tree`) — декомпозицию под задачей без Σ и
+без процедуры. Десятого инструмента нет намеренно: декларации инструментов стоят
+токенов в каждой сессии, поэтому дерево добавлено в существующие девять.
 
 ## База знаний проекта
 
@@ -57,7 +83,8 @@ SKILL.state (arXiv:2608.26263) и базу знаний проекта рядо�
 Делегированный сабагент стартует без транскрипта, и `UserPromptSubmit` на него не
 срабатывает — событие другое. Поэтому `SubagentStart` выдаёт ему несколько строк
 ориентации: id задачи с навыком и статусом, `goal`, пункт плана в работе (вместе с
-`notes`), `next.action` с уровнем риска и `blockers`. Не Σ целиком.
+`notes`), `next.action` с уровнем риска и `blockers`. Не Σ целиком. Строка
+`Branch:` над ними говорит, какой кусок какой большой работы ему вручили.
 
 Почему не Σ: сабагент носит свой промпт на каждом собственном ходе, и четыре тысячи
 символов состояния, умноженные на 12–40 ходов дешёвой модели, — ровно тот
@@ -69,21 +96,23 @@ SKILL.state (arXiv:2608.26263) и базу знаний проекта рядо�
 Режима «полная Σ» нет намеренно: он дублировал бы `task_show`, а две копии состояния в
 контексте расходятся. Хвостовые строки блока тоже другие — сабагенту положено
 **отчитаться**, а патчит Σ оркестратор: два агента на одном состоянии означают дважды
-закрытый пункт плана и `guard`-отказ как единственный след. Бриф базы знаний и Σ
-объявленных проектов (`SKILLSTATE_PROJECTS`) сабагенту не выдаются: он делегирован
-внутри этого проекта, и чужие состояния — контекст, которым он не может распорядиться.
+закрытый пункт плана и `guard`-отказ как единственный след. Строка очереди
+(`Queued after this`) сабагенту не выдаётся: ему вручили один кусок, и назвать
+следующий — значит пригласить его начать самому. Бриф базы знаний и Σ объявленных
+проектов (`STATE3_PROJECTS`) не выдаются тоже: он делегирован внутри этого проекта,
+и чужие состояния — контекст, которым он не может распорядиться.
 
-`SKILLSTATE_SUBAGENT_STATE=off` отключает инжекцию для этого события и только для него
+`STATE3_SUBAGENT_STATE=off` отключает инжекцию для этого события и только для него
 (сессия продолжает получать Σ) — на случай агента, чья работа не связана с задачей в
 полёте.
 
 ## Установка
 
 Расширение не содержит собственной сборки — оно запускает собранный сервер из
-репозитория skillstate.
+репозитория state3.
 
 ```bash
-# 1. Собрать сервер в репозитории skillstate
+# 1. Собрать сервер в репозитории state3
 cd D:\Projects\skillState
 npm install
 npm run build          # создаёт dist/mcp/server.js
@@ -92,26 +121,26 @@ npm run build          # создаёт dist/mcp/server.js
 npm run smoke:mcp
 
 # 3. Подключить расширение (локальная ссылка: правки подхватываются без переустановки)
-qwen extensions link D:\Projects\skillState\extensions\skillstate
+qwen extensions link D:\Projects\skillState\extensions\state3
 
 # 4. Перезапустить Qwen Code и проверить
 qwen extensions list
 ```
 
 Если расширение устанавливается вне репозитория (`qwen extensions install <path>`
-или копированием в `~/.qwen/extensions/skillstate`), укажите путь к репозиторию:
+или копированием в `~/.qwen/extensions/state3`), укажите путь к репозиторию:
 
 ```bash
-qwen extensions settings set skillstate SKILLSTATE_HOME D:\Projects\skillState
+qwen extensions settings set state3 STATE3_HOME D:\Projects\skillState
 ```
 
-Поиск репозитория: `SKILLSTATE_HOME` → обход каталогов вверх от файла
-`bin/skillstate-mcp.mjs` (до 8 уровней).
+Поиск репозитория: `STATE3_HOME` → обход каталогов вверх от файла
+`bin/state3-mcp.mjs` (до 8 уровней).
 
-## Состояние нескольких проектов (`SKILLSTATE_PROJECTS`)
+## Состояние нескольких проектов (`STATE3_PROJECTS`)
 
-Корень состояния по умолчанию один — `<каталог запуска>/.skillstate` либо
-`SKILLSTATE_STATE_DIR`. Переменная `SKILLSTATE_PROJECTS` объявляет
+Корень состояния по умолчанию один — `<каталог запуска>/.state3` либо
+`STATE3_STATE_DIR`. Переменная `STATE3_PROJECTS` объявляет
 дополнительные корни, после чего у всех девяти инструментов появляется
 необязательный аргумент `project` с именем такого корня. Задайте её как обычную
 переменную окружения или через пункт «supervised projects» в настройках
@@ -119,7 +148,7 @@ qwen extensions settings set skillstate SKILLSTATE_HOME D:\Projects\skillState
 либо JSON-объект `{"name":"dir"}`:
 
 ```
-SKILLSTATE_PROJECTS=worker=D:\Projects\worker\.skillstate
+STATE3_PROJECTS=worker=D:\Projects\worker\.state3
 ```
 
 - имя проекта обязано соответствовать `/^[a-z0-9][a-z0-9_-]{0,63}$/`; каталог
@@ -130,10 +159,10 @@ SKILLSTATE_PROJECTS=worker=D:\Projects\worker\.skillstate
   его, ни записать в него. Объявление приходит из окружения пользователя, не от
   модели;
 - необъявленное имя — ошибка с перечислением объявленных корней (проверено):
-  `unknown project "nope" — declared: racegame (D:\Projects\RaceGame\.skillstate)`;
+  `unknown project "nope" — declared: racegame (D:\Projects\RaceGame\.state3)`;
 - `task_list` дописывает строки возможностей `skills: …` и `projects: …`;
-- хук при заданной `SKILLSTATE_PROJECTS` инжектирует также активную задачу
-  каждого объявленного проекта — блоком `## Supervised projects (skillstate)` с
+- хук при заданной `STATE3_PROJECTS` инжектирует также активную задачу
+  каждого объявленного проекта — блоком `## Supervised projects (state3)` с
   подзаголовком `### <name> — <rootDir>`. Корень, совпадающий с основным (на
   Windows сравнение без учёта регистра), и проект без активной задачи
   пропускаются, не скрывая остальные; нечитаемый корень ход не роняет;
@@ -147,7 +176,7 @@ SKILLSTATE_PROJECTS=worker=D:\Projects\worker\.skillstate
 ## Безопасность
 
 - Сервер не исполняет shell/HTTP и не правит код — он читает и пишет только
-  файлы `.skillstate/`.
+  файлы `.state3/`.
 - Поле `next.risk` в Σ помечает следующее действие: `safe`, `destructive`
   (удаление файлов/веток, force-push, drop таблиц) или `external` (всё, что
   выходит за пределы рабочего каталога проекта: push, комментарии в PR/issue,
@@ -156,7 +185,7 @@ SKILLSTATE_PROJECTS=worker=D:\Projects\worker\.skillstate
   Процедура P требует запросить подтверждение пользователя до исполнения
   destructive/external.
 - Подтверждение опасных действий обеспечивает и сам Qwen Code (approval-режимы,
-  хуки `PreToolUse`/`PermissionRequest`) — слой skillstate их не заменяет.
+  хуки `PreToolUse`/`PermissionRequest`) — слой state3 их не заменяет.
 - Невалидный патч отклоняется до записи: состояние не меняется, а в истории
   патчей (таблица `task_history` в `state.db`; читается `task_history` или
   `npm run run -- task history`) остаётся запись с категорией ошибки
@@ -168,15 +197,15 @@ SKILLSTATE_PROJECTS=worker=D:\Projects\worker\.skillstate
 
 ```bash
 # Сервер и его инструменты
-node extensions\skillstate\bin\skillstate-mcp.mjs --help
+node extensions\state3\bin\state3-mcp.mjs --help
 npm run smoke:mcp
-npm run smoke:mcp -- --server extensions\skillstate\bin\skillstate-mcp.mjs
+npm run smoke:mcp -- --server extensions\state3\bin\state3-mcp.mjs
 
 # Хук: --self-test читает состояние проекта вместо JSON-события из stdin
 # (пустой вывод означает, что ни активной задачи, ни страниц нет)
-node extensions\skillstate\hooks\inject-state.mjs --self-test D:\Projects\skillState
+node extensions\state3\hooks\inject-state.mjs --self-test D:\Projects\skillState
 # второй аргумент --self-test — имя события; SessionStart добавляет бриф базы знаний
-node extensions\skillstate\hooks\inject-state.mjs --self-test D:\Projects\skillState SessionStart
+node extensions\state3\hooks\inject-state.mjs --self-test D:\Projects\skillState SessionStart
 
 # Состояние и аудит задачи
 npm run run -- task list
@@ -191,18 +220,18 @@ npm run run -- task doctor
 ## Проверка в живой сессии Qwen Code
 
 ```bash
-qwen extensions list   # расширение включено: QWEN.md, навык long-task, MCP-сервер skillstate
-qwen mcp list          # ✓ skillstate: node ...\bin\skillstate-mcp.mjs (stdio) - Connected
+qwen extensions list   # расширение включено: QWEN.md, навык long-task, MCP-сервер state3
+qwen mcp list          # ✓ state3: node ...\bin\state3-mcp.mjs (stdio) - Connected
 
 # Хуки и инжекция Σ без интерактивной сессии:
 qwen --debug -p "Do not use any tools. Reply with the single word OK."
-# в логе: [TRUSTED_HOOKS] Hook skillstate-inject-state ended for event UserPromptSubmit: success
-qwen -p "Do not call any tools. Reply with the task id and status from the '## Active task state (skillstate)' block, or NONE."
+# в логе: [TRUSTED_HOOKS] Hook state3-inject-state ended for event UserPromptSubmit: success
+qwen -p "Do not call any tools. Reply with the task id and status from the '## Active task state (state3)' block, or NONE."
 # ответ: task-<id>, active
 ```
 
-В сессии инструменты видны под именами `mcp__skillstate__task_start`,
-`mcp__skillstate__task_patch` и т. д.
+В сессии инструменты видны под именами `mcp__state3__task_start`,
+`mcp__state3__task_patch` и т. д.
 
 ## Подводные камни
 
@@ -218,7 +247,7 @@ qwen -p "Do not call any tools. Reply with the task id and status from the '## A
   `<qwen:user-prompt-submit-context>`.
 - Хост **экранирует** инжектированный текст: `>` и `<` из Σ приходят модели как
   `&gt;`/`&lt;`, поэтому `next.action` с `->` читается как `-&gt;`. Это делает
-  Qwen Code при подстановке `additionalContext`, а не skillstate — в сыром
+  Qwen Code при подстановке `additionalContext`, а не state3 — в сыром
   stdout хука (`--self-test`) текст не экранирован, и функции экранирования в
   рантайме нет. Команду, которую надо скопировать дословно, читайте через
   `task_show`: ответ MCP-инструмента в XML-контекст не заворачивается.
@@ -228,7 +257,7 @@ full — Σ is 7294 chars and this prompt carries 5867 of them…`. Порог �
   не по сохранённой Σ, поэтому полная инжекция рядом с «Σ is 7294 chars» — не
   сбой, а измерение; в дельта-режиме строка начинается с `Injection mode:
 delta`. Версию сборки, которая отвечает, печатает `task_show`
-  (`runtime: skillstate <версия> (<путь>)`, с пометкой STALE, если `dist`
+  (`runtime: state3 <версия> (<путь>)`, с пометкой STALE, если `dist`
   старше `src`).
 - Σ описывает дерево, и дерево может сдвинуться между сессиями: каждый патч
   снимает штамп `mtime` и размера с файлов, названных в `artifacts`, а
@@ -242,18 +271,18 @@ delta`. Версию сборки, которая отвечает, печата
   `${workspacePath}`, то есть **каталог запуска `qwen`**. Хук берёт каталог из
   поля `cwd` своего stdin-payload, поэтому для него действует то же правило и то
   же переопределение. Обычно qwen запускают из
-  каталога проекта, и состоянием будет `<проект>/.skillstate`. Если qwen запущен
+  каталога проекта, и состоянием будет `<проект>/.state3`. Если qwen запущен
   из другого места (например, из домашнего каталога, а проект подключён к сессии
   отдельно), сервер и хуки читают и пишут чужой каталог: проверено экспериментом
   — `qwen mcp list` из `C:\Users\Asus` даёт `cwd=C:\Users\Asus`, и `task_start`
-  в такой сессии создаёт файл в `C:\Users\Asus\.skillstate`.
+  в такой сессии создаёт файл в `C:\Users\Asus\.state3`.
 - Переменной для каталога проекта в 0.22.3 нет: `${workspaceFolder}` не
   поддерживается и раскрывается в пустую строку (с таким `cwd` сервер не
   стартует — `qwen mcp list` показывает `Disconnected`), а протокольный канал
   MCP `roots` клиент не объявляет: в `capabilities`, присланных им в `initialize`,
   только `extensions: io.modelcontextprotocol/ui`. Поэтому
   либо запускайте qwen из каталога проекта, либо задайте
-  `SKILLSTATE_STATE_DIR=<проект>\.skillstate` (пункт «state directory» в
+  `STATE3_STATE_DIR=<проект>\.state3` (пункт «state directory» в
   настройках расширения или обычная переменная окружения): её учитывают сервер,
   хук и плагин opencode, а явный `--root` имеет приоритет.
 - Рассинхрон каталогов больше не тихий: инструменты называют корень состояния
@@ -266,7 +295,7 @@ delta`. Версию сборки, которая отвечает, печата
   `task_list` по-прежнему показывает чужой корень. `/reload-plugins` процесс тоже
   не пересоздаёт (проверено: pid и время старта сервера не изменились ни после
   `/cd`, ни после `/reload-plugins`). Лечится только перезапуском `qwen` из
-  каталога проекта либо `SKILLSTATE_STATE_DIR`.
+  каталога проекта либо `STATE3_STATE_DIR`.
 - Живой сервер уже запущенной сессии держит в памяти **старый скомпилированный
   код** (измерено 09.09.2026): после `npm run build` в открытой сессии
   path-ключи продолжали отвергаться как `unknown-key` — так же, как в пункте

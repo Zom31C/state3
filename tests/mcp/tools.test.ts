@@ -75,7 +75,7 @@ class FakeTaskStore {
   private counter = 0;
 
   constructor(options: FakeStoreOptions = {}) {
-    this.rootDir = options.rootDir ?? '/fake/project/.skillstate';
+    this.rootDir = options.rootDir ?? '/fake/project/.state3';
     const skills = options.skills === undefined ? SKILLS : options.skills;
     if (skills !== null) {
       const names = [...skills];
@@ -150,9 +150,10 @@ class FakeTaskStore {
         id,
         createdAt: at,
         updatedAt: at,
-        path: `.skillstate/${id}.json`,
+        path: `.state3/${id}.json`,
         skill,
         notation,
+        parent: options.parent ?? null,
       },
       state: this.initialState(goal, skill, options.plan ?? []),
     };
@@ -208,7 +209,7 @@ class FakeTaskStore {
   async list(): Promise<TaskSummary[]> {
     this.record('list', []);
     if (this.errors.list !== undefined) throw this.errors.list;
-    return this.tasks.map((task) => {
+    const summaries = this.tasks.map((task) => {
       const plan = Array.isArray(task.state['plan']) ? (task.state['plan'] as Dict[]) : [];
       return {
         id: task.meta.id,
@@ -216,8 +217,20 @@ class FakeTaskStore {
         status: String(task.state['status'] ?? 'active'),
         skill: task.meta.skill,
         updatedAt: task.meta.updatedAt,
+        createdAt: task.meta.createdAt,
+        seq: this.tasks.indexOf(task),
         progressDone: plan.filter((item) => item['status'] === 'done').length,
         progressTotal: plan.length,
+        parent: task.meta.parent,
+      };
+    });
+    // The same rollup the real store does from its rows, so a tree reads the same from a fake.
+    return summaries.map((summary) => {
+      const children = summaries.filter((other) => other.parent === summary.id);
+      return {
+        ...summary,
+        subtasks: children.length,
+        openSubtasks: children.filter((child) => child.status !== 'done').length,
       };
     });
   }
@@ -264,9 +277,9 @@ function setup(errors: FakeErrors = {}, options: FakeStoreOptions = {}) {
 
 /** Two declared roots: the primary one plus a named project the tools may address. */
 function setupProjects() {
-  const primary = new FakeTaskStore({ rootDir: '/fake/primary/.skillstate' });
-  const worker = new FakeTaskStore({ rootDir: '/fake/worker/.skillstate' });
-  const projects: ProjectEntry[] = [{ name: 'worker', rootDir: '/fake/worker/.skillstate' }];
+  const primary = new FakeTaskStore({ rootDir: '/fake/primary/.state3' });
+  const worker = new FakeTaskStore({ rootDir: '/fake/worker/.state3' });
+  const projects: ProjectEntry[] = [{ name: 'worker', rootDir: '/fake/worker/.state3' }];
   const opened: string[] = [];
   const resolver = createProjectResolver(asPort(primary), projects, (rootDir) => {
     opened.push(rootDir);
@@ -332,7 +345,7 @@ describe('task_start', () => {
     expect(result.ok).toBe(true);
     expect(result.isError).toBeUndefined();
     expect(store.calledWith('start')).toEqual(['ship the MCP server', { plan: ['a', 'b'] }]);
-    expect(result.content).toContain('Started task task-1 [dev-task] at .skillstate/task-1.json.');
+    expect(result.content).toContain('Started task task-1 [dev-task] at .state3/task-1.json.');
     expect(result.content).toContain('Task task-1 [dev-task] (active):');
     expect(result.content).toContain('"goal":"ship the MCP server"');
   });
@@ -353,13 +366,24 @@ describe('task_start', () => {
     expect(store.calledWith('start')).toEqual(['ship it', {}]);
   });
 
+  it('forwards the parent and says the subtask is queued rather than in flight', async () => {
+    const { store, call } = setup();
+    const result = await call('task_start', { goal: 'first piece', parent: 'task-0' });
+
+    expect(result.ok).toBe(true);
+    expect(store.calledWith('start')).toEqual(['first piece', { parent: 'task-0' }]);
+    expect(result.content).toContain('Queued as a subtask of task-0');
+    // Patching Σ after every step is advice for the work in flight, not for the queue behind it.
+    expect(result.content).not.toContain('Keep this state current');
+  });
+
   it('forwards the skill and gives the task its own Σ and header', async () => {
     const { store, call } = setup();
     const result = await call('task_start', { goal: 'review the worker', skill: 'supervise-task' });
     expect(result.ok).toBe(true);
     expect(store.calledWith('start')).toEqual(['review the worker', { skill: 'supervise-task' }]);
     expect(result.content).toContain(
-      'Started task task-1 [supervise-task] at .skillstate/task-1.json.',
+      'Started task task-1 [supervise-task] at .state3/task-1.json.',
     );
     expect(result.content).toContain('Task task-1 [supervise-task] (active):');
     expect(jsonLine(result.content)).toContain('"rounds":[]');
@@ -456,6 +480,22 @@ describe('task_show', () => {
     expect(jsonLine(result.content)).toContain('"status":"active"');
   });
 
+  it('answers view tree with the decomposition, and with neither Σ nor the procedure', async () => {
+    const { store, call } = setup();
+    await store.start('ship the release');
+    await store.start('first piece', { parent: 'task-1' });
+
+    const result = await call('task_show', { id: 'task-1', view: 'tree' });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('ship the release');
+    expect(result.content).toContain('first piece');
+    expect(result.content).toContain('(1 subtask, 1 open)');
+    // The point of the view: it answers about the tree, so it costs no state and no procedure.
+    expect(result.content).not.toContain('"goal":');
+    expect(result.content).not.toContain('How to keep this state');
+  });
+
   it('passes an explicit id to the store', async () => {
     const { store, call } = setup();
     await store.start('first');
@@ -489,7 +529,7 @@ describe('task_show', () => {
     await store.start('ship it');
     const result = await call('task_show', {});
     expect(result.ok).toBe(true);
-    expect(result.content).toMatch(/runtime: skillstate \S+ \(/);
+    expect(result.content).toMatch(/runtime: state3 \S+ \(/);
   });
 
   it('leaves the runtime line out of the size view, which answers about Σ alone', async () => {
@@ -497,7 +537,7 @@ describe('task_show', () => {
     await store.start('ship it');
     const result = await call('task_show', { view: 'size' });
     expect(result.ok).toBe(true);
-    expect(result.content).not.toContain('runtime: skillstate');
+    expect(result.content).not.toContain('runtime: state3');
   });
 
   it('names the artifacts the disk disagrees with, under the Σ that describes them', async () => {
@@ -537,7 +577,7 @@ describe('task_show', () => {
     expect(result.isError).toBe(true);
     expect(result.content).toContain('no active task');
     expect(result.content).toContain('task_start');
-    expect(result.content).toContain('(state root: /fake/project/.skillstate)');
+    expect(result.content).toContain('(state root: /fake/project/.state3)');
   });
 
   it('fails for an unknown id', async () => {
@@ -904,7 +944,7 @@ describe('task_list', () => {
   it('names the build that answered, so a host serving stale code is visible', async () => {
     const { call } = setup();
     const result = await call('task_list', {});
-    expect(result.content).toMatch(/runtime: skillstate \S+ \(/);
+    expect(result.content).toMatch(/runtime: state3 \S+ \(/);
   });
 
   it('omits the skills line when the store does not expose skillNames', async () => {
@@ -917,7 +957,7 @@ describe('task_list', () => {
   it('appends the declared projects as a capability line', async () => {
     const { call } = setupProjects();
     const result = await call('task_list', {});
-    expect(result.content).toContain('projects: worker (/fake/worker/.skillstate)');
+    expect(result.content).toContain('projects: worker (/fake/worker/.state3)');
     expect(result.content).toContain('skills: dev-task, supervise-task');
   });
 
@@ -932,7 +972,7 @@ describe('task_list', () => {
   it('names the state root in an empty list so a wrong host cwd is visible', async () => {
     const { call } = setup();
     const result = await call('task_list', {});
-    expect(result.content).toContain('no tasks (state root: /fake/project/.skillstate)');
+    expect(result.content).toContain('no tasks (state root: /fake/project/.state3)');
   });
 
   it('reports a store failure as an error result', async () => {
@@ -1082,7 +1122,7 @@ describe('the project argument', () => {
     const { primary, worker, opened, call } = setupProjects();
     const result = await call('task_start', { goal: 'follow the worker', project: 'worker' });
     expect(result.ok).toBe(true);
-    expect(opened).toEqual(['/fake/worker/.skillstate']);
+    expect(opened).toEqual(['/fake/worker/.state3']);
     expect(worker.tasks).toHaveLength(1);
     expect(primary.tasks).toHaveLength(0);
     expect(primary.callCount('start')).toBe(0);
@@ -1121,7 +1161,7 @@ describe('the project argument', () => {
     expect(result.ok).toBe(false);
     expect(result.isError).toBe(true);
     expect(result.content).toContain('unknown project "nope"');
-    expect(result.content).toContain('worker (/fake/worker/.skillstate)');
+    expect(result.content).toContain('worker (/fake/worker/.state3)');
     expect(primary.callCount('list')).toBe(0);
     expect(worker.callCount('list')).toBe(0);
   });
@@ -1138,7 +1178,7 @@ describe('the project argument', () => {
     const { call } = setupProjects();
     const result = await call('task_show', { project: 'worker' });
     expect(result.ok).toBe(false);
-    expect(result.content).toContain('(state root: /fake/worker/.skillstate)');
+    expect(result.content).toContain('(state root: /fake/worker/.state3)');
   });
 });
 

@@ -13,8 +13,8 @@ import {
 import { createProjectResolver } from '../../src/tasks/projects.js';
 import { TaskStore } from '../../src/tasks/store.js';
 
-const STATE_DIR_VAR = 'SKILLSTATE_STATE_DIR';
-const PROJECTS_VAR = 'SKILLSTATE_PROJECTS';
+const STATE_DIR_VAR = 'STATE3_STATE_DIR';
+const PROJECTS_VAR = 'STATE3_PROJECTS';
 
 /** What `client.callTool` resolves to in this SDK version. */
 type CallResult = Awaited<ReturnType<Client['callTool']>>;
@@ -38,22 +38,22 @@ afterEach(() => {
 });
 
 describe('parseServerArgs', () => {
-  it('defaults to .skillstate in the current directory', () => {
+  it('defaults to .state3 in the current directory', () => {
     expect(parseServerArgs([])).toEqual({
-      root: resolve('.skillstate'),
+      root: resolve('.state3'),
       projects: [],
       help: false,
     });
   });
 
   it('takes the state directory from the environment when the host starts us outside the project', () => {
-    process.env[STATE_DIR_VAR] = 'D:/somewhere/else/.skillstate';
-    expect(parseServerArgs([]).root).toBe(resolve('D:/somewhere/else/.skillstate'));
+    process.env[STATE_DIR_VAR] = 'D:/somewhere/else/.state3';
+    expect(parseServerArgs([]).root).toBe(resolve('D:/somewhere/else/.state3'));
   });
 
   it('ignores a blank environment override', () => {
     process.env[STATE_DIR_VAR] = '   ';
-    expect(parseServerArgs([]).root).toBe(resolve('.skillstate'));
+    expect(parseServerArgs([]).root).toBe(resolve('.state3'));
   });
 
   it('lets --root win over the environment', () => {
@@ -73,7 +73,7 @@ describe('parseServerArgs', () => {
 
   it('collects --project declarations raw and in order, leaving them unresolved', () => {
     expect(parseServerArgs(['--project', 'worker=state/worker'])).toEqual({
-      root: resolve('.skillstate'),
+      root: resolve('.state3'),
       projects: ['worker=state/worker'],
       help: false,
     });
@@ -242,8 +242,8 @@ describe('createMcpServer over an in-memory transport', () => {
 
   beforeEach(async () => {
     stores = [];
-    primaryRoot = await mkdtemp(resolve(tmpdir(), 'skillstate-primary-'));
-    workerRoot = await mkdtemp(resolve(tmpdir(), 'skillstate-worker-'));
+    primaryRoot = await mkdtemp(resolve(tmpdir(), 'state3-primary-'));
+    workerRoot = await mkdtemp(resolve(tmpdir(), 'state3-worker-'));
   });
 
   afterEach(async () => {

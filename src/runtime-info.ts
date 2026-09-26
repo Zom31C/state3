@@ -83,10 +83,10 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
   return { version: await packageVersion(), loadedFrom, staleBuild };
 }
 
-/** One line for tool output: `runtime: skillstate 0.1.0 (D:\…\dist)`. */
+/** One line for tool output: `runtime: state3 0.1.0 (D:\…\dist)`. */
 export function formatRuntimeInfo(info: RuntimeInfo): string {
   const stale = info.staleBuild
     ? `${info.loadedFrom} — STALE: src is newer than this build; rebuild and restart the host`
     : info.loadedFrom;
-  return `runtime: skillstate ${info.version} (${stale})`;
+  return `runtime: state3 ${info.version} (${stale})`;
 }

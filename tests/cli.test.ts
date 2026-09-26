@@ -137,7 +137,7 @@ describe('parseArgs', () => {
 });
 
 describe('runEpisode', () => {
-  it('scores 1.0 accuracy against the skillstate oracle provider', async () => {
+  it('scores 1.0 accuracy against the state3 oracle provider', async () => {
     const env = new WarehouseEnv({ horizon: 5, seed: 42 });
     const provider = makePatchOracleProvider(env);
 
@@ -147,7 +147,7 @@ describe('runEpisode', () => {
     );
 
     expect(report.skill).toBe('warehouse');
-    expect(report.runtime).toBe('skillstate');
+    expect(report.runtime).toBe('state3');
     expect(report.provider).toBe('oracle');
     expect(report.metrics.accuracy).toBe(1);
     expect(report.metrics.judged).toBe(5);

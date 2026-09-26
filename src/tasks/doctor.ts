@@ -8,6 +8,7 @@ import type { SqlDatabase } from '../db/database.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
 import { describeDrift, driftedArtifacts, storedArtifactStamps } from './artifact-stamps.js';
 import { readLegacyRoot } from './legacy.js';
+import { pendingLegacyRoot, readMigrationMarker } from './migrate-root.js';
 import { builtinSkillRegistry } from './registry.js';
 import type { SkillRegistry } from './registry.js';
 
@@ -81,11 +82,35 @@ export async function inspectStateRoot(
       severity: 'warn',
       text:
         `${legacy.records.length} legacy JSON task record(s) are still in this root — ` +
-        'run `skillstate task migrate` to move them into the database',
+        'run `state3 task migrate` to move them into the database',
     });
   }
   for (const bad of legacy.unreadable) {
     findings.push({ severity: 'warn', text: `unreadable legacy file ${bad.file}: ${bad.reason}` });
+  }
+
+  // Both halves of the rename, reported rather than acted on: doctor changes nothing, so a
+  // carry-over that has not happened yet is a finding, and one that has is a provenance.
+  const carriedFrom = readMigrationMarker(rootDir);
+  if (carriedFrom !== null) {
+    findings.push({
+      severity: 'ok',
+      text:
+        `this root was carried over from the pre-rename name ${carriedFrom.from}` +
+        `${carriedFrom.at === '' ? '' : ` at ${carriedFrom.at}`}; the old root was left in place`,
+    });
+  }
+  const pending = pendingLegacyRoot(rootDir);
+  if (pending !== null) {
+    findings.push({
+      severity: 'warn',
+      text: pending.inUse
+        ? `a pre-rename root at ${pending.from} still has an open database connection, so it was ` +
+          'NOT carried over here: end the session that predates the rename, then run any state3 ' +
+          'command again'
+        : `a pre-rename root at ${pending.from} has not been carried over yet; the next state3 ` +
+          'command that opens this root copies it here',
+    });
   }
 
   const report: DoctorReport = {
@@ -264,7 +289,7 @@ export async function inspectStateRoot(
 
   // A read-only connection cannot delete the WAL siblings when it closes, so a purely
   // diagnostic command would leave the root with MORE files than it found. Fold them back
-  // — but only once this is confirmed to be a skillState database at the version this build
+  // — but only once this is confirmed to be a state3 database at the version this build
   // writes, so `doctor` never touches a foreign SQLite file it was pointed at by mistake.
   if (report.schemaVersion === SCHEMA_VERSION && report.integrity === 'ok') {
     try {

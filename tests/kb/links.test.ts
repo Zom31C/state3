@@ -13,7 +13,7 @@ let pages: PageStore;
 let links: LinkStore;
 
 beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'skillstate-links-'));
+  dir = await mkdtemp(path.join(tmpdir(), 'state3-links-'));
   tasks = new TaskStore(dir);
   pages = new PageStore(tasks);
   links = new LinkStore(tasks);

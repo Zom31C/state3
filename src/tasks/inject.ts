@@ -7,6 +7,7 @@ import { STATE_DB_FILENAME, openStateDatabase } from '../db/database.js';
 import type { SqlDatabase } from '../db/database.js';
 import { renderDatabaseBrief } from '../kb/brief.js';
 import { driftedArtifacts, driftWarnings, storedArtifactStamps } from './artifact-stamps.js';
+import { migrateLegacyStateRoot, rootMigrationNote } from './migrate-root.js';
 import { DEFAULT_NOTATION, isNotation } from './notation.js';
 import { renderTaskBrief, renderTaskHead } from './render.js';
 import { RISK_LEVELS } from './schema.js';
@@ -39,7 +40,7 @@ export interface InjectionOptions {
   brief?: boolean;
   /**
    * Render the task as the few lines a delegated subagent needs instead of Σ. A subagent has no
-   * transcript and usually no skillstate tools, so it needs to know a task exists and which step
+   * transcript and usually no state3 tools, so it needs to know a task exists and which step
    * is in flight — not the whole state, which it would pay for on every one of its turns. The
    * full Σ and the procedure stay behind `task_show`.
    */
@@ -62,23 +63,160 @@ interface CandidateRow {
   state: string;
   created_at: string;
   updated_at: string;
+  parent: string | null;
+  goal: string;
+  status: string;
+  /** `rowid`: the insertion order that puts same-millisecond siblings back in queue order. */
+  seq: number;
 }
 
-function candidateSql(where: string): string {
-  return `SELECT id, skill, notation, state, created_at, updated_at FROM task
-          WHERE ${where} ORDER BY updated_at DESC, id DESC LIMIT 1`;
+const CANDIDATE_COLUMNS =
+  'id, skill, notation, state, created_at, updated_at, parent, goal, status, rowid AS seq';
+
+/**
+ * The order the injection and the tools agree on: the work in flight, then the work that
+ * stalled, then the queue behind it.
+ *
+ * Mirrors `pickFrontier` in src/tasks/store.ts. The rule lives twice — there as a sort over
+ * summaries, here as a query — because a hook runs on every prompt and cannot afford to
+ * deserialize every task in the project to find the one it needs. The tiebreak differs by rank
+ * for the reason given there: a queued subtask nobody has touched waits behind its older
+ * siblings, while a task somebody was in the middle of is found by when it was last touched.
+ */
+const FRONTIER_ORDER = `CASE status WHEN 'active' THEN 0 WHEN 'blocked' THEN 1
+              WHEN 'pending' THEN 2 ELSE 3 END,
+         CASE WHEN status = 'pending' THEN created_at END,
+         CASE WHEN status = 'pending' THEN rowid END,
+         updated_at DESC, id DESC`;
+
+/**
+ * The task a hook injects: the piece of open work at the frontier — nothing open underneath it
+ * — that the order above picks first.
+ *
+ * The `NOT EXISTS` is what the tree costs here and what it buys everywhere else: a task that has
+ * been split is a container, and injecting it would put the decomposition in the prompt instead
+ * of the work, which is the thing splitting it was supposed to stop.
+ */
+function pickCandidate(db: SqlDatabase): CandidateRow | null {
+  const frontier = db
+    .prepare(
+      `SELECT ${CANDIDATE_COLUMNS} FROM task
+       WHERE status <> 'done'
+         AND NOT EXISTS (SELECT 1 FROM task AS c WHERE c.parent = task.id AND c.status <> 'done')
+       ORDER BY ${FRONTIER_ORDER}
+       LIMIT 1`,
+    )
+    .get() as CandidateRow | undefined;
+  if (frontier !== undefined) return frontier;
+
+  // An open task exists but no frontier does: a cycle in `parent`, which is corrupt data rather
+  // than anything a sequence of calls can produce. Falling back to the flat answer keeps Σ in
+  // the prompt, which is what a session resuming this project needs, and leaves the tree to
+  // `doctor` to report.
+  const open = db
+    .prepare(
+      `SELECT ${CANDIDATE_COLUMNS} FROM task
+       WHERE status <> 'done'
+       ORDER BY ${FRONTIER_ORDER}
+       LIMIT 1`,
+    )
+    .get() as CandidateRow | undefined;
+  return open ?? null;
+}
+
+/** One row of the branch the task in flight sits on. */
+interface BranchRow {
+  id: string;
+  goal: string;
+  status: string;
+  parent: string | null;
+  created_at: string;
 }
 
 /**
- * The task a hook injects: the most recently updated open one, `active` first.
- * Mirrors TaskStore.activeId(), but as two indexed queries — a hook runs on every prompt
- * and must not deserialize every task in the project to find the one it needs.
+ * The chain from the root task down to this one, root first.
+ *
+ * Walked one query per level rather than loaded whole: a decomposition is a handful of levels
+ * deep while a project can hold hundreds of tasks, and this runs on every prompt.
  */
-function pickCandidate(db: SqlDatabase): CandidateRow | null {
-  const active = db.prepare(candidateSql(`status = 'active'`)).get() as CandidateRow | undefined;
-  if (active !== undefined) return active;
-  const open = db.prepare(candidateSql(`status <> 'done'`)).get() as CandidateRow | undefined;
-  return open ?? null;
+function branchOf(db: SqlDatabase, id: string): BranchRow[] {
+  const branch: BranchRow[] = [];
+  const seen = new Set<string>();
+  let current: string | null = id;
+  // `seen` rather than a depth limit: the walk ends at the root in a well-formed tree and at
+  // the first repeated id in a corrupt one, and neither needs a constant to be safe.
+  while (current !== null && !seen.has(current)) {
+    seen.add(current);
+    const row = db
+      .prepare('SELECT id, goal, status, parent, created_at FROM task WHERE id = ?')
+      .get(current) as BranchRow | undefined;
+    if (row === undefined) break;
+    branch.unshift(row);
+    current = row.parent;
+  }
+  return branch;
+}
+
+/**
+ * The subtasks of the same parent still to come after this one, in the order they were split.
+ *
+ * Compared on `created_at` and then on `rowid`, which is `queueOrder` in src/tasks/store.ts as
+ * SQL: a timestamp has millisecond resolution, and an agent that splits a job into three pieces
+ * usually does it inside one millisecond, so the insertion order is what makes "the next one"
+ * mean the next one.
+ */
+function queuedAfter(db: SqlDatabase, row: CandidateRow): BranchRow[] {
+  if (row.parent === null) return [];
+  return db
+    .prepare(
+      `SELECT id, goal, status, parent, created_at FROM task
+       WHERE parent = ? AND id <> ? AND status <> 'done'
+         AND (created_at > ? OR (created_at = ? AND rowid > ?))
+       ORDER BY created_at, rowid`,
+    )
+    .all(row.parent, row.id, row.created_at, row.created_at, row.seq) as BranchRow[];
+}
+
+/**
+ * Where the task in flight sits in the decomposition, as at most two lines.
+ *
+ * Splitting work into subtasks is worth exactly what it stops costing: the queue no longer
+ * rides along in Σ on every prompt. So what the prompt owes the branch is orientation — which
+ * larger job this step belongs to, and that something follows — and not the queue itself.
+ * Naming the next sibling is what lets a session that just finished one pick up the following
+ * one without spending a call; the rest are a count, because their goals are text no action of
+ * this turn reads.
+ *
+ * `queue` is off for a delegated subagent: it was handed one piece of work and must not start
+ * the next one, so telling it what comes next is an invitation it should not be given.
+ *
+ * Never throws. These lines annotate Σ, and losing the state to a failure in its annotations
+ * is the wrong trade — least of all on a prompt where Σ is all the session has.
+ */
+function branchLines(db: SqlDatabase, row: CandidateRow, queue: boolean): string[] {
+  const lines: string[] = [];
+  try {
+    const branch = branchOf(db, row.id);
+    if (branch.length > 1) {
+      const path = branch.map((task, index) =>
+        index === branch.length - 1 ? 'this task' : `${task.goal} [${task.status}]`,
+      );
+      lines.push(`Branch: ${path.join(' -> ')}`);
+    }
+    if (queue !== true) return lines;
+
+    const queued = queuedAfter(db, row);
+    const next = queued[0];
+    if (next === undefined) return lines;
+    const rest = queued.length - 1;
+    lines.push(
+      `Queued after this: "${next.goal}" (${next.id})` +
+        `${rest === 0 ? '' : ` + ${rest} more`} — task_list prints the tree.`,
+    );
+  } catch {
+    return lines.filter((line) => line.startsWith('Branch:'));
+  }
+  return lines;
 }
 
 function message(err: unknown): string {
@@ -113,7 +251,7 @@ function readTaskHead(
   dbPath: string,
   rootDir: string,
   render: (task: StoredTask) => string,
-  drift: boolean,
+  options: { drift: boolean; queue: boolean },
 ): TaskHead {
   const row = pickCandidate(db);
   if (row === null) return { text: null, risk: null, unreadable: null };
@@ -139,16 +277,16 @@ function readTaskHead(
     path: dbPath,
     skill: row.skill,
     notation: isNotation(row.notation) ? row.notation : DEFAULT_NOTATION,
+    parent: row.parent,
   };
   const state = parsed as StateDict;
   const task: StoredTask = { meta, state };
-  const lines = drift ? driftLines(db, row.id, state, rootDir) : [];
-  const text = render(task);
-  return {
-    text: lines.length === 0 ? text : `${text}\n${lines.join('\n')}`,
-    risk: riskOf(state),
-    unreadable: null,
-  };
+  // Above Σ rather than below it: the branch says which piece of a larger job the state below
+  // describes, and a resumed session reads top to bottom.
+  const branch = branchLines(db, row, options.queue);
+  const drift = options.drift ? driftLines(db, row.id, state, rootDir) : [];
+  const text = [...branch, render(task), ...drift].join('\n');
+  return { text, risk: riskOf(state), unreadable: null };
 }
 
 /**
@@ -169,7 +307,22 @@ function driftLines(db: SqlDatabase, taskId: string, state: StateDict, rootDir: 
 }
 
 /**
- * Reads the injection for one state root, without ever writing to it.
+ * Carries a pre-rename state root over and returns the line worth reporting, or null.
+ *
+ * Exported beside `readInjection` because the two standalone halves — the Qwen Code hook and
+ * the opencode plugin — both decide whether a root holds a database *before* they call into
+ * this build, so neither would reach the carry-over inside `readInjection` on the one run
+ * where it matters: the first.
+ */
+export function carryOverStateRoot(rootDir: string): string | null {
+  return rootMigrationNote(migrateLegacyStateRoot(rootDir));
+}
+
+/**
+ * Reads the injection for one state root, without ever writing to the state it reads.
+ *
+ * The one thing it does write is the carry-over of a pre-rename root, which copies files into
+ * a root that by definition holds no database yet — see `carryOverStateRoot`.
  *
  * This is the compiled half of the `inject-state` hook: the hook itself is a standalone
  * script, and reading a SQLite file needs the driver, so it resolves the repository and
@@ -180,10 +333,18 @@ function driftLines(db: SqlDatabase, taskId: string, state: StateDict, rootDir: 
  * session is trying to resume; the tools still refuse to *patch* what they cannot validate.
  */
 export function readInjection(rootDir: string, options: InjectionOptions = {}): Injection {
+  // Before the existence check: a root with no database may still have a pre-rename neighbour
+  // holding the project's whole history, and reading that root as empty is what would send a
+  // session off to redo finished work.
+  const carried = carryOverStateRoot(rootDir);
   const dbPath = join(rootDir, STATE_DB_FILENAME);
   // Checked before opening: without a database there is nothing to read, and reporting
-  // "unreadable" here would make the hook warn about a root that is simply empty.
-  if (!existsSync(dbPath)) return { kind: 'none' };
+  // "unreadable" here would make the hook warn about a root that is simply empty. A refused
+  // carry-over is the exception — the state exists, it only could not be moved, and answering
+  // "nothing here" would be the one silently wrong answer this function can give.
+  if (!existsSync(dbPath)) {
+    return carried === null ? { kind: 'none' } : { kind: 'unreadable', reason: carried };
+  }
 
   let db: SqlDatabase;
   try {
@@ -206,9 +367,14 @@ export function readInjection(rootDir: string, options: InjectionOptions = {}): 
         : // A prompt is not a read: it carries Σ on every turn of the task, so it drops the
           // archived steps and, above the threshold, everything but the step in flight.
           (task) => renderTaskHead(task, { injected: true }),
-      // Not for a subagent: it gets an orientation rather than Σ, and the artifacts of a task
-      // it does not own are context it cannot act on.
-      options.drift === true && options.subagent !== true,
+      {
+        // Not for a subagent: it gets an orientation rather than Σ, and the artifacts of a task
+        // it does not own are context it cannot act on.
+        drift: options.drift === true && options.subagent !== true,
+        // Nor the queue behind it: a delegated agent was handed one piece of the work and must
+        // not start the next one on its own.
+        queue: options.subagent !== true,
+      },
     );
     if (head.unreadable !== null) return { kind: 'unreadable', reason: head.unreadable };
     const brief = options.brief === true ? renderDatabaseBrief(db) : null;

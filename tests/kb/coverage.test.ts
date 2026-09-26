@@ -31,13 +31,13 @@ async function commit(file: string, contents: string, message: string): Promise<
   await mkdir(path.dirname(path.join(project, file)), { recursive: true });
   await writeFile(path.join(project, file), contents, 'utf8');
   git('add', file);
-  git('-c', 'user.email=test@skillstate', '-c', 'user.name=test', 'commit', '-q', '-m', message);
+  git('-c', 'user.email=test@state3', '-c', 'user.name=test', 'commit', '-q', '-m', message);
 }
 
 beforeEach(async () => {
-  project = await mkdtemp(path.join(tmpdir(), 'skillstate-coverage-'));
+  project = await mkdtemp(path.join(tmpdir(), 'state3-coverage-'));
   git('init', '-q');
-  tasks = new TaskStore(path.join(project, '.skillstate'));
+  tasks = new TaskStore(path.join(project, '.state3'));
   pages = new PageStore(tasks);
 });
 
@@ -158,8 +158,8 @@ describe('PageStore.coverage', () => {
 
   it('reports no repository rather than an empty list, which would read as full coverage', async () => {
     // The state root of a project that is not a repository: `git ls-files` has no answer.
-    const outside = await mkdtemp(path.join(tmpdir(), 'skillstate-norepo-'));
-    const store = new TaskStore(path.join(outside, '.skillstate'));
+    const outside = await mkdtemp(path.join(tmpdir(), 'state3-norepo-'));
+    const store = new TaskStore(path.join(outside, '.state3'));
     try {
       const report = new PageStore(store).coverage();
       expect(report.tracked).toBeNull();

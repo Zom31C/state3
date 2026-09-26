@@ -23,7 +23,7 @@ let tasks: TaskStore;
 let pages: PageStore;
 
 beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'skillstate-templates-'));
+  dir = await mkdtemp(path.join(tmpdir(), 'state3-templates-'));
   tasks = new TaskStore(dir);
   pages = new PageStore(tasks);
 });
@@ -107,7 +107,7 @@ describe('initPages', () => {
     pages.put({
       id: 'project',
       kind: 'project',
-      title: 'skillState',
+      title: 'state3',
       summary: 'External validated task state.',
       body: 'The real description.',
       status: 'current',
@@ -143,7 +143,7 @@ describe('initPages', () => {
   });
 
   it('creates a knowledge base in a root that had nothing but an empty directory', async () => {
-    const empty = await mkdtemp(path.join(tmpdir(), 'skillstate-templates-empty-'));
+    const empty = await mkdtemp(path.join(tmpdir(), 'state3-templates-empty-'));
     const owner = new TaskStore(empty);
     try {
       expect(initPages(new PageStore(owner)).created).toHaveLength(3);

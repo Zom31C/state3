@@ -3,7 +3,7 @@ import { z, type ZodType } from 'zod';
 import {
   buildMemoryRuntimePrompt,
   buildPromptRuntimePrompt,
-  buildSkillStatePrompt,
+  buildState3Prompt,
   buildStatefulRuntimePrompt,
   compactState,
   formatTranscript,
@@ -34,7 +34,7 @@ const entryB: TranscriptEntry = {
   action: 'pick widget',
 };
 
-describe('buildSkillStatePrompt (A.4)', () => {
+describe('buildState3Prompt (A.4)', () => {
   it('renders the full SKILL.state prompt verbatim', () => {
     const expected = `You are a warehouse robot.
 
@@ -57,11 +57,11 @@ Respond exactly in the following format:
 - Set a key to null to delete it from the state
 - action is a single valid action allowed in the skill environment`;
 
-    expect(buildSkillStatePrompt(skill, state, observation)).toBe(expected);
+    expect(buildState3Prompt(skill, state, observation)).toBe(expected);
   });
 
   it('serializes the state compactly right after the label', () => {
-    const out = buildSkillStatePrompt(skill, state, observation);
+    const out = buildState3Prompt(skill, state, observation);
 
     expect(out).toContain('Skill Execution State:\n{"shelf_0":null,"shelf_1":"widget"}');
     expect(out).not.toContain('"shelf_0": null');

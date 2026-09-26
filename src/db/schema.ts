@@ -1,5 +1,5 @@
 /**
- * The single-file schema. One `.skillstate/state.db` holds everything skillState
+ * The single-file schema. One `.state3/state.db` holds everything state3
  * knows about a project: task states Σ, their audit trail, and the knowledge base
  * (Confluence-like pages) that lets a context-free agent orient itself.
  *
@@ -17,11 +17,11 @@
 
 /**
  * Schema version this build creates and expects, stored in `PRAGMA user_version`.
- * A database with a HIGHER version is refused (fail closed): a newer skillState
+ * A database with a HIGHER version is refused (fail closed): a newer state3
  * wrote it, and this build cannot know what it must preserve. A LOWER version is
  * migrated forward by `MIGRATIONS` below.
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /**
  * Previous bodies of a page, newest last, kept by the write path in `PageStore`.
@@ -174,6 +174,23 @@ const SEARCH_SYMBOLS_SQL: readonly string[] = [
   ...SEARCH_REINDEX_SQL,
 ];
 
+/**
+ * The task this one was split out of.
+ *
+ * A flat `plan` inside one Σ can only grow: every step still queued is carried on every
+ * prompt of the task, whether or not the next action reads it. Making the decomposition a
+ * tree of tasks instead puts the queue in rows nobody injects — one Σ per piece of work, and
+ * the prompt carries the branch from the root to the step actually in flight.
+ *
+ * `SET NULL` rather than `CASCADE`, matching `page.parent`: a piece of work that outlives the
+ * decomposition it was filed under is still a piece of work, and orphans are visible to
+ * `doctor`, where a cascade would have been silent data loss.
+ */
+const TASK_PARENT_SQL: readonly string[] = [
+  `ALTER TABLE task ADD COLUMN parent TEXT REFERENCES task (id) ON DELETE SET NULL`,
+  `CREATE INDEX IF NOT EXISTS task_parent ON task (parent)`,
+];
+
 /** Statements run in order, inside one transaction, to create the current version. */
 export const SCHEMA_SQL: readonly string[] = [
   // Free-form per-project settings and counters that do not deserve a table.
@@ -192,13 +209,17 @@ export const SCHEMA_SQL: readonly string[] = [
     progress_done  INTEGER NOT NULL DEFAULT 0,
     progress_total INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL
+    updated_at     TEXT NOT NULL,
+    parent         TEXT REFERENCES task (id) ON DELETE SET NULL
   )`,
 
   // `updated_at DESC, id DESC` makes "most recently updated open task" deterministic
   // even when two writes land in the same millisecond.
   `CREATE INDEX IF NOT EXISTS task_recent ON task (updated_at DESC, id DESC)`,
   `CREATE INDEX IF NOT EXISTS task_status ON task (status)`,
+  // The tree: what a decomposition was split into, asked on every prompt that has to find the
+  // active leaf and the branch above it.
+  `CREATE INDEX IF NOT EXISTS task_parent ON task (parent)`,
 
   // Replaces the per-task `*.history.jsonl` sidecar. Rejected patches are stored
   // too: the audit trail has to show what did NOT apply, and why.
@@ -276,6 +297,8 @@ export const MIGRATIONS: ReadonlyMap<number, readonly string[]> = new Map([
   [4, PAGE_SYMBOLS_SQL],
   // 5 -> 6: the search index gained that column, which an FTS5 table cannot do in place.
   [5, SEARCH_SYMBOLS_SQL],
+  // 6 -> 7: tasks gained the parent they were split out of, so a queue stops riding in Σ.
+  [6, TASK_PARENT_SQL],
 ]);
 
 /** Tables `doctor` checks for dangling `link` edges. */

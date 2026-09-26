@@ -10,9 +10,9 @@ const dirs: string[] = [];
 const open: SqlDatabase[] = [];
 
 function tempFile(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'skillstate-db-'));
+  const dir = mkdtempSync(join(tmpdir(), 'state3-db-'));
   dirs.push(dir);
-  return join(dir, '.skillstate', 'state.db');
+  return join(dir, '.state3', 'state.db');
 }
 
 function track(db: SqlDatabase): SqlDatabase {
@@ -117,7 +117,7 @@ describe('openStateDatabase', () => {
     expect(db.prepare('SELECT id FROM task').all()).toEqual([]);
   });
 
-  it('refuses a database written by a newer skillState instead of downgrading it', () => {
+  it('refuses a database written by a newer state3 instead of downgrading it', () => {
     const file = tempFile();
     const db = track(openStateDatabase(file));
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
@@ -129,7 +129,7 @@ describe('openStateDatabase', () => {
   });
 
   it('reports a missing database as a schema error when opened read-only', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'skillstate-db-ro-'));
+    const dir = mkdtempSync(join(tmpdir(), 'state3-db-ro-'));
     dirs.push(dir);
     expect(() => track(openStateDatabase(join(dir, 'absent.db'), { readOnly: true }))).toThrow(
       DatabaseSchemaError,
@@ -189,11 +189,16 @@ describe('migrating an older database forward', () => {
   /**
    * A database at an older schema version, made by undoing what the later migrations add.
    * The migration path has to be exercised against a file that really is behind, because
-   * every project already using skillState has one.
+   * every project already using state3 has one.
    */
   function databaseAtVersion(file: string, version: number): void {
     const db = track(openStateDatabase(file));
     insertPage(db, 'project', 'Drift Ages', 'A driving game.', 'Physics lives in scripts/.');
+    // The index goes before the column: SQLite will not drop a column an index reads.
+    if (version < 7) {
+      db.exec('DROP INDEX task_parent');
+      db.exec('ALTER TABLE task DROP COLUMN parent');
+    }
     if (version < 6) {
       db.exec('DROP TRIGGER search_task_insert');
       db.exec('DROP TRIGGER search_task_update');
@@ -235,6 +240,11 @@ describe('migrating an older database forward', () => {
     ).not.toThrow();
     // Read rather than written: a stamp row references a task, and this database has none.
     expect(db.prepare('SELECT count(*) AS n FROM artifact_stamp').get()).toEqual({ n: 0 });
+    // Asked the way the injection asks it: a carried-over database has no subtasks, so the
+    // answer is the point — the query only runs at all if the column is really there.
+    expect(db.prepare('SELECT count(*) AS n FROM task WHERE parent IS NOT NULL').get()).toEqual({
+      n: 0,
+    });
   }
 
   it('adds what the new version needs and keeps every row that was there', () => {

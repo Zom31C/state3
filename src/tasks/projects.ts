@@ -41,13 +41,13 @@ export function parseProjectsSpec(spec: string, cwd: string = process.cwd()): Pr
       parsed = JSON.parse(trimmed);
     } catch (err) {
       throw new Error(
-        `SKILLSTATE_PROJECTS looks like JSON but does not parse: ${
+        `STATE3_PROJECTS looks like JSON but does not parse: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
     }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      throw new Error('SKILLSTATE_PROJECTS as JSON must be an object of name -> directory');
+      throw new Error('STATE3_PROJECTS as JSON must be an object of name -> directory');
     }
     for (const [name, dir] of Object.entries(parsed)) {
       if (typeof dir !== 'string') {

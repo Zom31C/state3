@@ -2,7 +2,7 @@ import type { Environment } from '../envs/env.js';
 import type { LLMProvider } from '../llm/provider.js';
 import type { ParsedStep } from './parser.js';
 import { parseStepResponse, ParseError } from './parser.js';
-import { buildSkillStatePrompt } from './prompts.js';
+import { buildState3Prompt } from './prompts.js';
 import type { Skill } from './skill.js';
 import { StateStore } from './state.js';
 import type { StateDict } from './types.js';
@@ -79,7 +79,7 @@ type ApplyResult = { ok: true; parsed: ParsedStep } | { ok: false; error: StepEr
  * prompt (P, Σ, O) → (R, ΔΣ, a) → validate ΔΣ → merge → execute a.
  * Reasoning traces are discarded; the prompt footprint stays O(1) per step.
  */
-export class SkillStateRuntime {
+export class State3Runtime {
   private readonly skill: Skill;
   private readonly env: Environment;
   private readonly provider: LLMProvider;
@@ -126,7 +126,7 @@ export class SkillStateRuntime {
 
   private async runStep(store: StateStore, result: RunResult): Promise<StepRecord> {
     const record: StepRecord = { step: result.steps.length, valid: false, retries: 0, errors: [] };
-    let prompt = buildSkillStatePrompt(this.skill, store.state, this.env.observe());
+    let prompt = buildState3Prompt(this.skill, store.state, this.env.observe());
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       const response = await this.provider.complete(

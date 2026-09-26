@@ -24,13 +24,13 @@ describe('runtimeInfo', () => {
 describe('formatRuntimeInfo', () => {
   it('prints one line naming the version and the build', () => {
     const fresh = { version: '1.2.3', loadedFrom: '/app/dist', staleBuild: false };
-    expect(formatRuntimeInfo(fresh)).toBe('runtime: skillstate 1.2.3 (/app/dist)');
+    expect(formatRuntimeInfo(fresh)).toBe('runtime: state3 1.2.3 (/app/dist)');
   });
 
   it('warns when the sources are newer than the build answering', () => {
     const stale = { version: '1.2.3', loadedFrom: '/app/dist', staleBuild: true };
     const line = formatRuntimeInfo(stale);
-    expect(line).toContain('runtime: skillstate 1.2.3');
+    expect(line).toContain('runtime: state3 1.2.3');
     expect(line).toContain('STALE');
     expect(line).toContain('rebuild');
   });

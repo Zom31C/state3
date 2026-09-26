@@ -1,11 +1,11 @@
-# Working with skillState in this project
+# Working with state3 in this project
 
 Copy this file to the root of your project as `AGENTS.md` (or merge it into the one you
 have), then fill in the last section.
 
 This project keeps its progress and its documentation **outside the conversation**: an
-external task state Σ and a project knowledge base, both in `.skillstate/state.db` (SQLite),
-written through the MCP server `skillstate` and validated on every write. The transcript is
+external task state Σ and a project knowledge base, both in `.state3/state.db` (SQLite),
+written through the MCP server `state3` and validated on every write. The transcript is
 lossy — it gets compacted, and a new session starts empty. Σ and the pages are not.
 
 Two consequences you have to act on:
@@ -22,23 +22,23 @@ here costs tokens on every turn. Keep additions to it short.
 
 ## Tools
 
-Nine, from the MCP server `skillstate`. Hosts prefix them: `mcp__skillstate__task_show` in
-Qwen Code, `skillstate_task_show` in opencode.
+Nine, from the MCP server `state3`. Hosts prefix them: `mcp__state3__task_show` in
+Qwen Code, `state3_task_show` in opencode.
 
 | Tool            | What it is for                                                                                                                                            |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `task_start`    | open Σ for a job: goal, ordered plan, `skill`, `notation`                                                                                                 |
-| `task_show`     | Σ **plus the procedure P** of its skill — the first call after a restart                                                                                  |
+| `task_start`    | open Σ for a job: goal, ordered plan, `skill`, `notation`, and `parent` to split a piece out of the task in flight                                        |
+| `task_show`     | Σ **plus the procedure P** of its skill — the first call after a restart; `{"view":"tree"}` answers with the decomposition under a task, no Σ and no P    |
 | `task_patch`    | the only way Σ changes; send only what changed                                                                                                            |
 | `task_finish`   | close the task with a summary of the outcome                                                                                                              |
-| `task_list`     | tasks, the skills this runtime has, the declared projects, the runtime line                                                                               |
+| `task_list`     | the tree of tasks — indent is depth, a parent counts its subtasks — plus the skills this runtime has, the declared projects, the runtime line             |
 | `task_history`  | audit trail, including rejected patches and why                                                                                                           |
 | `project_brief` | L0 map of the project: one line per page, no bodies, inside a fixed budget                                                                                |
 | `page`          | the knowledge base, chosen by `op`: `get` `put` `patch` `append` `history` `stale` `coverage` `list` `delete` `init` `link` `unlink` `links`              |
 | `search`        | full text over tasks and pages — title, summary, body and a page's `symbols` — best match first, hits with short snippets; a miss names the nearest pages |
 
 Every tool takes an optional `project` — the name of another state root the user declared
-(`SKILLSTATE_PROJECTS`) — which is how a supervising session reads and patches a worker's Σ
+(`STATE3_PROJECTS`) — which is how a supervising session reads and patches a worker's Σ
 in a different directory. Only declared roots are reachable, and an unknown name is an error
 that lists them: never reach for a directory that was not declared, ask the user to declare
 it.
@@ -46,15 +46,15 @@ it.
 Tools name the state root they used (`Started task <id> [<skill>] at <path>`,
 `no tasks (state root: …)`). **If that root is not this project, stop and tell the user.**
 The host starts the server in its own launch directory, which is not necessarily the
-project; `SKILLSTATE_STATE_DIR` pins the right one. Do not create or patch tasks in a
+project; `STATE3_STATE_DIR` pins the right one. Do not create or patch tasks in a
 directory you did not expect.
 
 ## Starting a session (cold start)
 
 Read cheap first, and stop as soon as you know enough to act:
 
-1. The injected blocks — `## Active task state (skillstate)`, `## Project brief (skillstate)`,
-   `## Supervised projects (skillstate)` — are already in your context. Read them before
+1. The injected blocks — `## Active task state (state3)`, `## Project brief (state3)`,
+   `## Supervised projects (state3)` — are already in your context. Read them before
    spending a tool call.
 2. `project_brief` when no brief was injected, or after a long session: the injection is a
    session-start snapshot, so a page written since then is newer than the brief.
@@ -90,9 +90,12 @@ bug fix that needs reproduce → fix → verify.
 - `notation`: `compact` when every injected character counts (a small local model, a very
   long task) — Σ values become one-line pseudocode, symbols instead of prose, paths and
   commands verbatim, and never a compressed-away constraint or failing command.
+- `parent`: the id of the task this job is a piece of. The new task starts `pending`, queued
+  behind the work in flight — see "Splitting work into subtasks" below.
 
-One open task per project. If one already exists, `task_list` then `task_show` — do not start
-a second. A task in `done` cannot be reopened (the guard refuses it): start a new one.
+One task at the frontier: the open one with nothing open underneath it. If work is already open,
+`task_list` then `task_show` — a further piece of it is a subtask, not a second root. A task in
+`done` cannot be reopened (the guard refuses it): start a new one.
 
 ## Keeping Σ current
 
@@ -149,6 +152,27 @@ sit on different sides of that threshold, so a full injection next to a large Σ
 you can check rather than a broken cut to guess about. `task_show {"view":"state"}` still returns
 all of Σ.
 
+## Splitting work into subtasks
+
+**Σ is carried on every prompt, so a queued plan item costs its full text on every turn of the
+step in flight, while a queued subtask costs its parent one line.** `plan` is for the small steps
+of the level you are on; a piece big enough to delegate, or to outlive this session, is a subtask
+— `task_start {"goal":…,"parent":"<this task id>"}`. It starts `pending`, the queue order is the
+order the pieces were created, and the injection names the next one under `Queued after this`. Set
+it `active` in the same patch that closes the piece before it. Statuses are `pending` | `active` |
+`blocked` | `done`.
+
+A prompt carries the **branch**, not the tree: above Σ of the task in flight stand at most two
+lines — `Branch: <root goal> [status] -> … -> this task`, and `Queued after this: "<goal>" (<id>)
+
+- N more`. No sibling's Σ rides along; the queue lives in rows no prompt holds. Tools and the
+injection act on the **frontier**, the open task with nothing open underneath it: a task that has
+been split is a container, its Σ is not injected, and it cannot go to `done`while a subtask is
+open — neither`task_patch`nor`task_finish`will close it. Close a decomposition last: finish or
+skip the subtasks, then the parent, with the outcome of the whole recorded in`decisions`. A
+  subtask cannot be created under a parent that is missing or already closed — decomposing is a
+  claim that the parent is still at work.
+
 ## Delegating to subagents
 
 A subagent is a separate context that is thrown away when it finishes: whatever it learned dies
@@ -157,16 +181,17 @@ undocumented delegation a pure loss.
 
 **One owner of Σ.** The session that delegates owns the state: the subagent reports, the
 orchestrator patches. Two agents patching one Σ is how a plan item gets marked `done` twice, and
-a `guard` rejection is the state telling you it happened. Give a subagent the skillstate tools
+a `guard` rejection is the state telling you it happened. Give a subagent the state3 tools
 only when it _is_ the worker for a step and nothing else patches while it runs — and then give
-it its own root (the `project` argument, `SKILLSTATE_PROJECTS`), not yours.
+it its own root (the `project` argument, `STATE3_PROJECTS`), not yours.
 
 **Brief it; do not hand it the transcript.** A subagent starts with no history. Say what the job
 is, what done looks like, which files are in scope and which are not, and which checks must
-pass. Where the host injects state into subagents, yours will also see the goal, the step in
-flight and the next action with its risk — enough to avoid opening a second task or redoing
-finished work, and deliberately not the whole of Σ, which it would pay for on every one of its
-own turns. Everything specific is still yours to give.
+pass. Where the host injects state into subagents, yours will also see the branch it was split
+from, the goal, the step in flight and the next action with its risk — enough to avoid opening a
+second task or redoing finished work, and deliberately not the whole of Σ, which it would pay for
+on every one of its own turns, nor the piece queued behind it: it was handed one piece, and naming
+the next one is an invitation to start it. Everything specific is still yours to give.
 
 **Take the cheapest agent that can do the job, and the narrowest toolset.** A lookup does not
 need the model you think with. An explicit `tools` allowlist also keeps every declaration the
@@ -278,7 +303,7 @@ not a substitute for asking.
   the next session picks up. "Continue the work" is not a next action;
   `run npm test, expect 0 failures, then patch plan[2] to done` is.
 
-`.skillstate/` is not versioned (it belongs in `.gitignore`): the database is the agent's
+`.state3/` is not versioned (it belongs in `.gitignore`): the database is the agent's
 working memory, the repository is the product.
 
 ## This project

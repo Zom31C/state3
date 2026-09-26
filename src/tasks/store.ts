@@ -10,6 +10,7 @@ import { validatePatch } from '../core/validator.js';
 import { STATE_DB_FILENAME, openStateDatabase } from '../db/database.js';
 import type { SqlDatabase } from '../db/database.js';
 import { readLegacyRoot } from './legacy.js';
+import { migrateLegacyStateRoot, rootMigrationNote } from './migrate-root.js';
 import { DEFAULT_NOTATION, isNotation, notationInstructions, NOTATIONS } from './notation.js';
 import type { Notation } from './notation.js';
 import { composeProcedure } from './procedure.js';
@@ -33,6 +34,8 @@ export interface TaskMeta {
   skill: string;
   /** How Σ values must be written. */
   notation: Notation;
+  /** The task this one was split out of; null for a root task. */
+  parent: string | null;
 }
 
 export interface StoredTask {
@@ -73,8 +76,28 @@ export interface TaskSummary {
   status: string;
   skill: string;
   updatedAt: string;
+  /**
+   * When the task was split out. A tree lists its siblings in the order they were created —
+   * that is the order the work was decomposed in, which `updatedAt` scrambles on the first
+   * patch of the second one.
+   */
+  createdAt: string;
+  /**
+   * Insertion order of the row, as SQLite's `rowid`.
+   *
+   * The tiebreak the queue cannot do without: `createdAt` has millisecond resolution, and an
+   * agent splitting a job into three subtasks lands all three inside one millisecond as often as
+   * not. Without this, "the first piece of work" would be decided by the random suffix of an id,
+   * which is the same as being decided by nothing.
+   */
+  seq: number;
   progressDone: number;
   progressTotal: number;
+  /** The task this one was split out of; null for a root task. */
+  parent: string | null;
+  /** How many tasks were split out of this one, and how many of those are not finished. */
+  subtasks: number;
+  openSubtasks: number;
 }
 
 /** What `start` may be asked for beyond the goal. */
@@ -85,6 +108,12 @@ export interface StartOptions {
   notation?: Notation;
   /** Ordered steps, only for skills whose Σ has a plan array. */
   plan?: readonly string[];
+  /**
+   * Split this task out of another one: the new task becomes its subtask. Omit it for a root
+   * task. The parent must exist and must not be finished — a decomposition nobody is working
+   * on any more has no place to file new work under.
+   */
+  parent?: string;
 }
 
 export class TaskNotFoundError extends Error {
@@ -117,6 +146,9 @@ interface TaskRow {
   progress_total: number;
   created_at: string;
   updated_at: string;
+  parent: string | null;
+  /** `rowid`, selected as `seq`: the insertion order that breaks a same-millisecond tie. */
+  seq: number;
 }
 
 interface HistoryRow {
@@ -125,6 +157,54 @@ interface HistoryRow {
   category: string | null;
   message: string | null;
   patch: string;
+}
+
+/**
+ * Which of several open tasks is the one to act on: the work in flight, then the work that
+ * stalled, then the queue behind it.
+ */
+const STATUS_RANK: Readonly<Record<string, number>> = { active: 0, blocked: 1, pending: 2 };
+
+/**
+ * The order a decomposition reads in: the order its pieces were split out, with the row's
+ * insertion order breaking the tie that a same-millisecond `createdAt` leaves behind.
+ *
+ * Shared by the listing, the subtree walk and the injection's "what comes next", because a queue
+ * that reads in one order and is handed over in another is not a queue.
+ */
+export function queueOrder(a: TaskSummary, b: TaskSummary): number {
+  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+  return a.seq - b.seq;
+}
+
+/**
+ * Which of several open tasks is the one to act on: the work in flight, then the work that
+ * stalled, then the queue behind it.
+ *
+ * The tiebreak inside a rank differs by what the rank means, and that split is the reason the
+ * queue has a rank of its own. A `pending` subtask is one nobody has touched, so it waits behind
+ * its older siblings in `queueOrder`: without that, splitting a job into three subtasks would
+ * hand back the last one created and leave the first two queued forever. An `active` or
+ * `blocked` task is one somebody was in the middle of, so `updatedAt` decides and a resumed
+ * session lands back where it stopped.
+ */
+function pickFrontier(tasks: readonly TaskSummary[]): string | null {
+  const open = tasks.filter((task) => task.status !== 'done');
+  if (open.length === 0) return null;
+
+  const rank = (task: TaskSummary): number => STATUS_RANK[task.status] ?? 3;
+  const ordered = [...open].sort((a, b) => {
+    const byRank = rank(a) - rank(b);
+    if (byRank !== 0) return byRank;
+    if (a.status === 'pending') {
+      if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+      if (a.seq !== b.seq) return a.seq - b.seq;
+    } else if (a.updatedAt !== b.updatedAt) {
+      return a.updatedAt < b.updatedAt ? 1 : -1;
+    }
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  return ordered[0]?.id ?? null;
 }
 
 /**
@@ -144,6 +224,9 @@ export class TaskStore {
 
   private readonly skills: SkillRegistry;
   private handle: SqlDatabase | undefined;
+  /** Whether the pre-rename root was already looked for; one attempt per store. */
+  private rootCarriedOver = false;
+  private carryOverNoteLine: string | null = null;
 
   constructor(rootDir: string, skills: SkillRegistry = builtinSkillRegistry()) {
     this.rootDir = rootDir;
@@ -153,6 +236,26 @@ export class TaskStore {
   /** Absolute path of the database file this store reads and writes. */
   get dbPath(): string {
     return join(this.rootDir, STATE_DB_FILENAME);
+  }
+
+  /**
+   * Carries a pre-rename state root over, at most once per store, and reports what it did.
+   *
+   * Runs before the first read as well as the first write: a session that only reads must not
+   * conclude the project has no state while its whole history sits in the directory this build
+   * no longer looks at by default. The note is kept rather than printed here because a store
+   * has no output channel of its own — the tool layer and the CLI decide where it goes.
+   */
+  private carryOverRoot(): void {
+    if (this.rootCarriedOver) return;
+    this.rootCarriedOver = true;
+    this.carryOverNoteLine = rootMigrationNote(migrateLegacyStateRoot(this.rootDir));
+  }
+
+  /** What carrying the pre-rename root over did, for an entry point to report; null if nothing. */
+  carryOverNote(): string | null {
+    this.carryOverRoot();
+    return this.carryOverNoteLine;
   }
 
   /**
@@ -169,7 +272,10 @@ export class TaskStore {
    * connection, not one per concern.
    */
   database(): SqlDatabase {
-    if (this.handle === undefined) this.handle = openStateDatabase(this.dbPath);
+    if (this.handle === undefined) {
+      this.carryOverRoot();
+      this.handle = openStateDatabase(this.dbPath);
+    }
     return this.handle;
   }
 
@@ -182,6 +288,7 @@ export class TaskStore {
    */
   readable(): SqlDatabase | null {
     if (this.handle !== undefined) return this.handle;
+    this.carryOverRoot();
     if (!existsSync(this.dbPath)) return null;
     return this.database();
   }
@@ -238,6 +345,7 @@ export class TaskStore {
       path: this.dbPath,
       skill: row.skill,
       notation: isNotation(row.notation) ? row.notation : DEFAULT_NOTATION,
+      parent: row.parent ?? null,
     };
   }
 
@@ -317,6 +425,8 @@ export class TaskStore {
       createdAt: string;
       updatedAt: string;
       state: StateDict;
+      /** Only read on insert: where a task sits in the tree does not change afterwards. */
+      parent?: string | null;
     },
   ): void {
     const skill = this.skillFor(row.skill, row.id);
@@ -325,8 +435,8 @@ export class TaskStore {
     const goal = typeof row.state.goal === 'string' ? row.state.goal : '';
 
     db.prepare(
-      `INSERT INTO task (id, skill, notation, status, goal, state, progress_done, progress_total, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO task (id, skill, notation, status, goal, state, progress_done, progress_total, created_at, updated_at, parent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET
          skill = excluded.skill,
          notation = excluded.notation,
@@ -347,6 +457,7 @@ export class TaskStore {
       progress.total,
       row.createdAt,
       row.updatedAt,
+      row.parent ?? null,
     );
   }
 
@@ -367,7 +478,16 @@ export class TaskStore {
       );
     }
 
+    const db = this.database();
+    const parent = this.checkParent(db, options.parent);
+
     const state: StateDict = { ...structuredClone(skill.initialState), goal };
+    // A subtask is queued, not in flight: the piece of work somebody is on already exists — it
+    // is the parent, or the sibling ahead of this one. Two "active" tasks under a decomposition
+    // is exactly what made "which Σ do I patch" ambiguous before there was a queue status.
+    // A skill whose state has no `status` keeps whatever it started with.
+    if (parent !== null && 'status' in state) state.status = 'pending';
+
     const plan = options.plan;
     const newItem = skill.newPlanItem;
     if (plan !== undefined && plan.length > 0) {
@@ -391,7 +511,6 @@ export class TaskStore {
       );
     }
 
-    const db = this.database();
     const now = new Date().toISOString();
     // The id is random, so a collision is possible in principle; the primary key
     // turns it into a retry rather than into a silently overwritten task.
@@ -406,6 +525,7 @@ export class TaskStore {
             createdAt: now,
             updatedAt: now,
             state,
+            parent,
           });
         });
         return this.readTask(id);
@@ -413,6 +533,44 @@ export class TaskStore {
         if (!isUniqueConstraintError(err)) throw err;
       }
     }
+  }
+
+  /**
+   * The task a new one is filed under, checked.
+   *
+   * Both refusals say the same thing from two ends: a decomposition is a claim that the parent
+   * is still being worked, so filing under a finished one — or under an id that was never a
+   * task — would hang the new work off a branch nothing reaches any more.
+   */
+  private checkParent(db: SqlDatabase, parent: string | undefined): string | null {
+    if (parent === undefined || parent.trim() === '') return null;
+    const id = parent.trim();
+    const row = db.prepare('SELECT id, status FROM task WHERE id = ?').get(id) as
+      { id: string; status: string } | undefined;
+    if (row === undefined) {
+      throw new TaskPatchError('guard', `no task with id "${id}" to split this one out of`);
+    }
+    if (row.status === 'done') {
+      throw new TaskPatchError(
+        'guard',
+        `task ${id} is done, so it takes no new subtasks; start a root task instead`,
+      );
+    }
+    return id;
+  }
+
+  /**
+   * Subtasks of a task that are not finished.
+   *
+   * The one number that decides both whether a task is the frontier of the work and whether it
+   * may be closed: a decomposition whose pieces are still open is not finished, whatever its
+   * own Σ says, and it is not where the next action is either.
+   */
+  private openChildCount(db: SqlDatabase, taskId: string): number {
+    const row = db
+      .prepare(`SELECT COUNT(*) AS n FROM task WHERE parent = ? AND status <> 'done'`)
+      .get(taskId) as { n: number } | undefined;
+    return row?.n ?? 0;
   }
 
   async show(id?: string): Promise<StoredTask> {
@@ -461,6 +619,21 @@ export class TaskStore {
     if (!validation.ok) return reject(validation.category, validation.message);
 
     const merged = mergeState(state, expanded.patch);
+
+    // A decomposition is not finished while its pieces are open, whatever its own Σ says. The
+    // skill guard cannot see this — it reads one state, and the subtasks are other rows — and
+    // closing a parent early is what leaves work orphaned: every view that picks a task to
+    // inject walks the tree, so a finished parent hides the open branch under it.
+    if (merged.status === 'done' && state.status !== 'done') {
+      const open = this.openChildCount(db, taskId);
+      if (open > 0) {
+        return reject(
+          'guard',
+          `task ${taskId} has ${open} open subtask(s); finish or skip them before closing it`,
+        );
+      }
+    }
+
     // Stamped before validation, so the stamps are checked like everything else the write
     // produces, and before the transaction, so a refused patch spawns no git subprocess.
     const stamps = stampVerifications(state, merged, () => ({
@@ -531,6 +704,16 @@ export class TaskStore {
     const taskId = id ?? (await this.activeId());
     if (taskId === null) throw new TaskNotFoundError('No active task found');
 
+    // The same rule patch() enforces, on the path that exists to close a task: finishing a
+    // decomposition while its pieces are open is how work disappears from every tree view.
+    const openChildren = this.openChildCount(this.database(), taskId);
+    if (openChildren > 0) {
+      throw new TaskPatchError(
+        'guard',
+        `task ${taskId} has ${openChildren} open subtask(s); finish or skip them before closing it`,
+      );
+    }
+
     const task = this.readTask(taskId);
     const skill = this.skillFor(task.meta.skill, taskId);
     const now = new Date().toISOString();
@@ -594,15 +777,27 @@ export class TaskStore {
       if (legacy.records.length > 0) {
         throw new Error(
           `this state root holds ${legacy.records.length} task record(s) in the legacy JSON ` +
-            `layout and has no database: run \`skillstate task migrate --root ${this.rootDir}\``,
+            `layout and has no database: run \`state3 task migrate --root ${this.rootDir}\``,
         );
       }
       return [];
     }
 
     const rows = db
-      .prepare('SELECT * FROM task ORDER BY updated_at DESC, id DESC')
+      .prepare('SELECT *, rowid AS seq FROM task ORDER BY updated_at DESC, id DESC')
       .all() as TaskRow[];
+
+    // Counted from the rows rather than from the summaries: a subtask whose Σ this runtime
+    // cannot validate is still a piece of open work, and leaving it out of the count is what
+    // would let its parent look finished and get closed over it.
+    const subtasks = new Map<string, { total: number; open: number }>();
+    for (const row of rows) {
+      if (row.parent === null) continue;
+      const entry = subtasks.get(row.parent) ?? { total: 0, open: 0 };
+      entry.total += 1;
+      if (row.status !== 'done') entry.open += 1;
+      subtasks.set(row.parent, entry);
+    }
 
     const summaries: TaskSummary[] = [];
     for (const row of rows) {
@@ -614,14 +809,20 @@ export class TaskStore {
         if (!isPlainObject(parsedState)) continue;
         if (!skill.schema.safeParse(parsedState).success) continue;
         const progress = skill.progress?.(parsedState) ?? { done: 0, total: 0 };
+        const split = subtasks.get(row.id);
         summaries.push({
           id: row.id,
           goal: row.goal,
           status: row.status,
           skill: skill.name,
           updatedAt: row.updated_at,
+          createdAt: row.created_at,
+          seq: row.seq,
           progressDone: progress.done,
           progressTotal: progress.total,
+          parent: row.parent ?? null,
+          subtasks: split?.total ?? 0,
+          openSubtasks: split?.open ?? 0,
         });
       } catch {
         continue;
@@ -669,15 +870,87 @@ export class TaskStore {
   }
 
   /**
-   * The task the tools act on when no id is given: the most recently updated open
-   * one. `active` wins, but a `blocked` task still counts as open — an agent that
-   * has just reported a blocker must be able to patch its way out of it without
-   * first looking the id up with task_list.
+   * The task the tools act on when no id is given: the most recently updated piece of work
+   * that is actually at the frontier — open, and with nothing open underneath it.
+   *
+   * The second half is what the tree costs and what it buys. A task that has been split is a
+   * container: naming it would answer "which Σ do I patch" with the decomposition instead of
+   * the step in flight, and would inject the queue rather than the work. A `blocked` task
+   * still counts as open — an agent that has just reported a blocker must be able to patch its
+   * way out of it without first looking the id up with task_list.
    */
   async activeId(): Promise<string | null> {
     const all = await this.list();
-    const open = all.find((s) => s.status === 'active') ?? all.find((s) => s.status !== 'done');
-    return open?.id ?? null;
+    const frontier = all.filter((s) => s.status !== 'done' && s.openSubtasks === 0);
+    const atFrontier = pickFrontier(frontier);
+    if (atFrontier !== null) return atFrontier;
+    // Only reachable on a cycle in `parent`, which is corrupt data rather than a state any
+    // sequence of calls can produce. Falling back to the flat answer keeps the tools usable
+    // and leaves `doctor` to report the tree.
+    return pickFrontier(all);
+  }
+
+  /**
+   * The branch from the root task down to this one, root first.
+   *
+   * What a prompt carries instead of the whole decomposition: the goals above the work in
+   * flight, one line each, are enough to know which piece of a larger job this is.
+   */
+  async branchOf(id: string): Promise<TaskSummary[]> {
+    const all = await this.list();
+    const byId = new Map(all.map((task) => [task.id, task]));
+    const branch: TaskSummary[] = [];
+    const seen = new Set<string>();
+    let current = byId.get(id);
+    // `seen` rather than a depth limit: the walk terminates on the root in a well-formed tree,
+    // and on the first repeated id in a corrupt one.
+    while (current !== undefined && !seen.has(current.id)) {
+      seen.add(current.id);
+      branch.unshift(current);
+      current = current.parent === null ? undefined : byId.get(current.parent);
+    }
+    return branch;
+  }
+
+  /**
+   * Every task under this one, each before its own children, siblings in the order they were
+   * split out. The whole decomposition, which is what a listing wants and a prompt does not.
+   */
+  async subtreeOf(id: string): Promise<TaskSummary[]> {
+    const all = await this.list();
+    const byParent = new Map<string, TaskSummary[]>();
+    for (const task of all) {
+      if (task.parent === null) continue;
+      const siblings = byParent.get(task.parent) ?? [];
+      siblings.push(task);
+      byParent.set(task.parent, siblings);
+    }
+    for (const siblings of byParent.values()) siblings.sort(queueOrder);
+
+    const out: TaskSummary[] = [];
+    const seen = new Set<string>([id]);
+    const walk = (parentId: string): void => {
+      for (const child of byParent.get(parentId) ?? []) {
+        if (seen.has(child.id)) continue;
+        seen.add(child.id);
+        out.push(child);
+        walk(child.id);
+      }
+    };
+    walk(id);
+    return out;
+  }
+
+  /**
+   * The subtasks that come after this one under the same parent, in the order they were split
+   * out — the queue a prompt owes one line about, and no more than one line.
+   */
+  async laterSiblingsOf(id: string): Promise<TaskSummary[]> {
+    const branch = await this.branchOf(id);
+    const task = branch[branch.length - 1];
+    if (task === undefined || task.parent === null) return [];
+    const siblings = (await this.subtreeOf(task.parent)).filter((s) => s.parent === task.parent);
+    return siblings.filter((s) => s.id !== id && queueOrder(s, task) > 0);
   }
 
   /** True when a task with this id is already stored. */

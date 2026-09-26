@@ -6,11 +6,11 @@ argument-hint: '<goal of the long task>'
 
 # Long task on external state (SKILL.state)
 
-Keep the progress of a long job in the skillstate task state Σ, not in the
+Keep the progress of a long job in the state3 task state Σ, not in the
 transcript. Σ is compact, validated on every write, and survives `/compact` and
-restarts. The tools come from the MCP server `skillstate`: `task_start`,
+restarts. The tools come from the MCP server `state3`: `task_start`,
 `task_show`, `task_patch`, `task_finish`, `task_list`, `task_history` — in Qwen
-Code they are exposed as `mcp__skillstate__task_start` and so on.
+Code they are exposed as `mcp__state3__task_start` and so on.
 
 ## 1. Start
 
@@ -26,8 +26,22 @@ argument: `plain` prose by default, `compact` pseudocode when every injected
 character counts (a small-context local model, a very long task). `task_list`
 prints the skills and the projects this runtime has.
 
-If a task already exists, call `task_list` and then `task_show` instead of
-starting a second one — one active task per project.
+Split rather than queue. A step that will take more than a handful of actions,
+or that you will delegate to another agent, becomes a subtask — `task_start`
+with `parent` set to the id of the task it is a piece of — and not another plan
+item: Σ is carried on every prompt, so a queued plan item costs its full text on
+every turn of the step in flight, while a queued subtask costs its parent one
+line. A subtask starts `pending`, queued behind the work in flight, and the
+runtime hands it over when its turn comes — the injection names the next piece
+under `Queued after this`. Set it `active` in the same patch that closes the
+piece before it; the queue order is the order the pieces were created. Statuses
+are `pending` | `active` | `blocked` | `done`. A subtask cannot be created under
+a parent that does not exist or is already closed.
+
+If work is already open, call `task_list` and then `task_show` instead of
+starting a second root — one task at the frontier: the open one with nothing
+open underneath it. A task that has been split is a container, and `task_list`
+prints the tree.
 
 ## 2. Work and patch
 
@@ -86,7 +100,8 @@ A rejected patch never modifies the state. Read the diagnostic category
 patch, and retry. Domain rules enforced by the guard: a finished task cannot be
 reopened (start a new one), a `done` plan item can only be reopened with an
 explanation in its `notes`, and `status: "blocked"` requires at least one
-blocker.
+blocker. A task with open subtasks is refused `done` too — by the store, which
+counts the other rows, not by a skill's guard, which reads one state.
 
 ## 3. Confirm risky actions
 
@@ -109,9 +124,15 @@ Tools also name the state root they use (`no tasks (state root: …)`,
 `Started task <id> [<skill>] at <path>`). If that root is not inside your
 project, stop and tell the user: the host starts the MCP server in its own
 startup directory, which is not necessarily the project, and
-`SKILLSTATE_STATE_DIR` pins the right one.
+`STATE3_STATE_DIR` pins the right one.
 
 ## 4. Resume after compaction or restart
+
+The injected state orients you before Σ does. Above it stand at most two lines:
+the `Branch:` from the root goal down to the task in flight, and
+`Queued after this: "<goal>" (<id>) + N more` when a piece is queued behind it.
+`task_show {"view":"tree"}` answers with the decomposition under a task — one
+line per task, no Σ and no P.
 
 When the transcript is short, ambiguous, or missing, call `task_show` first: it
 returns Σ plus the full procedure P. Then continue from `next.action` without
@@ -125,10 +146,15 @@ verifications `pass` — call `task_finish` with a short summary of the outcome.
 Report verification results faithfully: if a check failed or was not run, say so
 in the state and in your answer.
 
+Close a decomposition last: a task with open subtasks cannot go to `done`, so
+finish or skip them first and then close the parent with the outcome of the
+whole recorded in `decisions`. Skipping a subtask means closing it with the
+reason as its summary — left open, it holds its parent.
+
 ## 6. A task in another project
 
 Every tool takes an optional `project` argument: the name of a state root the
-user declared, either in `SKILLSTATE_PROJECTS` (`name=dir;name2=dir2`, or a JSON
+user declared, either in `STATE3_PROJECTS` (`name=dir;name2=dir2`, or a JSON
 object of the same) or with `--project name=dir` on the server. This is how one
 supervising session reads and patches the Σ of a worker agent running in a
 different project directory: `task_show` with `{"project": "worker"}`, review the
@@ -137,5 +163,5 @@ artifacts yourself, then `task_patch` with the same argument.
 Only declared roots are reachable, and an unknown name is an error that lists
 them — never try to reach a directory that was not declared, ask the user to
 declare it. When roots are declared, the Qwen Code hook also injects the active
-task of each of them under `## Supervised projects (skillstate)`, so their Σ is
+task of each of them under `## Supervised projects (state3)`, so their Σ is
 in context before you spend a tool call on it.

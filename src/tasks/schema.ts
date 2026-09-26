@@ -4,7 +4,7 @@ import { isPlainObject } from '../core/state.js';
 import type { StateDict } from '../core/types.js';
 import { composeProcedure, PATCH_SEMANTICS, RISK_RULES, STATE_HYGIENE } from './procedure.js';
 
-export const TASK_STATUSES = ['active', 'blocked', 'done'] as const;
+export const TASK_STATUSES = ['pending', 'active', 'blocked', 'done'] as const;
 export const PLAN_ITEM_STATUSES = ['pending', 'in_progress', 'done', 'skipped'] as const;
 export const VERIFICATION_STATUSES = ['pass', 'fail', 'pending'] as const;
 export const RISK_LEVELS = ['safe', 'destructive', 'external'] as const;
@@ -139,7 +139,7 @@ const DEV_TASK_INTRO: string = `You are a software engineering agent working on 
 
 const DEV_TASK_STATE_DICT: string = `State dictionary (all keys required, strict schema — unknown keys are rejected):
 - goal: one-sentence description of the objective.
-- status: "active" | "blocked" | "done".
+- status: "pending" | "active" | "blocked" | "done". A subtask starts "pending" — queued behind the work in flight, and handed over when its turn comes; "active" is the task being worked now.
 - plan: array of { id, task, status, notes } plus an optional "archived": true. ids are sequential strings "1", "2", … Exactly one item may be "in_progress" at a time. An archived item stays in the array — its index and its id do not move — but the state injected into the prompt leaves it out and says how many it left out.
 - artifacts: map from file path (or resource key) to a one-line description of what it is / what changed.
 - verifications: array of { check, status } where check is the literal command ("npm test", "npm run lint", …) and status is "pass" | "fail" | "pending". Never mark "pass" without real output confirming it. The runtime stamps every entry you add or change with "at" (when) and "commit" (the project's git HEAD, null outside a repository) — send neither yourself. An entry you resend with the same field values keeps the stamp it had, whatever order you write them in; rewording one makes it a new claim, re-stamps it, and the answer names the stamp that was replaced.
@@ -150,6 +150,9 @@ const DEV_TASK_STATE_DICT: string = `State dictionary (all keys required, strict
 const DEV_TASK_RULES: string = `Task rules:
 - Move the finished plan item to "done" and exactly one other item to "in_progress" in the same patch.
 - Once a finished step's outcome is recorded in decisions, archive it in the same patch: {"plan[3].status":"done","plan[3].archived":true}. Archiving is what stops Σ from growing with every step you complete — the injected state drops archived steps and says how many, while task_show still lists all of them.
+- Split rather than queue: a step that will take more than a handful of actions, or that you will delegate to another agent, becomes a subtask — task_start {"goal":…,"parent":"<this task id>"} — and not another plan item. Σ is carried on every prompt of the task, so ten pending plan items are ten lines you pay for on every turn of the first one, while a subtask costs its parent one line of queue and carries its own state only while it is in flight.
+- A subtask starts "pending" and the runtime hands it over when its turn comes: the injection names the next one under "Queued after this". Set it "active" in the same patch that closes the one before it.
+- Close a decomposition last. A task with open subtasks cannot go to "done" — finish or skip them, then close the parent with the outcome of the whole recorded in decisions.
 - When blocked: set status "blocked" and add at least one entry to blockers; clear them when work resumes.
 - Set status "done" only after every plan item is "done" or "skipped" and the key verifications are "pass".`;
 

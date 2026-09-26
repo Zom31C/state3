@@ -30,7 +30,7 @@ async function commit(file: string, contents: string, message: string): Promise<
   await mkdir(path.dirname(path.join(project, file)), { recursive: true });
   await writeFile(path.join(project, file), contents, 'utf8');
   git('add', file);
-  git('-c', 'user.email=test@skillstate', '-c', 'user.name=test', 'commit', '-q', '-m', message);
+  git('-c', 'user.email=test@state3', '-c', 'user.name=test', 'commit', '-q', '-m', message);
   return git('rev-parse', '--short', 'HEAD');
 }
 
@@ -42,9 +42,9 @@ const carPage = {
 };
 
 beforeEach(async () => {
-  project = await mkdtemp(path.join(tmpdir(), 'skillstate-stale-'));
+  project = await mkdtemp(path.join(tmpdir(), 'state3-stale-'));
   git('init', '-q');
-  tasks = new TaskStore(path.join(project, '.skillstate'));
+  tasks = new TaskStore(path.join(project, '.state3'));
   pages = new PageStore(tasks);
 });
 

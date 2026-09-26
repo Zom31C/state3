@@ -10,7 +10,7 @@ let dir: string;
 let store: TaskStore | undefined;
 
 beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'skillstate-migrate-'));
+  dir = await mkdtemp(path.join(tmpdir(), 'state3-migrate-'));
   store = undefined;
 });
 

@@ -139,7 +139,7 @@ describe('renderProjectBrief over a real database', () => {
   let pages: PageStore;
 
   beforeEach(async () => {
-    dir = await mkdtemp(path.join(tmpdir(), 'skillstate-brief-'));
+    dir = await mkdtemp(path.join(tmpdir(), 'state3-brief-'));
     tasks = new TaskStore(dir);
     pages = new PageStore(tasks);
   });
@@ -163,7 +163,7 @@ describe('renderProjectBrief over a real database', () => {
   });
 
   it('reads what the page tool wrote, with no bodies', () => {
-    pages.put({ id: 'project', kind: 'project', title: 'skillState', summary: 'Task state.' });
+    pages.put({ id: 'project', kind: 'project', title: 'state3', summary: 'Task state.' });
     pages.put({
       id: 'auth',
       kind: 'feature',
@@ -180,7 +180,7 @@ describe('renderProjectBrief over a real database', () => {
   });
 
   it('briefs an empty project without touching the disk', async () => {
-    const empty = await mkdtemp(path.join(tmpdir(), 'skillstate-brief-empty-'));
+    const empty = await mkdtemp(path.join(tmpdir(), 'state3-brief-empty-'));
     const owner = new TaskStore(empty);
     try {
       expect(renderProjectBrief(new PageStore(owner))).toContain('no knowledge base yet');

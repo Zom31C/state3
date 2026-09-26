@@ -115,9 +115,9 @@ describe('completeOpenAICompatible', () => {
   it('merges extra headers', async () => {
     const calls = stubFetch(() => ok(validPayload));
 
-    await completeOpenAICompatible({ ...settings, extraHeaders: { 'X-Title': 'skillState' } }, 'x');
+    await completeOpenAICompatible({ ...settings, extraHeaders: { 'X-Title': 'state3' } }, 'x');
 
-    expect(calls[0]?.init.headers).toMatchObject({ 'X-Title': 'skillState' });
+    expect(calls[0]?.init.headers).toMatchObject({ 'X-Title': 'state3' });
   });
 
   it('throws with status and body snippet on HTTP error', async () => {

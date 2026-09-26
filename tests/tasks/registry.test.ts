@@ -191,7 +191,7 @@ describe('a custom registry driving TaskStore', () => {
   let store: TaskStore;
 
   beforeEach(async () => {
-    dir = await mkdtemp(path.join(tmpdir(), 'skillstate-garden-'));
+    dir = await mkdtemp(path.join(tmpdir(), 'state3-garden-'));
     store = new TaskStore(dir, createSkillRegistry([gardenTaskSkill()], 'garden-task'));
   });
 

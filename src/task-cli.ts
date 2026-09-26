@@ -5,8 +5,8 @@ import { formatDoctorReport, inspectStateRoot } from './tasks/doctor.js';
 import { formatMigrationReport, migrateRootToDatabase } from './tasks/migrate.js';
 import { isNotation, NOTATIONS } from './tasks/notation.js';
 import { describeProjects, parseProjectsSpec } from './tasks/projects.js';
-import { renderTaskHead } from './tasks/render.js';
-import type { HistoryEntry, StartOptions, TaskSummary } from './tasks/store.js';
+import { formatTaskList, renderTaskHead, subtreeRows } from './tasks/render.js';
+import type { HistoryEntry, StartOptions } from './tasks/store.js';
 import { TaskStore } from './tasks/store.js';
 
 export type TaskStorePort = Pick<
@@ -15,6 +15,8 @@ export type TaskStorePort = Pick<
 > & {
   /** Optional so test fakes stay small; the CLI closes it to release the database file. */
   close?(): void;
+  /** Optional for the same reason: a fake has no root to carry over, and nothing to report. */
+  carryOverNote?(): string | null;
 };
 
 export const TASK_SUBCOMMANDS = [
@@ -29,7 +31,7 @@ export const TASK_SUBCOMMANDS = [
 ] as const;
 export type TaskSubcommand = (typeof TASK_SUBCOMMANDS)[number];
 
-export const DEFAULT_TASK_ROOT = '.skillstate';
+export const DEFAULT_TASK_ROOT = '.state3';
 
 export interface TaskCliOptions {
   root: string;
@@ -42,7 +44,11 @@ export interface TaskCliOptions {
   limit: number | null;
   skill: string | null;
   notation: string | null;
-  /** Declared project whose root replaces `--root`; see SKILLSTATE_PROJECTS. */
+  /** With `start`: the task to split this one out of, making it a subtask. */
+  parent: string | null;
+  /** With `show`: print the decomposition under the task instead of its Σ. */
+  tree: boolean;
+  /** Declared project whose root replaces `--root`; see STATE3_PROJECTS. */
   project: string | null;
   /** With `migrate`: delete the legacy JSON files instead of archiving them. */
   purge: boolean;
@@ -59,14 +65,14 @@ export interface TaskCliDeps {
 
 /**
  * The state root this invocation writes to. `--project` resolves a name declared
- * in SKILLSTATE_PROJECTS, which is how one shell reaches the state of another
+ * in STATE3_PROJECTS, which is how one shell reaches the state of another
  * project (a supervisor following a worker) without typing absolute paths.
  */
 export function resolveTaskRoot(options: TaskCliOptions, env: NodeJS.ProcessEnv): string {
   if (options.project === null) return resolve(options.root);
-  const spec = env.SKILLSTATE_PROJECTS;
+  const spec = env.STATE3_PROJECTS;
   if (spec === undefined || spec.trim() === '') {
-    throw new Error('--project needs SKILLSTATE_PROJECTS to declare project roots');
+    throw new Error('--project needs STATE3_PROJECTS to declare project roots');
   }
   const entries = parseProjectsSpec(spec);
   const found = entries.find((entry) => entry.name === options.project);
@@ -109,6 +115,8 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
   let limit: number | null = null;
   let skill: string | null = null;
   let notation: string | null = null;
+  let parent: string | null = null;
+  let tree = false;
   let project: string | null = null;
   let help = false;
   let purge = false;
@@ -143,6 +151,12 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
         break;
       case '--notation':
         notation = takeValue(token);
+        break;
+      case '--parent':
+        parent = takeValue(token);
+        break;
+      case '--tree':
+        tree = true;
         break;
       case '--project':
         project = takeValue(token);
@@ -183,6 +197,8 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
       limit,
       skill,
       notation,
+      parent,
+      tree,
       project,
       purge,
       fromStdin: false,
@@ -205,6 +221,8 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
     limit,
     skill,
     notation,
+    parent,
+    tree,
     project,
     purge,
     fromStdin: false,
@@ -260,6 +278,12 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
   if (options.notation !== null && !isNotation(options.notation)) {
     throw new Error(`--notation expects one of: ${NOTATIONS.join(', ')}`);
   }
+  if (options.parent !== null && subcommand !== 'start') {
+    throw new Error('--parent is only valid for task start');
+  }
+  if (options.tree && subcommand !== 'show') {
+    throw new Error('--tree is only valid for task show');
+  }
   if (options.project !== null && rootExplicit) {
     throw new Error('--project already picks a declared state root, so --root is redundant');
   }
@@ -269,11 +293,13 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
 
 /** One line per subcommand. The Record is exhaustive by type, so a new subcommand cannot ship undocumented. */
 const SUBCOMMAND_HELP: Record<TaskSubcommand, string> = {
-  start: 'create a task from a goal; --plan adds steps, --skill and --notation shape Σ',
-  show: 'print Σ of the open task, or of --id',
+  start:
+    'create a task from a goal; --plan adds steps, --parent splits it out of another task, ' +
+    '--skill and --notation shape Σ',
+  show: 'print Σ of the open task, or of --id; --tree prints the decomposition under it instead',
   patch: 'merge a JSON patch into Σ; "-" reads the patch from stdin',
   finish: 'mark the task done and append the summary to decisions',
-  list: 'list tasks with skill, status, progress, and the build that is answering',
+  list: 'list tasks as a tree, with skill, status, progress, and the build that is answering',
   history: 'print the audit trail of patches, rejected ones included; --limit N',
   migrate: 'move legacy <id>.json + <id>.history.jsonl into state.db; archives them unless --purge',
   doctor:
@@ -282,10 +308,12 @@ const SUBCOMMAND_HELP: Record<TaskSubcommand, string> = {
 
 /** Flags the help prints; a test feeds each one back to parseTaskArgs. */
 const FLAG_HELP: readonly (readonly [flag: string, text: string])[] = [
-  ['--root <dir>', 'state root to read and write (default .skillstate)'],
-  ['--project <name>', 'a root declared in SKILLSTATE_PROJECTS, instead of --root'],
-  ['--id <task>', 'task to act on (default: the most recently updated open task)'],
+  ['--root <dir>', 'state root to read and write (default .state3)'],
+  ['--project <name>', 'a root declared in STATE3_PROJECTS, instead of --root'],
+  ['--id <task>', 'task to act on (default: the work in flight — nothing open beneath it)'],
   ['--plan <step>', 'plan step for start; repeatable'],
+  ['--parent <task>', 'with start: split the new task out of this one, as its subtask'],
+  ['--tree', 'with show: print the decomposition under the task instead of its Σ'],
   ['--skill <name>', 'skill for start; task list prints the ones this runtime has'],
   ['--notation <name>', 'how to write Σ: plain prose or compact pseudocode'],
   ['--limit <n>', 'history entries to print (default 20)'],
@@ -297,7 +325,7 @@ export const HELP_FLAGS: readonly string[] = FLAG_HELP.map(([flag]) => flag.spli
 
 export function taskHelpText(): string {
   return [
-    'skillstate task <subcommand> — keep the progress of long work in an external state Σ',
+    'state3 task <subcommand> — keep the progress of long work in an external state Σ',
     '',
     'Subcommands:',
     ...TASK_SUBCOMMANDS.map((name) => `  ${name.padEnd(9)} ${SUBCOMMAND_HELP[name]}`),
@@ -307,21 +335,19 @@ export function taskHelpText(): string {
     `  ${'-h, --help'.padEnd(18)} print this help`,
     '',
     'Examples:',
-    '  skillstate task start "Ship the adapter" --plan "read the spec" --notation compact',
-    '  skillstate task patch - < patch.json',
-    '  skillstate task list --root ../other-project/.skillstate',
+    '  state3 task start "Ship the adapter" --plan "read the spec" --notation compact',
+    '  state3 task patch - < patch.json',
+    '  state3 task list --root ../other-project/.state3',
   ].join('\n');
 }
 
-export function formatTaskList(rows: readonly TaskSummary[]): string {
-  if (rows.length === 0) return 'no tasks';
-  return rows
-    .map(
-      (r) =>
-        `${r.id}  ${r.skill.padEnd(14)}  ${r.status.padEnd(6)}  ` +
-        `${r.progressDone}/${r.progressTotal}  ${r.goal}`,
-    )
-    .join('\n');
+// Re-exported rather than defined here: the tree listing is rendered in one place, because the
+// MCP tools print the same tree and two formatters for one shape drift apart.
+export { formatTaskList };
+
+/** The decomposition under one task, as the same tree the list prints. */
+export async function formatSubtree(store: TaskStorePort, id: string): Promise<string> {
+  return formatTaskList(subtreeRows(await store.list(), id));
 }
 
 export function formatHistory(entries: readonly HistoryEntry[]): string {
@@ -373,6 +399,10 @@ async function executeTaskCommand(options: TaskCliOptions, deps: TaskCliDeps): P
   }
 
   const store = deps.createStore(root);
+  // One line, once: a root carried over from the pre-rename name is the difference between
+  // resuming this project and starting it over, and the store has no output channel of its own.
+  const carried = store.carryOverNote?.() ?? null;
+  if (carried !== null) deps.log(carried);
   try {
     await runStoreCommand(options, store, deps);
   } finally {
@@ -397,15 +427,29 @@ async function runStoreCommand(
       if (options.notation !== null && isNotation(options.notation)) {
         startOptions.notation = options.notation;
       }
+      if (options.parent !== null) startOptions.parent = options.parent;
       const task = await store.start(goal, startOptions);
       deps.log(renderTaskHead(task));
+      if (task.meta.parent !== null) {
+        // A subtask is not the work in flight yet, so "patch it after every step" would be
+        // advice to start work the runtime has queued behind something else.
+        deps.log(
+          `queued as a subtask of ${task.meta.parent} — it is handed over when the work in ` +
+            'flight is closed; `state3 task show --tree` prints the decomposition',
+        );
+        return;
+      }
       deps.log(
-        `patch it after each meaningful step: skillstate task patch '{"plan[0].status":"done","next":{"action":"...","risk":"safe"}}'`,
+        `patch it after each meaningful step: state3 task patch '{"plan[0].status":"done","next":{"action":"...","risk":"safe"}}'`,
       );
       return;
     }
     case 'show': {
       const task = await (options.id === null ? store.show() : store.show(options.id));
+      if (options.tree) {
+        deps.log(await formatSubtree(store, task.meta.id));
+        return;
+      }
       deps.log(renderTaskHead(task));
       return;
     }

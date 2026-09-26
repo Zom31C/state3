@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { SkillStateRuntime, STEP_JSON_SCHEMA } from '../../src/core/runtime.js';
+import { State3Runtime, STEP_JSON_SCHEMA } from '../../src/core/runtime.js';
 import type { Skill } from '../../src/core/skill.js';
 import type { Environment } from '../../src/envs/env.js';
 import type { CompletionOptions, LLMProvider, LLMResponse } from '../../src/llm/provider.js';
@@ -65,7 +65,7 @@ function stepResponse(patch: Record<string, unknown>, action: string): string {
   ].join('\n');
 }
 
-describe('SkillStateRuntime', () => {
+describe('State3Runtime', () => {
   it('runs a happy-path episode and applies patches and actions', async () => {
     const skill = makeSkill();
     const provider = new ScriptedProvider([
@@ -77,7 +77,7 @@ describe('SkillStateRuntime', () => {
       'Shipment arrived containing [gadget]',
     ]);
 
-    const result = await new SkillStateRuntime({ skill, env, provider }).run(2);
+    const result = await new State3Runtime({ skill, env, provider }).run(2);
 
     expect(result.validSteps).toBe(2);
     expect(result.invalidSteps).toBe(0);
@@ -96,7 +96,7 @@ describe('SkillStateRuntime', () => {
     ]);
     const env = new RecordingEnv(['Shipment arrived containing [widget]']);
 
-    await new SkillStateRuntime({ skill: makeSkill(), env, provider }).run(1);
+    await new State3Runtime({ skill: makeSkill(), env, provider }).run(1);
 
     const prompt = provider.prompts[0] ?? '';
     expect(prompt).toContain('You are a test robot.');
@@ -114,7 +114,7 @@ describe('SkillStateRuntime', () => {
     ]);
     const env = new RecordingEnv(['Shipment arrived containing [widget]']);
 
-    const result = await new SkillStateRuntime({ skill: makeSkill(), env, provider }).run(1);
+    const result = await new State3Runtime({ skill: makeSkill(), env, provider }).run(1);
 
     const record = result.steps[0];
     expect(result.validSteps).toBe(1);
@@ -133,7 +133,7 @@ describe('SkillStateRuntime', () => {
     ]);
     const env = new RecordingEnv(['Shipment arrived containing [widget]']);
 
-    const result = await new SkillStateRuntime({ skill: makeSkill(), env, provider }).run(1);
+    const result = await new State3Runtime({ skill: makeSkill(), env, provider }).run(1);
 
     const record = result.steps[0];
     expect(record?.valid).toBe(true);
@@ -150,7 +150,7 @@ describe('SkillStateRuntime', () => {
     ]);
     const env = new RecordingEnv(['Shipment arrived containing [widget]']);
 
-    const result = await new SkillStateRuntime({ skill: makeSkill(), env, provider }).run(1);
+    const result = await new State3Runtime({ skill: makeSkill(), env, provider }).run(1);
 
     expect(result.steps[0]?.errors[0]?.category).toBe('unknown-key');
     expect(result.steps[0]?.valid).toBe(true);
@@ -160,7 +160,7 @@ describe('SkillStateRuntime', () => {
     const provider = new ScriptedProvider(['nonsense without json']);
     const env = new RecordingEnv(['Shipment arrived containing [widget]']);
 
-    const result = await new SkillStateRuntime({
+    const result = await new State3Runtime({
       skill: makeSkill(),
       env,
       provider,
@@ -196,7 +196,7 @@ describe('SkillStateRuntime', () => {
     ]);
     const env = new RecordingEnv(['Customer ordered [x]']);
 
-    const result = await new SkillStateRuntime({ skill, env, provider }).run(1);
+    const result = await new State3Runtime({ skill, env, provider }).run(1);
 
     expect(result.steps[0]?.errors[0]?.category).toBe('guard');
     expect(result.steps[0]?.valid).toBe(true);
@@ -213,7 +213,7 @@ describe('SkillStateRuntime', () => {
     ]);
     const env = new RecordingEnv(['Customer ordered [widget]']);
 
-    const result = await new SkillStateRuntime({ skill, env, provider }).run(1);
+    const result = await new State3Runtime({ skill, env, provider }).run(1);
 
     expect(result.steps[0]?.valid).toBe(true);
     expect(result.finalState).toEqual({ shelf_0: null });
@@ -224,7 +224,7 @@ describe('SkillStateRuntime', () => {
     const env: Environment = { observe: () => 'x', step: () => undefined, done: true };
     const provider = new ScriptedProvider([stepResponse({}, 'NOOP')]);
 
-    const result = await new SkillStateRuntime({ skill: makeSkill(), env, provider }).run(5);
+    const result = await new State3Runtime({ skill: makeSkill(), env, provider }).run(5);
 
     expect(result.steps).toEqual([]);
     expect(result.llmCalls).toBe(0);
@@ -233,7 +233,7 @@ describe('SkillStateRuntime', () => {
   it('rejects a negative or fractional horizon', async () => {
     const env = new RecordingEnv(['x']);
     const provider = new ScriptedProvider(['y']);
-    const runtime = new SkillStateRuntime({ skill: makeSkill(), env, provider });
+    const runtime = new State3Runtime({ skill: makeSkill(), env, provider });
 
     await expect(runtime.run(-1)).rejects.toThrow(/non-negative integer/);
     await expect(runtime.run(1.5)).rejects.toThrow(/non-negative integer/);
@@ -245,7 +245,7 @@ describe('SkillStateRuntime', () => {
     ]);
     const env = new RecordingEnv(['Shipment arrived containing [widget]']);
 
-    await new SkillStateRuntime({
+    await new State3Runtime({
       skill: makeSkill(),
       env,
       provider,
@@ -261,7 +261,7 @@ describe('SkillStateRuntime', () => {
     ]);
     const env = new RecordingEnv(['Shipment arrived containing [widget]']);
 
-    await new SkillStateRuntime({ skill: makeSkill(), env, provider }).run(1);
+    await new State3Runtime({ skill: makeSkill(), env, provider }).run(1);
 
     expect(provider.optionsSeen[0]).toEqual({});
   });

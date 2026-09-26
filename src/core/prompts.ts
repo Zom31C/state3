@@ -97,7 +97,7 @@ export function buildStatefulRuntimePrompt(
 }
 
 /** A.4 — SKILL.state runtime prompt: compact execution state replaces the transcript. */
-export function buildSkillStatePrompt(skill: Skill, state: StateDict, observation: string): string {
+export function buildState3Prompt(skill: Skill, state: StateDict, observation: string): string {
   return joinBlocks([
     `You are ${skill.instructions}`,
     'Execute the following task.',

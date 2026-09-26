@@ -18,7 +18,7 @@ let tools: TaskToolDefinition[];
 let byName: Map<string, TaskToolDefinition>;
 
 beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'skillstate-kbtools-'));
+  dir = await mkdtemp(path.join(tmpdir(), 'state3-kbtools-'));
   tasks = new TaskStore(dir);
   pages = new PageStore(tasks);
   links = new LinkStore(tasks);
@@ -48,7 +48,7 @@ const projectPage = {
   op: 'put',
   id: 'project',
   kind: 'project',
-  title: 'skillState',
+  title: 'state3',
   summary: 'External validated task state for long agent work.',
 };
 
@@ -125,7 +125,7 @@ describe('page put and get', () => {
     const updated = await call('page', { op: 'put', id: 'project', summary: 'A shorter line.' });
     expect(updated.content).toContain('Updated page project');
     expect(updated.content).toContain('A shorter line.');
-    expect(pages.get('project')?.title).toBe('skillState');
+    expect(pages.get('project')?.title).toBe('state3');
   });
 
   it('reads a page back with its body and its links', async () => {
@@ -777,7 +777,7 @@ describe('search', () => {
     const found = await call('search', { query: 'validates' });
 
     expect(found.content).toContain('1 hit(s) for "validates":');
-    expect(found.content).toContain('- page:project skillState:');
+    expect(found.content).toContain('- page:project state3:');
     expect(found.content).toContain('[validates]');
   });
 

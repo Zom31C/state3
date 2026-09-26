@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
  * importing src/tasks/*), so the only honest way to test it is to run it: a
  * child process, a state directory on disk, and the JSON it prints. */
 
-const HOOK = resolve('extensions/skillstate/hooks/inject-state.mjs');
+const HOOK = resolve('extensions/state3/hooks/inject-state.mjs');
 
 function devState(overrides = {}) {
   return {
@@ -39,8 +39,8 @@ let dir;
 let stateDir;
 
 beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), 'skillstate-hook-'));
-  stateDir = join(dir, '.skillstate');
+  dir = await mkdtemp(join(tmpdir(), 'state3-hook-'));
+  stateDir = join(dir, '.state3');
   await mkdir(stateDir, { recursive: true });
 });
 
@@ -55,7 +55,7 @@ async function writeTask(name, taskRecord) {
 /** Runs the hook. `--self-test <dir>` replaces the stdin event; `stdin` overrides it. */
 async function runHook({ args = [], env = {}, stdin = null }) {
   const child = spawn(process.execPath, [HOOK, ...args], {
-    env: { ...process.env, SKILLSTATE_PROJECTS: '', ...env },
+    env: { ...process.env, STATE3_PROJECTS: '', ...env },
   });
   const out = [];
   const err = [];
@@ -94,7 +94,7 @@ describe('inject-state hook', () => {
 
     expect(result.code).toBe(0);
     const context = contextOf(result);
-    expect(context).toContain('## Active task state (skillstate)');
+    expect(context).toContain('## Active task state (state3)');
     expect(context).toContain('Task task-1 [dev-task] (active):');
     expect(context).toContain('"goal":"Ship the adapter"');
     expect(context).toContain('task_patch');
@@ -190,10 +190,10 @@ describe('inject-state hook', () => {
     );
     await writeTask('task-1.json', record('task-1', devState()));
 
-    const result = await runSelfTest({ SKILLSTATE_PROJECTS: `worker=${workerRoot}` });
+    const result = await runSelfTest({ STATE3_PROJECTS: `worker=${workerRoot}` });
     const context = contextOf(result);
 
-    expect(context).toContain('## Supervised projects (skillstate)');
+    expect(context).toContain('## Supervised projects (state3)');
     expect(context).toContain(`### worker — ${workerRoot}`);
     expect(context).toContain('Build the car');
     expect(context).toContain('task_patch {"project":"<name>"');
@@ -204,16 +204,16 @@ describe('inject-state hook', () => {
     await mkdir(emptyRoot, { recursive: true });
     await writeTask('task-1.json', record('task-1', devState()));
 
-    const result = await runSelfTest({ SKILLSTATE_PROJECTS: `worker=${emptyRoot}` });
+    const result = await runSelfTest({ STATE3_PROJECTS: `worker=${emptyRoot}` });
 
-    expect(contextOf(result)).toContain('## Active task state (skillstate)');
+    expect(contextOf(result)).toContain('## Active task state (state3)');
     expect(result.stdout).not.toContain('## Supervised projects');
   });
 
   it('ignores a malformed project declaration instead of failing the turn', async () => {
     await writeTask('task-1.json', record('task-1', devState()));
 
-    const result = await runSelfTest({ SKILLSTATE_PROJECTS: 'not a declaration' });
+    const result = await runSelfTest({ STATE3_PROJECTS: 'not a declaration' });
 
     expect(result.code).toBe(0);
     expect(contextOf(result)).toContain('Task task-1');
@@ -272,7 +272,7 @@ describe('inject-state hook', () => {
     const context = contextOf(await runSelfTestEvent('SessionStart'));
 
     expect(context).toContain('Task task-1');
-    expect(context).not.toContain('## Project brief (skillstate)');
+    expect(context).not.toContain('## Project brief (state3)');
   });
 
   it('treats an unknown or missing event as UserPromptSubmit', async () => {
@@ -285,7 +285,7 @@ describe('inject-state hook', () => {
     // the state directory, or this asserts against whatever the developer's own project holds.
     const garbage = await runHook({
       stdin: 'not json at all',
-      env: { SKILLSTATE_STATE_DIR: stateDir },
+      env: { STATE3_STATE_DIR: stateDir },
     });
     expect(garbage.code).toBe(0);
     expect(eventOf(garbage)).toBe('UserPromptSubmit');
@@ -315,7 +315,7 @@ describe('inject-state hook', () => {
     expect(result.stderr).toContain('state.db');
   });
 
-  it('honours SKILLSTATE_STATE_DIR over the reported cwd', async () => {
+  it('honours STATE3_STATE_DIR over the reported cwd', async () => {
     const pinned = join(dir, 'pinned');
     await mkdir(pinned, { recursive: true });
     await writeFile(
@@ -326,7 +326,7 @@ describe('inject-state hook', () => {
 
     const result = await runHook({
       args: ['--self-test', dir],
-      env: { SKILLSTATE_STATE_DIR: pinned },
+      env: { STATE3_STATE_DIR: pinned },
     });
 
     expect(contextOf(result)).toContain('Pinned root');
@@ -365,14 +365,12 @@ describe('inject-state hook', () => {
   it('stays silent on SubagentStart when the orientation is switched off', async () => {
     await writeTask('task-1.json', record('task-1', devState()));
 
-    const result = await runSelfTestEvent('SubagentStart', { SKILLSTATE_SUBAGENT_STATE: 'off' });
+    const result = await runSelfTestEvent('SubagentStart', { STATE3_SUBAGENT_STATE: 'off' });
 
     expect(result.code).toBe(0);
     expect(result.stdout.trim()).toBe('');
     // The switch is for this event only: a session still gets its Σ.
-    expect(contextOf(await runSelfTest({ SKILLSTATE_SUBAGENT_STATE: 'off' }))).toContain(
-      'Task task-1',
-    );
+    expect(contextOf(await runSelfTest({ STATE3_SUBAGENT_STATE: 'off' }))).toContain('Task task-1');
   });
 
   it('gives a subagent no supervised projects: it was delegated inside this one', async () => {
@@ -387,11 +385,11 @@ describe('inject-state hook', () => {
 
     const subagent = await runHook({
       args: ['--self-test', dir, 'SubagentStart'],
-      env: { SKILLSTATE_PROJECTS: `worker=${workerRoot}` },
+      env: { STATE3_PROJECTS: `worker=${workerRoot}` },
     });
     const session = await runHook({
       args: ['--self-test', dir, 'UserPromptSubmit'],
-      env: { SKILLSTATE_PROJECTS: `worker=${workerRoot}` },
+      env: { STATE3_PROJECTS: `worker=${workerRoot}` },
     });
 
     expect(contextOf(subagent)).not.toContain('## Supervised projects');
@@ -403,7 +401,7 @@ describe('inject-state hook', () => {
     await writeTask('task-1.json', record('task-1', devState()));
 
     expect(contextOf(await runSelfTestEvent('SubagentStart'))).not.toContain(
-      '## Project brief (skillstate)',
+      '## Project brief (state3)',
     );
   });
 });

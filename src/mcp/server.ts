@@ -19,13 +19,13 @@ import { createKbTools } from './kb-tools.js';
 import { createTaskTools } from './tools.js';
 import type { TaskToolDefinition } from './tools.js';
 
-const SERVER_INFO = { name: 'skillstate', version: '0.2.0' };
+const SERVER_INFO = { name: 'state3', version: '0.2.0' };
 
 /**
  * Connection-level instructions. Deliberately short: the procedure P of a task
  * belongs to that task's skill and notation, and `task_show` returns it with Σ.
  */
-export const RUNTIME_INSTRUCTIONS: string = `skillstate keeps the progress of long-horizon work in an external state Σ that is validated on every write, instead of in the conversation transcript, so it survives compaction and restarts.
+export const RUNTIME_INSTRUCTIONS: string = `state3 keeps the progress of long-horizon work in an external state Σ that is validated on every write, instead of in the conversation transcript, so it survives compaction and restarts.
 
 Tools: task_start, task_show, task_patch, task_finish, task_list, task_history, project_brief, page, search.
 Each task names a skill, and the skill owns the Σ schema, the domain rules and the procedure P — "dev-task" implements work in a project, "supervise-task" reviews work another agent does. Call task_show to read Σ together with the P of that task, call task_patch after every meaningful step with only the fields that changed, and call task_list to see the skills and projects this runtime knows.
@@ -33,20 +33,20 @@ A rejected patch never modifies the state: read the diagnostic category, fix the
 
 The same file holds the project's knowledge base: pages saying what the project is, what the user wants from it, how to start working in it, what a feature does and why a decision was taken. Call project_brief first when you have no context — it is one line per page inside a fixed budget. If it reports that the project has no knowledge base, page {"op":"init"} scaffolds the three reserved pages as templates to fill in. Then search before reading anything in full, page with op "get" to read one, and op "put" to write down what you learned. Keep a page summary to one informative line: it is all a cold agent sees before deciding whether to open the page.`;
 
-const USAGE = `skillstate MCP server (stdio transport)
+const USAGE = `state3 MCP server (stdio transport)
 
 Usage: node dist/mcp/server.js [--root <dir>] [--project <name>=<dir>]…
 
-  --root <dir>          task state directory (default: .skillstate in the current directory)
+  --root <dir>          task state directory (default: .state3 in the current directory)
   --project <name>=<dir> additional state root the tools may address by name; repeatable
   --help                print this message and exit
 
 Environment:
-  SKILLSTATE_STATE_DIR  absolute state directory; overrides the cwd-based default.
+  STATE3_STATE_DIR  absolute state directory; overrides the cwd-based default.
                         Set it when the host starts the server outside the project:
                         hosts resolve the working directory to their own startup
                         directory, which is not necessarily the project.
-  SKILLSTATE_PROJECTS   declared project roots, as "name=dir;name2=dir2" or a JSON
+  STATE3_PROJECTS   declared project roots, as "name=dir;name2=dir2" or a JSON
                         object of the same. Only roots declared here (or with
                         --project) are reachable through the "project" argument, so
                         the tools can follow a worker in another project without
@@ -111,9 +111,9 @@ interface ServerArgs {
 
 /** The host's startup directory is not necessarily the project, so allow an override. */
 function defaultStateDir(): string {
-  const fromEnv = process.env.SKILLSTATE_STATE_DIR;
+  const fromEnv = process.env.STATE3_STATE_DIR;
   if (fromEnv !== undefined && fromEnv.trim() !== '') return fromEnv;
-  return '.skillstate';
+  return '.state3';
 }
 
 export function parseServerArgs(argv: readonly string[]): ServerArgs {
@@ -148,7 +148,7 @@ export function resolveProjectEntries(
   raw: readonly string[],
   cwd: string = process.cwd(),
 ): ProjectEntry[] {
-  const fromEnv = process.env.SKILLSTATE_PROJECTS;
+  const fromEnv = process.env.STATE3_PROJECTS;
   const entries = fromEnv === undefined ? [] : parseProjectsSpec(fromEnv, cwd);
   for (const declaration of raw) {
     entries.push(...parseProjectsSpec(declaration, cwd));
@@ -201,6 +201,10 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   };
 
   const primary = track(new TaskStore(options.root, skills));
+  // Reported once at startup rather than on every tool answer: a root carried over from the
+  // pre-rename name is the difference between resuming this project and starting it over, and
+  // repeating that for the rest of the session would cost tokens to say what already happened.
+  const carried = primary.carryOverNote();
   const projects = resolveProjectEntries(options.projects);
   const resolver = createProjectResolver(primary, projects, (rootDir) =>
     track(new TaskStore(rootDir, skills)),
@@ -231,9 +235,8 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   await server.connect(new StdioServerTransport());
   const declared =
     projects.length === 0 ? '' : `, projects: ${projects.map((p) => p.name).join(', ')}`;
-  process.stderr.write(
-    `skillstate MCP server listening on stdio (root: ${options.root}${declared})\n`,
-  );
+  if (carried !== null) process.stderr.write(`state3: ${carried}\n`);
+  process.stderr.write(`state3 MCP server listening on stdio (root: ${options.root}${declared})\n`);
 }
 
 const invokedDirectly =

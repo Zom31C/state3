@@ -12,7 +12,7 @@ import {
 let dir: string;
 
 beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'skillstate-artifacts-'));
+  dir = await mkdtemp(path.join(tmpdir(), 'state3-artifacts-'));
   await mkdir(path.join(dir, 'src'), { recursive: true });
   await writeFile(path.join(dir, 'src', 'reader.ts'), 'export const reader = 1;\n', 'utf8');
 });
@@ -44,8 +44,8 @@ describe('isPathLikeArtifact', () => {
     for (const key of [
       'документация',
       'tests',
-      'git skillState',
-      'github.com/Zom31C/skillState',
+      'git state3',
+      'github.com/Zom31C/state3',
       'https://example.com/report.html',
       'Σ task-mtv1tug2-fbus',
     ]) {

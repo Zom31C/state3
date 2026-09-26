@@ -1,15 +1,15 @@
 import { basename, dirname, resolve } from 'node:path';
 
 /** The directory a project's state lives in: every entry point defaults to it. */
-export const STATE_DIRNAME = '.skillstate';
+export const STATE_DIRNAME = '.state3';
 
 /**
  * The project a state root belongs to.
  *
- * A state root is `<project>/.skillstate` by convention, and everything anchored to the
+ * A state root is `<project>/.state3` by convention, and everything anchored to the
  * project — the git commit a verification was recorded at, the files a page describes, the
  * paths its artifacts name — is resolved against the project, not against the state
- * directory. A root pointed somewhere else (`SKILLSTATE_STATE_DIR`, a declared project) is
+ * directory. A root pointed somewhere else (`STATE3_STATE_DIR`, a declared project) is
  * taken as the project itself: there is no better guess, and guessing the parent of an
  * arbitrary directory would anchor records to a tree they have nothing to do with.
  */

@@ -14,7 +14,7 @@ let tasks: TaskStore;
 let pages: PageStore;
 
 beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'skillstate-kb-'));
+  dir = await mkdtemp(path.join(tmpdir(), 'state3-kb-'));
   tasks = new TaskStore(dir);
   pages = new PageStore(tasks);
 });
@@ -28,7 +28,7 @@ afterEach(async () => {
 const projectPage = {
   id: 'project',
   kind: 'project',
-  title: 'skillState',
+  title: 'state3',
   summary: 'External validated task state for long agent work.',
 };
 
@@ -52,7 +52,7 @@ function searchRowsFor(id: string): { title: string; summary: string; body: stri
 
 describe('PageStore reads', () => {
   it('creates no database: an empty project and a wrong root must stay distinguishable', async () => {
-    const empty = await mkdtemp(path.join(tmpdir(), 'skillstate-kb-empty-'));
+    const empty = await mkdtemp(path.join(tmpdir(), 'state3-kb-empty-'));
     const owner = new TaskStore(empty);
     try {
       const reader = new PageStore(owner);

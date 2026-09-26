@@ -4,9 +4,10 @@ import type { StateDict } from '../src/core/types.js';
 import { devTaskSchema } from '../src/tasks/schema.js';
 import type { DevTaskState } from '../src/tasks/schema.js';
 import type { HistoryEntry, StartOptions, StoredTask, TaskSummary } from '../src/tasks/store.js';
-import type { TaskCliDeps } from '../src/task-cli.js';
+import type { TaskCliDeps, TaskStorePort } from '../src/task-cli.js';
 import {
   formatHistory,
+  formatSubtree,
   formatTaskList,
   HELP_FLAGS,
   parseTaskArgs,
@@ -92,9 +93,10 @@ class FakeStore {
         id,
         createdAt: at,
         updatedAt: at,
-        path: `.skillstate/${id}.json`,
+        path: `.state3/${id}.json`,
         skill: options.skill ?? 'dev-task',
         notation: options.notation ?? 'plain',
+        parent: options.parent ?? null,
       },
       state: asDict(state),
     };
@@ -144,7 +146,7 @@ class FakeStore {
 
   async list(): Promise<TaskSummary[]> {
     this.calls.push('list');
-    return this.tasks.map((t) => {
+    const summaries = this.tasks.map((t) => {
       const state = this.dev(t);
       return {
         id: t.meta.id,
@@ -152,8 +154,19 @@ class FakeStore {
         status: state.status,
         skill: t.meta.skill,
         updatedAt: t.meta.updatedAt,
+        createdAt: t.meta.createdAt,
+        seq: this.tasks.indexOf(t),
         progressDone: state.plan.filter((p) => p.status === 'done').length,
         progressTotal: state.plan.length,
+        parent: t.meta.parent,
+      };
+    });
+    return summaries.map((summary) => {
+      const children = summaries.filter((other) => other.parent === summary.id);
+      return {
+        ...summary,
+        subtasks: children.length,
+        openSubtasks: children.filter((child) => child.status !== 'done').length,
       };
     });
   }
@@ -198,7 +211,7 @@ function makeDeps(
   return { deps, lines, roots };
 }
 
-const PROJECTS_VAR = 'SKILLSTATE_PROJECTS';
+const PROJECTS_VAR = 'STATE3_PROJECTS';
 const cwd = process.cwd();
 const workerRoot = resolve(cwd, 'state/worker');
 const reviewRoot = resolve(cwd, 'state/review');
@@ -215,7 +228,7 @@ describe('parseTaskArgs', () => {
     expect(
       parseTaskArgs(['start', 'Refactor auth', '--plan', 'Read code', '--plan', 'Write tests']),
     ).toEqual({
-      root: '.skillstate',
+      root: '.state3',
       subcommand: 'start',
       goal: 'Refactor auth',
       plan: ['Read code', 'Write tests'],
@@ -225,6 +238,8 @@ describe('parseTaskArgs', () => {
       limit: null,
       skill: null,
       notation: null,
+      parent: null,
+      tree: false,
       project: null,
       purge: false,
       fromStdin: false,
@@ -328,7 +343,7 @@ describe('parseTaskArgs', () => {
     expect(parseTaskArgs(['list', '--project', 'worker'])).toMatchObject({
       subcommand: 'list',
       project: 'worker',
-      root: '.skillstate',
+      root: '.state3',
     });
     expect(parseTaskArgs(['--project', 'worker', 'show'])).toMatchObject({ project: 'worker' });
     expect(() => parseTaskArgs(['--root', 'build/state', 'list', '--project', 'worker'])).toThrow(
@@ -392,22 +407,22 @@ describe('resolveTaskRoot', () => {
   const env = { [PROJECTS_VAR]: `worker=${workerRoot};review=${reviewRoot}` };
 
   it('resolves --root when no project is named', () => {
-    expect(resolveTaskRoot(parseTaskArgs(['list']), {})).toBe(resolve('.skillstate'));
+    expect(resolveTaskRoot(parseTaskArgs(['list']), {})).toBe(resolve('.state3'));
     expect(resolveTaskRoot(parseTaskArgs(['--root', 'build/state', 'list']), {})).toBe(
       resolve('build/state'),
     );
   });
 
   it('ignores the declared projects when no project is named', () => {
-    expect(resolveTaskRoot(parseTaskArgs(['list']), env)).toBe(resolve('.skillstate'));
+    expect(resolveTaskRoot(parseTaskArgs(['list']), env)).toBe(resolve('.state3'));
   });
 
-  it('looks a named project up in SKILLSTATE_PROJECTS', () => {
+  it('looks a named project up in STATE3_PROJECTS', () => {
     expect(resolveTaskRoot(parseTaskArgs(['list', '--project', 'worker']), env)).toBe(workerRoot);
     expect(resolveTaskRoot(parseTaskArgs(['show', '--project', 'review']), env)).toBe(reviewRoot);
   });
 
-  it('accepts the JSON form of SKILLSTATE_PROJECTS', () => {
+  it('accepts the JSON form of STATE3_PROJECTS', () => {
     const json = { [PROJECTS_VAR]: JSON.stringify({ worker: workerRoot }) };
     expect(resolveTaskRoot(parseTaskArgs(['list', '--project', 'worker']), json)).toBe(workerRoot);
   });
@@ -422,10 +437,10 @@ describe('resolveTaskRoot', () => {
   it('throws when the environment declares no projects', () => {
     const options = parseTaskArgs(['list', '--project', 'worker']);
     expect(() => resolveTaskRoot(options, {})).toThrow(
-      /--project needs SKILLSTATE_PROJECTS to declare project roots/,
+      /--project needs STATE3_PROJECTS to declare project roots/,
     );
     expect(() => resolveTaskRoot(options, { [PROJECTS_VAR]: '   ' })).toThrow(
-      /--project needs SKILLSTATE_PROJECTS/,
+      /--project needs STATE3_PROJECTS/,
     );
   });
 
@@ -443,24 +458,17 @@ describe('runTaskCommand', () => {
     const { deps, lines, roots } = makeDeps(store);
 
     await runTaskCommand(
-      parseTaskArgs([
-        'start',
-        'Migrate to zod 4',
-        '--plan',
-        'Read usages',
-        '--root',
-        '.skillstate',
-      ]),
+      parseTaskArgs(['start', 'Migrate to zod 4', '--plan', 'Read usages', '--root', '.state3']),
       deps,
     );
 
-    expect(roots).toEqual([resolve('.skillstate')]);
+    expect(roots).toEqual([resolve('.state3')]);
     expect(store.calls[0]).toBe('start|Migrate to zod 4|Read usages|-|-');
     expect(store.startOptions[0]).toEqual({ plan: ['Read usages'] });
     expect(lines[0]).toContain('Task task-1 [dev-task] (active):');
     expect(lines[0]).toContain('"goal":"Migrate to zod 4"');
     expect(lines[0]).not.toContain('\n  ');
-    expect(lines[1]).toContain('skillstate task patch');
+    expect(lines[1]).toContain('state3 task patch');
   });
 
   it('demonstrates a path patch in the start hint', async () => {
@@ -622,7 +630,7 @@ describe('runTaskCommand', () => {
     await runTaskCommand(parseTaskArgs(['list']), deps);
     expect(lines[0]).toBe('no tasks');
     // Every list ends with the build that answered, so a stale host is visible.
-    expect(lines[1]).toMatch(/^runtime: skillstate \S+ \(/);
+    expect(lines[1]).toMatch(/^runtime: state3 \S+ \(/);
 
     await store.start('Goal one', { plan: ['step a', 'step b'] });
     await runTaskCommand(parseTaskArgs(['list']), deps);
@@ -631,7 +639,7 @@ describe('runTaskCommand', () => {
     expect(lines[2]).toContain('active');
     expect(lines[2]).toContain('0/2');
     expect(lines[2]).toContain('Goal one');
-    expect(lines[3]).toMatch(/^runtime: skillstate /);
+    expect(lines[3]).toMatch(/^runtime: state3 /);
   });
 
   it('prints the help for --help and -h without touching any store', async () => {
@@ -641,7 +649,7 @@ describe('runTaskCommand', () => {
     await runTaskCommand(parseTaskArgs(['--help']), deps);
     expect(roots).toEqual([]);
     expect(store.calls).toEqual([]);
-    expect(lines[0]).toContain('skillstate task <subcommand>');
+    expect(lines[0]).toContain('state3 task <subcommand>');
     expect(lines[0]).toContain('start');
     expect(lines[0]).toContain('--notation');
 
@@ -753,8 +761,13 @@ describe('formatters', () => {
       status: 'active',
       skill: 'dev-task',
       updatedAt: '2026-09-05T00:00:01Z',
+      createdAt: '2026-09-05T00:00:00Z',
+      seq: 0,
       progressDone: 1,
       progressTotal: 2,
+      parent: null,
+      subtasks: 0,
+      openSubtasks: 0,
     },
     {
       id: 'task-2',
@@ -762,8 +775,13 @@ describe('formatters', () => {
       status: 'done',
       skill: 'supervise-task',
       updatedAt: '2026-09-05T00:00:02Z',
+      createdAt: '2026-09-05T00:00:01Z',
+      seq: 1,
       progressDone: 3,
       progressTotal: 3,
+      parent: null,
+      subtasks: 0,
+      openSubtasks: 0,
     },
   ];
 
@@ -775,8 +793,8 @@ describe('formatters', () => {
   it('formatTaskList prints id, skill, status, progress and goal in padded columns', () => {
     expect(formatTaskList(rows)).toBe(
       [
-        `task-1  ${'dev-task'.padEnd(14)}  ${'active'.padEnd(6)}  1/2  Ship the integration`,
-        `task-2  ${'supervise-task'.padEnd(14)}  ${'done'.padEnd(6)}  3/3  Review the worker`,
+        `task-1  ${'dev-task'.padEnd(14)}  ${'active'.padEnd(7)}  1/2  Ship the integration`,
+        `task-2  ${'supervise-task'.padEnd(14)}  ${'done'.padEnd(7)}  3/3  Review the worker`,
       ].join('\n'),
     );
   });
@@ -793,9 +811,75 @@ describe('formatters', () => {
   it('formatTaskList keeps a long skill name readable without breaking the row', () => {
     const line = formatTaskList([{ ...rows[0]!, skill: 'a-very-long-skill-name' }]).split('\n')[0];
     expect(line).toBe(
-      `task-1  a-very-long-skill-name  ${'active'.padEnd(6)}  1/2  Ship the integration`,
+      `task-1  a-very-long-skill-name  ${'active'.padEnd(7)}  1/2  Ship the integration`,
     );
     expect(line).toContain('a-very-long-skill-name');
+  });
+
+  /** A root split into two queued subtasks, newest first as list() returns them. */
+  const tree: TaskSummary[] = [
+    {
+      ...rows[1]!,
+      id: 'task-b2',
+      goal: 'Second piece',
+      status: 'pending',
+      skill: 'dev-task',
+      createdAt: '2026-09-05T00:00:03Z',
+      seq: 3,
+      progressDone: 0,
+      progressTotal: 0,
+      parent: 'task-1',
+      subtasks: 0,
+      openSubtasks: 0,
+    },
+    {
+      ...rows[1]!,
+      id: 'task-b1',
+      goal: 'First piece',
+      status: 'pending',
+      skill: 'dev-task',
+      createdAt: '2026-09-05T00:00:02Z',
+      seq: 2,
+      progressDone: 0,
+      progressTotal: 0,
+      parent: 'task-1',
+      subtasks: 0,
+      openSubtasks: 0,
+    },
+    { ...rows[0]!, subtasks: 2, openSubtasks: 2 },
+  ];
+
+  it('formatTaskList indents subtasks under the task they were split out of', () => {
+    const lines = formatTaskList(tree).split('\n');
+
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain('task-1');
+    expect(lines[0]).toContain('(2 subtasks, 2 open)');
+    expect(lines[0]).not.toMatch(/^\s/);
+    // Newest-first rows go back into the order the work was decomposed in.
+    expect(lines[1]).toContain('task-b1');
+    expect(lines[1]).toMatch(/^ {2}- /);
+    expect(lines[2]).toContain('task-b2');
+  });
+
+  it('formatTaskList prints an orphan as a root instead of dropping it', () => {
+    const text = formatTaskList([{ ...rows[0]!, id: 'task-x', parent: 'task-gone' }]);
+
+    expect(text).toContain('task-x');
+    expect(text).not.toContain('task-gone');
+  });
+
+  it('formatSubtree prints one decomposition and leaves another root out', async () => {
+    const store = new FakeStore();
+    const root = await store.start('Ship the release', {});
+    await store.start('First piece', { parent: root.meta.id });
+    await store.start('Unrelated work', {});
+
+    const text = await formatSubtree(store as unknown as TaskStorePort, root.meta.id);
+
+    expect(text).toContain('Ship the release');
+    expect(text).toContain('First piece');
+    expect(text).not.toContain('Unrelated work');
   });
 
   it('formatHistory prints one line per entry with the rejected category', () => {

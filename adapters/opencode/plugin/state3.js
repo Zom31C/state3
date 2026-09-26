@@ -1,12 +1,12 @@
-// skillstate plugin for opencode.
+// state3 plugin for opencode.
 //
-// Injects the external task state (Σ) from `.skillstate/` into the model context
+// Injects the external task state (Σ) from `.state3/` into the model context
 // so long tasks survive compaction and restarts, and optionally blocks risky tool
 // calls while the active task marks its next action as destructive/external.
 //
-// A root that holds `state.db` is read through the skillstate build (`readInjection` in
+// A root that holds `state.db` is read through the state3 build (`readInjection` in
 // `dist/tasks/inject.js`), because reading SQLite needs the driver — the same route the Qwen
-// Code hook takes, resolved by `SKILLSTATE_HOME` or by walking up from this file. Such a root is
+// Code hook takes, resolved by `STATE3_HOME` or by walking up from this file. Such a root is
 // authoritative: the JSON files beside it are the archive migration left behind, and injecting
 // them would show a Σ that is already out of date. The legacy JSON layout is still read here, so
 // a project that has not migrated needs no build at all — and only that half is self-contained.
@@ -15,9 +15,15 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const STATE_DIRNAME = '.skillstate';
+const STATE_DIRNAME = '.state3';
 const STATE_DB_FILENAME = 'state.db';
-/** Proves a directory is a built skillstate repository, as far as this plugin is concerned. */
+/**
+ * Mirrors LEGACY_STATE_DIRNAME in src/tasks/migrate-root.ts: the state directory of the
+ * pre-rename build. Only the name is mirrored, and only to keep the carry-over cheap — the
+ * copy itself is done by the build, so the two halves cannot disagree about what it means.
+ */
+const LEGACY_STATE_DIRNAME = '.skillstate';
+/** Proves a directory is a built state3 repository, as far as this plugin is concerned. */
 const INJECT_MARKER = join('dist', 'tasks', 'inject.js');
 // Above this size Σ stops being an O(1) prompt component, so the agent is told to compress it.
 const STATE_SIZE_HINT_CHARS = 4000;
@@ -49,15 +55,15 @@ async function loadActiveTask(stateDir) {
   return best;
 }
 
-/** The skillstate build to read a database through, or null when there is none to find. */
+/** The state3 build to read a database through, or null when there is none to find. */
 function findBuildHome() {
-  const fromEnv = process.env.SKILLSTATE_HOME;
+  const fromEnv = process.env.STATE3_HOME;
   if (typeof fromEnv === 'string' && fromEnv.trim() !== '') {
     const candidate = resolve(fromEnv);
     if (existsSync(join(candidate, INJECT_MARKER))) return candidate;
   }
   // Walking up only helps while the plugin runs in place (this repository, its tests, a
-  // `--self-test`); a copy inside `.opencode/plugins/` is found through SKILLSTATE_HOME alone.
+  // `--self-test`); a copy inside `.opencode/plugins/` is found through STATE3_HOME alone.
   let dir = dirname(fileURLToPath(import.meta.url));
   for (let depth = 0; depth < 8; depth++) {
     if (existsSync(join(dir, INJECT_MARKER))) return dir;
@@ -87,8 +93,30 @@ function reader() {
 }
 
 /**
- * What one state root holds, ready to inject: `{ head, brief, risk }`, or `{ warn }` when the
- * root holds a database this plugin cannot read, or null when there is nothing to inject.
+ * Carries a pre-rename state root over and returns the line worth reporting, or null.
+ *
+ * Gated on the filesystem rather than on the build, so a project with no state at all does not
+ * load dist on every request; the copy, its marker and the "somebody is writing this database"
+ * refusal belong to the build, so there is one implementation of the rule.
+ */
+async function carryOver(stateDir, hasDatabase) {
+  if (hasDatabase) return null;
+  if (basename(stateDir) !== STATE_DIRNAME) return null;
+  if (!existsSync(join(dirname(stateDir), LEGACY_STATE_DIRNAME))) return null;
+  const module = await reader();
+  if (module === null || typeof module.carryOverStateRoot !== 'function') return null;
+  try {
+    const note = module.carryOverStateRoot(stateDir);
+    return typeof note === 'string' ? note : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What one state root holds, ready to inject: `{ head, brief, risk }`, plus `warn` when there
+ * is something to say that does not replace the state — a root this plugin cannot read, or the
+ * one-time carry-over of a pre-rename root. Null when there is nothing to inject at all.
  *
  * `oncePerSession` asks for the two halves that are worth one look and not a tax on every
  * turn: the knowledge-base map, and the artifacts whose file changed on disk since Σ was
@@ -99,13 +127,22 @@ function reader() {
  */
 async function loadContext(stateDir, oncePerSession) {
   const dbPath = join(stateDir, STATE_DB_FILENAME);
+  // Ahead of the existence check below, because the carry-over can create the very database
+  // that check looks for: without it a renamed project reads as one that never had any state.
+  const carried = await carryOver(stateDir, existsSync(dbPath));
+  /** Attaches the one-time carry-over line to whatever this root answered, warnings aside. */
+  const withNote = (result) =>
+    carried === null || result === null || result.warn !== undefined
+      ? result
+      : { ...result, warn: carried };
+
   if (existsSync(dbPath)) {
     const module = await reader();
     if (module === null || typeof module.readInjection !== 'function') {
       return {
         warn:
-          `${dbPath} needs the skillstate build: run "npm run build" in the repository ` +
-          'and set SKILLSTATE_HOME to it',
+          `${dbPath} needs the state3 build: run "npm run build" in the repository ` +
+          'and set STATE3_HOME to it',
       };
     }
     let injection;
@@ -117,23 +154,28 @@ async function loadContext(stateDir, oncePerSession) {
     } catch (err) {
       return { warn: `cannot read ${dbPath}: ${err?.message ?? String(err)}` };
     }
-    if (injection === null || typeof injection !== 'object') return null;
+    if (injection === null || typeof injection !== 'object') return withNote(null);
     if (injection.kind === 'context') {
-      return {
+      return withNote({
         head: typeof injection.task === 'string' ? injection.task : null,
         brief: typeof injection.brief === 'string' ? injection.brief : null,
         risk: typeof injection.risk === 'string' ? injection.risk : null,
-      };
+      });
     }
     // A build from before the brief and the risk existed answers with Σ alone, under its own
     // kind. Accepted rather than dropped: losing Σ silently is the failure this plugin exists to
     // prevent, and the guard then degrades to not blocking instead of blocking everything.
-    if (injection.kind === 'head') return { head: injection.text, brief: null, risk: null };
+    if (injection.kind === 'head') {
+      return withNote({ head: injection.text, brief: null, risk: null });
+    }
     if (injection.kind === 'unreadable') {
       return { warn: `cannot read ${dbPath}: ${String(injection.reason)}` };
     }
-    return null;
+    return withNote(null);
   }
+
+  // No database, and the neighbour holding one could not be copied: a reason, not an empty root.
+  if (carried !== null) return { warn: carried };
 
   const record = await loadActiveTask(stateDir);
   if (record === null) return null;
@@ -166,7 +208,7 @@ const REMINDERS = [
 ];
 
 function stateBlock(head, purpose) {
-  return ['## Active task state (skillstate)', leadFor(purpose), head, ...REMINDERS]
+  return ['## Active task state (state3)', leadFor(purpose), head, ...REMINDERS]
     .filter((line) => line !== '')
     .join('\n');
 }
@@ -180,7 +222,7 @@ function stateBlock(head, purpose) {
  */
 function briefBlock(brief) {
   return [
-    '## Project brief (skillstate)',
+    '## Project brief (state3)',
     'What this project has written down for an agent with no context, as one line per page — a snapshot taken when this session started, so a page changed since then is newer than this.',
     brief,
   ].join('\n');
@@ -199,21 +241,31 @@ function isUsableProjectDir(candidate) {
   );
 }
 
+/**
+ * Whether a directory holds this project's state, under either name.
+ *
+ * The pre-rename one counts too: a project that has not been carried over yet is still the
+ * project, and preferring a candidate with no state at all would point every hook at an empty
+ * root while the real one sits beside it.
+ */
 async function hasStateDir(dir) {
-  try {
-    return (await stat(join(dir, STATE_DIRNAME))).isDirectory();
-  } catch {
-    return false;
+  for (const name of [STATE_DIRNAME, LEGACY_STATE_DIRNAME]) {
+    try {
+      if ((await stat(join(dir, name))).isDirectory()) return true;
+    } catch {
+      // Not under this name; the next one, or false, is the answer.
+    }
   }
+  return false;
 }
 
 async function resolveProjectDir({ directory, worktree, project }) {
-  const explicit = process.env.SKILLSTATE_ROOT;
+  const explicit = process.env.STATE3_ROOT;
   if (isUsableProjectDir(explicit)) return explicit;
   const candidates = [directory, worktree, project?.worktree, process.cwd()].filter(
     isUsableProjectDir,
   );
-  // The directory that actually holds .skillstate wins; otherwise take the best guess.
+  // The directory that actually holds .state3 wins; otherwise take the best guess.
   for (const candidate of candidates) {
     if (await hasStateDir(candidate)) return candidate;
   }
@@ -223,19 +275,19 @@ async function resolveProjectDir({ directory, worktree, project }) {
 // Same escape hatch as the MCP server: an explicit state directory wins over the
 // project-dir heuristic, for hosts started outside the project.
 function resolveStateDir(projectDir) {
-  const fromEnv = process.env.SKILLSTATE_STATE_DIR;
+  const fromEnv = process.env.STATE3_STATE_DIR;
   if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return resolve(fromEnv);
   return join(projectDir, STATE_DIRNAME);
 }
 
-export const Skillstate = async ({ directory, worktree, project, client }) => {
+export const State3 = async ({ directory, worktree, project, client }) => {
   const projectDir = await resolveProjectDir({ directory, worktree, project });
   const stateDir = resolveStateDir(projectDir);
-  const guarded = process.env.SKILLSTATE_GUARD === '1';
+  const guarded = process.env.STATE3_GUARD === '1';
 
   const log = async (level, message) => {
     try {
-      await client.app.log({ body: { service: 'skillstate', level, message } });
+      await client.app.log({ body: { service: 'state3', level, message } });
     } catch {
       // Logging must never break a hook.
     }
@@ -251,14 +303,17 @@ export const Skillstate = async ({ directory, worktree, project, client }) => {
       const oncePerSession = purpose === 'compacting' || !briefed.has(key);
       const context = await loadContext(stateDir, oncePerSession);
       if (context === null) return [];
-      if (context.warn !== undefined) {
-        await log('warn', context.warn);
-        return [];
-      }
-      if (context.brief !== null) briefed.add(key);
+      // A warning no longer ends the read. It used to be the only thing a warning could
+      // accompany — an unreadable root, which has no Σ to inject — and the carry-over of a
+      // pre-rename root is reported on the very call that first injects from it: dropping the
+      // state to announce where it came from would cost more than the announcement is worth.
+      if (context.warn !== undefined) await log('warn', context.warn);
+      const head = typeof context.head === 'string' ? context.head : null;
+      const brief = typeof context.brief === 'string' ? context.brief : null;
+      if (brief !== null) briefed.add(key);
       const blocks = [];
-      if (context.head !== null) blocks.push(stateBlock(context.head, purpose));
-      if (context.brief !== null) blocks.push(briefBlock(context.brief));
+      if (head !== null) blocks.push(stateBlock(head, purpose));
+      if (brief !== null) blocks.push(briefBlock(brief));
       return blocks;
     } catch (err) {
       await log('debug', `state read failed: ${err?.message ?? String(err)}`);
@@ -275,13 +330,13 @@ export const Skillstate = async ({ directory, worktree, project, client }) => {
 
   // Present in the 1.18.26 plugin typings (not in the public docs): the system
   // prompt of every request, which keeps Σ in context turn by turn.
-  if (process.env.SKILLSTATE_NO_SYSTEM !== '1') {
+  if (process.env.STATE3_NO_SYSTEM !== '1') {
     hooks['experimental.chat.system.transform'] = async (input, output) => {
       for (const block of await readBlocks('system', input)) output.system.push(block);
     };
   }
 
-  // Opt-in (SKILLSTATE_GUARD=1): documented way to block a tool call is to throw.
+  // Opt-in (STATE3_GUARD=1): documented way to block a tool call is to throw.
   if (guarded) {
     hooks['tool.execute.before'] = async (input) => {
       if (!GUARDED_TOOLS.has(input.tool)) return;
@@ -289,7 +344,7 @@ export const Skillstate = async ({ directory, worktree, project, client }) => {
       const risk = context?.risk;
       if (typeof risk === 'string' && RISKY.has(risk)) {
         throw new Error(
-          `skillstate: the active task marks its next action as "${risk}". ` +
+          `state3: the active task marks its next action as "${risk}". ` +
             `Ask the user for confirmation before running "${input.tool}", then set next.risk to "safe" in the task state.`,
         );
       }
@@ -299,12 +354,12 @@ export const Skillstate = async ({ directory, worktree, project, client }) => {
   await log(
     'info',
     `loaded (state: ${stateDir}, build: ${findBuildHome() ?? 'none — legacy JSON only'}, ` +
-      `system injection: ${process.env.SKILLSTATE_NO_SYSTEM !== '1'}, guard: ${guarded})`,
+      `system injection: ${process.env.STATE3_NO_SYSTEM !== '1'}, guard: ${guarded})`,
   );
   return hooks;
 };
 
-// `node skillstate.js --self-test [projectDir]` prints what the hooks would inject.
+// `node state3.js --self-test [projectDir]` prints what the hooks would inject.
 const invokedDirectly =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 
@@ -317,18 +372,19 @@ if (invokedDirectly && process.argv.includes('--self-test')) {
   const context = await loadContext(stateDir, true);
   if (context === null) {
     console.log(`nothing to inject in ${stateDir} (no open task, no pages)`);
-  } else if (context.warn !== undefined) {
-    console.log(`warning: ${context.warn}`);
   } else {
-    const sections = [
-      ['experimental.chat.system.transform', 'system'],
-      ['experimental.session.compacting', 'compacting'],
-    ];
-    for (const [hook, purpose] of sections) {
-      console.log(`--- ${hook} ---`);
-      if (context.head !== null) console.log(stateBlock(context.head, purpose));
-      if (context.brief !== null) console.log(briefBlock(context.brief));
-      console.log('');
+    if (context.warn !== undefined) console.log(`warning: ${context.warn}`);
+    if (context.head != null || context.brief != null) {
+      const sections = [
+        ['experimental.chat.system.transform', 'system'],
+        ['experimental.session.compacting', 'compacting'],
+      ];
+      for (const [hook, purpose] of sections) {
+        console.log(`--- ${hook} ---`);
+        if (context.head != null) console.log(stateBlock(context.head, purpose));
+        if (context.brief != null) console.log(briefBlock(context.brief));
+        console.log('');
+      }
     }
   }
 }

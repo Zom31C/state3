@@ -25,7 +25,7 @@ export interface SqlStatement {
   all(...params: SqlParam[]): unknown[];
 }
 
-/** Structural subset of the database handle skillState uses. */
+/** Structural subset of the database handle state3 uses. */
 export interface SqlDatabase {
   prepare(sql: string): SqlStatement;
   exec(sql: string): void;
@@ -53,7 +53,7 @@ function readVersion(db: SqlDatabase): number {
 }
 
 /**
- * Creates or upgrades the schema. Refuses a database from a NEWER skillState:
+ * Creates or upgrades the schema. Refuses a database from a NEWER state3:
  * downgrading silently would let this build drop columns it does not know about.
  */
 export function ensureSchema(db: SqlDatabase, file: string): { created: boolean; from: number } {
@@ -61,8 +61,8 @@ export function ensureSchema(db: SqlDatabase, file: string): { created: boolean;
 
   if (from > SCHEMA_VERSION) {
     throw new DatabaseSchemaError(
-      `${file} uses schema version ${from}, but this skillState build only understands ` +
-        `up to ${SCHEMA_VERSION}. Upgrade skillState instead of opening this database with an older one.`,
+      `${file} uses schema version ${from}, but this state3 build only understands ` +
+        `up to ${SCHEMA_VERSION}. Upgrade state3 instead of opening this database with an older one.`,
     );
   }
 
@@ -77,7 +77,7 @@ export function ensureSchema(db: SqlDatabase, file: string): { created: boolean;
         if (steps === undefined) {
           throw new DatabaseSchemaError(
             `${file} is at schema version ${version} and this build has no migration to ` +
-              `${version + 1}. Restore a backup, or re-run skillState migrate from the JSON export.`,
+              `${version + 1}. Restore a backup, or re-run state3 migrate from the JSON export.`,
           );
         }
         for (const statement of steps) db.exec(statement);
@@ -125,7 +125,7 @@ export function openStateDatabase(file: string, options: OpenOptions = {}): SqlD
   } catch (err) {
     throw new DatabaseSchemaError(
       `cannot open ${describe(file, err)}. If the file is corrupt, restore it from ` +
-        'version control or re-run skillState migrate against the JSON export.',
+        'version control or re-run state3 migrate against the JSON export.',
     );
   }
 

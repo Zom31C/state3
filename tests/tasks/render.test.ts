@@ -34,9 +34,10 @@ function makeTask(state: DevTaskState, id = 'task-9', notation: Notation = 'plai
       id,
       createdAt: 'c',
       updatedAt: 'u',
-      path: `.skillstate/${id}.json`,
+      path: `.state3/${id}.json`,
       skill: 'dev-task',
       notation,
+      parent: null,
     },
     state: state as unknown as StateDict,
   };

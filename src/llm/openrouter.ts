@@ -18,7 +18,7 @@ export class OpenRouterProvider implements LLMProvider {
       baseUrl: config.baseUrl.replace(/\/+$/, ''),
       apiKey: config.apiKey,
       model: config.model,
-      extraHeaders: { 'X-Title': 'skillState' },
+      extraHeaders: { 'X-Title': 'state3' },
     };
   }
 

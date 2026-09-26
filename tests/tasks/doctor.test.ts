@@ -11,7 +11,7 @@ let dir: string;
 const open: { close(): void }[] = [];
 
 beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'skillstate-doctor-'));
+  dir = await mkdtemp(path.join(tmpdir(), 'state3-doctor-'));
 });
 
 afterEach(async () => {

@@ -9,7 +9,13 @@ import { artifactWarnings, missingArtifactPaths } from '../tasks/artifacts.js';
 import { isNotation, NOTATIONS } from '../tasks/notation.js';
 import type { ProjectEntry, StoreResolver, TaskStorePort } from '../tasks/ports.js';
 import { describeProjects } from '../tasks/projects.js';
-import { renderStateSize, renderTaskHead } from '../tasks/render.js';
+import {
+  formatTaskList,
+  renderStateSize,
+  renderTaskHead,
+  subtreeRows,
+  treeOrder,
+} from '../tasks/render.js';
 import type {
   HistoryEntry,
   PatchReport,
@@ -62,8 +68,11 @@ const REMINDER =
   'Keep this state current: after every meaningful step call task_patch with only the fields that changed. ' +
   'Call task_show to reload the state and the procedure whenever the session was compacted or restarted.';
 
-/** What `task_show` answers with: Σ and the procedure, or the cost of each field of Σ. */
-export const TASK_SHOW_VIEWS = ['state', 'size'] as const;
+/**
+ * What `task_show` answers with: Σ and the procedure, the cost of each field of Σ, or the
+ * decomposition under the task.
+ */
+export const TASK_SHOW_VIEWS = ['state', 'size', 'tree'] as const;
 
 const NO_TASK_HINT = 'Start one with task_start, or list existing tasks with task_list.';
 
@@ -223,11 +232,24 @@ export function renderStateWithProcedure(store: TaskStorePort, task: StoredTask)
   return `${head}\n\n## How to keep this state (P)\n${instructions}`;
 }
 
-function renderSummary(summary: TaskSummary): string {
+/**
+ * One task of a listing, indented by how deep it sits in the decomposition.
+ *
+ * The indentation is what makes the queue readable without carrying it: a prompt no longer holds
+ * the tasks queued behind the work in flight, so the listing is where an agent goes to see them,
+ * and a flat run of ids would not say which of them belongs to which.
+ */
+function renderSummary(summary: TaskSummary, depth: number): string {
+  const indent = depth === 0 ? '' : '  '.repeat(depth);
+  const split =
+    summary.subtasks === 0
+      ? ''
+      : `  (${summary.subtasks} subtask${summary.subtasks === 1 ? '' : 's'}, ` +
+        `${summary.openSubtasks} open)`;
   return (
-    `- ${summary.id} [${summary.skill}] (${summary.status}) ` +
+    `${indent}- ${summary.id} [${summary.skill}] (${summary.status}) ` +
     `progress ${summary.progressDone}/${summary.progressTotal}` +
-    ` updated ${summary.updatedAt} — ${summary.goal}`
+    ` updated ${summary.updatedAt} — ${summary.goal}${split}`
   );
 }
 
@@ -285,17 +307,29 @@ async function startTask(
   if (notation.value !== undefined && !isNotation(notation.value)) {
     return failure(`argument notation must be one of: ${NOTATIONS.join(', ')}`);
   }
+  const parent = optionalString(args, 'parent');
+  if (!parent.ok) return failure(parent.message);
 
   const options: StartOptions = {};
   if (plan.value !== undefined) options.plan = plan.value;
   if (skill.value !== undefined) options.skill = skill.value;
   if (notation.value !== undefined && isNotation(notation.value)) options.notation = notation.value;
+  if (parent.value !== undefined) options.parent = parent.value;
 
   try {
     const task = await store.start(goal.value, options);
+    // A subtask is queued, not in flight, so the standing reminder to patch Σ after every step
+    // would be advice to start work the runtime has put behind something else. What it needs
+    // instead is to know whose it is and when it comes up.
+    const tail =
+      task.meta.parent === null
+        ? REMINDER
+        : `Queued as a subtask of ${task.meta.parent}: it is handed over once the work in ` +
+          'flight is closed, so there is nothing of it to patch yet. task_show {"view":"tree"} ' +
+          'prints the decomposition.';
     return success(
       `Started task ${task.meta.id} [${task.meta.skill}] at ${task.meta.path}.\n\n` +
-        `${renderState(task)}\n\n${REMINDER}`,
+        `${renderState(task)}\n\n${tail}`,
     );
   } catch (err) {
     return failure(patchFailureMessage(classifyError(err), rootNote(store)));
@@ -322,6 +356,12 @@ async function showTask(
     // The size report answers "what should I compress", so it carries no Σ and no procedure:
     // both are what it is measuring, and repeating them would cost what the call saves.
     if (view.value === 'size') return success(renderStateSize(task.state));
+    // One line per task and no Σ: this answers "what is left under here", which is a question
+    // about the tree rather than about any single state, and the tree is what a prompt does not
+    // carry — so this is the call to make before deciding what to work on next.
+    if (view.value === 'tree') {
+      return success(formatTaskList(subtreeRows(await store.list(), task.meta.id)));
+    }
     const parts = [renderStateWithProcedure(store, task)];
     // A read is the moment to compare Σ against the tree: this is the call a resumed session
     // makes before acting on what Σ says, and the tree may have been changed by hand while
@@ -425,7 +465,11 @@ async function listTasks(
     const capabilities = await renderCapabilities(resolver, store);
     if (summaries.length === 0) return success(`no tasks${rootNote(store)}${capabilities}`);
     return success(
-      `Tasks (${summaries.length}):\n${summaries.map(renderSummary).join('\n')}${capabilities}`,
+      `Tasks (${summaries.length}):\n` +
+        `${treeOrder(summaries)
+          .map(({ row, depth }) => renderSummary(row, depth))
+          .join('\n')}` +
+        capabilities,
     );
   } catch (err) {
     return failureFromError(err, rootNote(store));
@@ -491,6 +535,11 @@ const START_SCHEMA: Record<string, unknown> = {
       description:
         'How state values must be written: "plain" prose, or "compact" pseudocode that costs fewer tokens on every turn. Omit for plain.',
     },
+    parent: {
+      type: 'string',
+      description:
+        'Id of the task to split this one out of, which makes it a subtask queued behind the work in flight. Omit it for a root task. Prefer this over more plan items for a step that is large enough to be delegated or to span a session: Σ is carried on every prompt, so a queued subtask costs one line in its parent, while a queued plan item costs its full text on every turn.',
+    },
     project: PROJECT_ARG,
   },
   required: ['goal'],
@@ -505,7 +554,7 @@ const SHOW_SCHEMA: Record<string, unknown> = {
       type: 'string',
       enum: [...TASK_SHOW_VIEWS],
       description:
-        'state (default): Σ with the procedure for keeping it. size: no Σ — how many characters each field of Σ costs, largest first, which is what to shorten when the state has grown.',
+        'state (default): Σ with the procedure for keeping it. size: no Σ — how many characters each field of Σ costs, largest first, which is what to shorten when the state has grown. tree: no Σ — this task and everything split out of it, one line each, which is what to read before deciding what to work on next.',
     },
     project: PROJECT_ARG,
   },
@@ -565,14 +614,14 @@ export function createTaskTools(resolver: StoreResolver): TaskToolDefinition[] {
     {
       name: 'task_start',
       description:
-        'Start a new task whose state lives outside the conversation, so it survives session compaction. Call it once when a multi-step job begins, with a one-sentence goal, the skill that fits the job, and an optional ordered plan. Returns the new task id and its initial state.',
+        'Start a new task whose state lives outside the conversation, so it survives session compaction. Call it once when a multi-step job begins, with a one-sentence goal, the skill that fits the job, and an optional ordered plan. Pass parent to split a piece out of a task that is already running: it is queued behind the work in flight instead of riding along in a plan the prompt carries on every turn. Returns the new task id and its initial state.',
       inputSchema: START_SCHEMA,
       handler: (args) => guarded(args, (a) => startTask(resolver, a)),
     },
     {
       name: 'task_show',
       description:
-        'Read the compact current state of the active task (or a task by id), together with the procedure for keeping that state. Call it first after the session was compacted or restarted, and any time you are unsure what has already been done.',
+        'Read the compact current state of the active task (or a task by id), together with the procedure for keeping that state. Call it first after the session was compacted or restarted, and any time you are unsure what has already been done. With view "tree" it answers with the decomposition under a task instead of its state.',
       inputSchema: SHOW_SCHEMA,
       handler: (args) => guarded(args, (a) => showTask(resolver, a)),
     },
@@ -593,7 +642,7 @@ export function createTaskTools(resolver: StoreResolver): TaskToolDefinition[] {
     {
       name: 'task_list',
       description:
-        'List every tracked task with its skill, status and progress, plus the skills and projects this runtime knows. Call it to recover a task id when nothing is active, or to see what a new task can be.',
+        'List every tracked task as a tree, with its skill, status and progress, plus the skills and projects this runtime knows. Call it to recover a task id when nothing is active, to see the queue behind the work in flight, or to see what a new task can be.',
       inputSchema: LIST_SCHEMA,
       handler: (args) => guarded(args, (a) => listTasks(resolver, a)),
     },

@@ -29,6 +29,11 @@ export interface TaskStorePort {
   instructionsFor(task: StoredTask): string;
   /** Skills this store can create tasks for; optional so test fakes stay small. */
   skillNames?(): string[];
+  /**
+   * What carrying a pre-rename state root over did, or null. Optional for the same reason as
+   * `driftedArtifacts`: an entry point that cannot report it loses one line, not any state.
+   */
+  carryOverNote?(): string | null;
 }
 
 /** A named state root besides the primary one. */

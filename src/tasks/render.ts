@@ -1,7 +1,8 @@
 import { isPlainObject } from '../core/state.js';
 import type { StateDict, StateValue } from '../core/types.js';
 import { notationReminder } from './notation.js';
-import type { StoredTask } from './store.js';
+import { queueOrder } from './store.js';
+import type { StoredTask, TaskSummary } from './store.js';
 
 /** Above this size Σ stops being an O(1) prompt component, so the agent is told to compress it. */
 export const STATE_SIZE_HINT_CHARS = 4000;
@@ -335,4 +336,93 @@ export function renderTaskBrief(task: StoredTask): string {
   if (blockers !== null) lines.push(`blocked: ${blockers}`);
 
   return lines.filter((line) => line !== '').join('\n');
+}
+
+/**
+ * One task's decomposition: the task itself, then each descendant behind its parent.
+ *
+ * Widened one level per pass until the set stops growing, so a cycle in `parent` — corrupt data,
+ * not a state any sequence of calls can produce — costs one extra pass instead of an endless
+ * walk. Order comes from the rows, which a listing already carries newest first; siblings are
+ * put back into the order they were split out of, because that is the order the work reads in.
+ */
+export function subtreeRows(rows: readonly TaskSummary[], id: string): TaskSummary[] {
+  const wanted = new Set<string>([id]);
+  for (;;) {
+    const before = wanted.size;
+    for (const row of rows) {
+      if (row.parent !== null && wanted.has(row.parent)) wanted.add(row.id);
+    }
+    if (wanted.size === before) break;
+  }
+  return rows.filter((row) => wanted.has(row.id));
+}
+
+/** One row of a listing, with the depth it sits at in the decomposition. */
+export interface TreeRow {
+  row: TaskSummary;
+  depth: number;
+}
+
+/**
+ * The rows in tree order: each task behind the one it was split out of, siblings in the order
+ * they were split.
+ *
+ * Built from `parent` and `queueOrder` rather than from a stored depth, because the rows are
+ * already in hand and a decomposition is a handful of levels deep. An orphan — a parent this list
+ * does not hold, which is what a task whose Σ this runtime cannot validate looks like from here
+ * — is printed as a root instead of disappearing: hiding a task is worse than misplacing one. A
+ * cycle leaves its tasks unvisited by the walk, and they are appended flat at the end, because
+ * "every task is in the listing" is the one property it owes whatever the tree looks like.
+ */
+export function treeOrder(rows: readonly TaskSummary[]): TreeRow[] {
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const childrenOf = new Map<string, TaskSummary[]>();
+  const roots: TaskSummary[] = [];
+  for (const row of rows) {
+    // Not its own parent: a self-referencing row is corrupt data, and treating it as a root
+    // keeps it visible instead of making the walk below loop on it.
+    if (row.parent !== null && row.parent !== row.id && byId.has(row.parent)) {
+      const siblings = childrenOf.get(row.parent) ?? [];
+      siblings.push(row);
+      childrenOf.set(row.parent, siblings);
+    } else {
+      roots.push(row);
+    }
+  }
+  for (const siblings of childrenOf.values()) siblings.sort(queueOrder);
+
+  const out: TreeRow[] = [];
+  const seen = new Set<string>();
+  const walk = (row: TaskSummary, depth: number): void => {
+    if (seen.has(row.id)) return;
+    seen.add(row.id);
+    out.push({ row, depth });
+    for (const child of childrenOf.get(row.id) ?? []) walk(child, depth + 1);
+  };
+  for (const root of roots) walk(root, 0);
+  for (const row of rows) {
+    if (seen.has(row.id)) continue;
+    seen.add(row.id);
+    out.push({ row, depth: 0 });
+  }
+  return out;
+}
+
+/** The task list as the tree it is, in the fixed-width columns the CLI prints. */
+export function formatTaskList(rows: readonly TaskSummary[]): string {
+  if (rows.length === 0) return 'no tasks';
+  return treeOrder(rows)
+    .map(({ row, depth }) => {
+      const indent = depth === 0 ? '' : `${'  '.repeat(depth)}- `;
+      const split =
+        row.subtasks === 0
+          ? ''
+          : `  (${row.subtasks} subtask${row.subtasks === 1 ? '' : 's'}, ${row.openSubtasks} open)`;
+      return (
+        `${indent}${row.id}  ${row.skill.padEnd(14)}  ${row.status.padEnd(7)}  ` +
+        `${row.progressDone}/${row.progressTotal}  ${row.goal}${split}`
+      );
+    })
+    .join('\n');
 }

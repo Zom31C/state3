@@ -2,6 +2,7 @@ import { mkdir, rename, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { readLegacyRoot } from './legacy.js';
 import type { LegacyUnreadable } from './legacy.js';
+import { migrateLegacyStateRoot, rootMigrationNote } from './migrate-root.js';
 import { builtinSkillRegistry } from './registry.js';
 import type { SkillRegistry } from './registry.js';
 import { TaskStore } from './store.js';
@@ -26,6 +27,11 @@ export interface MigrationReport {
   archivedTo: string | null;
   /** Legacy files taken out of the root, archived or deleted. */
   filesHandled: number;
+  /**
+   * What carrying the pre-rename root over did, when this run had to do it first. Null in the
+   * ordinary case: a root that was never renamed, or one already carried over.
+   */
+  rootNote: string | null;
 }
 
 export interface MigrateOptions {
@@ -81,6 +87,10 @@ export async function migrateRootToDatabase(
   options: MigrateOptions = {},
 ): Promise<MigrationReport> {
   const registry = options.registry ?? builtinSkillRegistry();
+  // Carried over before the legacy records are read: a project renamed while its state was
+  // still in the JSON layout keeps those files under the old directory name, and reading the
+  // new root first would answer "nothing to migrate" about a root full of history.
+  const rootNote = rootMigrationNote(migrateLegacyStateRoot(rootDir));
   const legacy = await readLegacyRoot(rootDir);
   const store = new TaskStore(rootDir, registry);
 
@@ -92,6 +102,7 @@ export async function migrateRootToDatabase(
     unreadable: legacy.unreadable,
     archivedTo: null,
     filesHandled: 0,
+    rootNote,
   };
 
   try {
@@ -146,6 +157,7 @@ export async function migrateRootToDatabase(
 /** Plain-text summary of a migration, one line per outcome. */
 export function formatMigrationReport(report: MigrationReport): string {
   const lines: string[] = [`state root: ${report.rootDir}`, `database:   ${report.dbPath}`];
+  if (report.rootNote !== null) lines.push(report.rootNote);
 
   if (report.migrated.length === 0 && report.alreadyInDatabase.length === 0) {
     lines.push('nothing to migrate: no legacy task records in this root');

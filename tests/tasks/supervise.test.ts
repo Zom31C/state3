@@ -34,7 +34,7 @@ function makeState(overrides: StateDict = {}): StateDict {
     goal: 'Review the worker',
     status: 'active',
     spec: 'SPEC.md rev 3',
-    worker: 'qwen3 on LM Studio, state at .skillstate',
+    worker: 'qwen3 on LM Studio, state at .state3',
     rounds: [],
     decisions: [],
     blockers: [],

@@ -17,7 +17,7 @@ let dir: string;
 let store: TaskStore;
 
 beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'skillstate-stamps-'));
+  dir = await mkdtemp(path.join(tmpdir(), 'state3-stamps-'));
   store = new TaskStore(dir);
 });
 
@@ -52,7 +52,7 @@ describe('artifactKeys', () => {
         'src/reader.ts': 'the reader',
         '.qwen/tmp/': 'scratch',
         'D:\\other\\project\\car.cs': 'somewhere else',
-        'github.com/Zom31C/skillState': 'a remote',
+        'github.com/Zom31C/state3': 'a remote',
         документация: 'a note in the user language',
       }),
     );

@@ -13,7 +13,7 @@ let dir: string;
 let store: TaskStore;
 
 beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'skillstate-inject-'));
+  dir = await mkdtemp(path.join(tmpdir(), 'state3-inject-'));
   store = new TaskStore(dir);
 });
 
@@ -83,7 +83,7 @@ function writePage(store: TaskStore, summary: string): void {
   new PageStore(store).put({
     id: 'project',
     kind: 'project',
-    title: 'skillState',
+    title: 'state3',
     summary,
     body: 'A body the brief must not carry.',
   });

@@ -10,7 +10,7 @@ const repoRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
 const isRepo = existsSync(join(repoRoot, '.git'));
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'skillstate-git-'));
+  return mkdtempSync(join(tmpdir(), 'state3-git-'));
 }
 
 describe('gitHead', () => {

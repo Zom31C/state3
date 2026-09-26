@@ -11,7 +11,7 @@ function serverPathFrom(argv) {
   const value = argv[index + 1];
   if (value === undefined) {
     console.error(
-      '--server expects a path, for example --server extensions/skillstate/bin/skillstate-mcp.mjs',
+      '--server expects a path, for example --server extensions/state3/bin/state3-mcp.mjs',
     );
     process.exit(1);
   }
@@ -31,16 +31,16 @@ const check = (label, ok, detail = '') => {
   console.log(`${ok === true ? 'PASS' : 'FAIL'}  ${label}${detail === '' ? '' : ` — ${detail}`}`);
 };
 
-const root = mkdtempSync(join(tmpdir(), 'skillstate-mcp-'));
+const root = mkdtempSync(join(tmpdir(), 'state3-mcp-'));
 // A second root, declared by name: the scaffolding is exercised on a project that holds nothing
 // yet, and the "project" argument — which no other check here reaches — is exercised at all.
-const kbRoot = mkdtempSync(join(tmpdir(), 'skillstate-mcp-kb-'));
+const kbRoot = mkdtempSync(join(tmpdir(), 'state3-mcp-kb-'));
 const client = new Client({ name: 'mcp-smoke', version: '0.0.0' });
 await client.connect(
   new StdioClientTransport({
     command: process.execPath,
     args: [serverPath, '--root', root],
-    env: { ...process.env, SKILLSTATE_PROJECTS: `kbinit=${kbRoot}` },
+    env: { ...process.env, STATE3_PROJECTS: `kbinit=${kbRoot}` },
     stderr: 'pipe',
   }),
 );
@@ -124,20 +124,20 @@ try {
     const run = spawnSync(
       process.execPath,
       [
-        join(process.cwd(), 'extensions', 'skillstate', 'hooks', 'inject-state.mjs'),
+        join(process.cwd(), 'extensions', 'state3', 'hooks', 'inject-state.mjs'),
         '--self-test',
         root,
         ...(eventName === null ? [] : [eventName]),
       ],
       {
         encoding: 'utf8',
-        // `--self-test <dir>` makes the hook append `.skillstate`, and the server was started
+        // `--self-test <dir>` makes the hook append `.state3`, and the server was started
         // with the state root itself, so the root has to be pinned explicitly.
         env: {
           ...process.env,
-          SKILLSTATE_HOME: process.cwd(),
-          SKILLSTATE_PROJECTS: '',
-          SKILLSTATE_STATE_DIR: root,
+          STATE3_HOME: process.cwd(),
+          STATE3_PROJECTS: '',
+          STATE3_STATE_DIR: root,
         },
       },
     );
@@ -173,7 +173,7 @@ try {
       subagentHook.context.includes('goal: Smoke the stdio MCP server') &&
       subagentHook.context.includes('next: ') &&
       !subagentHook.context.includes('"artifacts"') &&
-      !subagentHook.context.includes('## Project brief (skillstate)'),
+      !subagentHook.context.includes('## Project brief (state3)'),
     subagentHook.context.split('\n')[0],
   );
 
@@ -339,7 +339,7 @@ try {
   const startHook = runHook('SessionStart');
   check(
     'inject-state hook adds the project brief at session start, Σ still first',
-    startHook.context.includes('## Project brief (skillstate)') &&
+    startHook.context.includes('## Project brief (state3)') &&
       startHook.context.includes('- project: One line a cold agent reads first.') &&
       startHook.context.includes('Smoke the stdio MCP server') &&
       startHook.context.indexOf('## Active task state') <
@@ -349,7 +349,7 @@ try {
   );
   check(
     'inject-state hook keeps the brief out of a prompt',
-    !runHook().context.includes('## Project brief (skillstate)'),
+    !runHook().context.includes('## Project brief (state3)'),
   );
 
   // Σ describes a tree, and a tree can be changed by hand between sessions. The stamp a patch
@@ -382,19 +382,19 @@ try {
   // silently loses both Σ and the guard that reads next.risk.
   const plugin = spawnSync(
     process.execPath,
-    [join(process.cwd(), 'adapters', 'opencode', 'plugin', 'skillstate.js'), '--self-test', root],
+    [join(process.cwd(), 'adapters', 'opencode', 'plugin', 'state3.js'), '--self-test', root],
     {
       encoding: 'utf8',
-      env: { ...process.env, SKILLSTATE_HOME: process.cwd(), SKILLSTATE_STATE_DIR: root },
+      env: { ...process.env, STATE3_HOME: process.cwd(), STATE3_STATE_DIR: root },
     },
   );
   const pluginOut = String(plugin.stdout ?? '');
   check(
     'opencode plugin injects Σ and the brief out of the database',
     plugin.status === 0 &&
-      pluginOut.includes('## Active task state (skillstate)') &&
+      pluginOut.includes('## Active task state (state3)') &&
       pluginOut.includes('Smoke the stdio MCP server') &&
-      pluginOut.includes('## Project brief (skillstate)') &&
+      pluginOut.includes('## Project brief (state3)') &&
       pluginOut.includes('- project: One line a cold agent reads first.') &&
       !pluginOut.includes('quixotic'),
     pluginOut.split('\n')[0] || String(plugin.stderr ?? '').split('\n')[0],
@@ -545,6 +545,60 @@ try {
       !text(sizes).includes('## How to keep this state (P)'),
     text(sizes).split('\n')[0],
   );
+
+  // The tree, end to end: work split into subtasks is queued in rows, so a prompt stops carrying
+  // it. Checked through the real server and the real hook, because what it buys is exactly what
+  // a prompt no longer pays for, and no unit test sees the prompt.
+  const subtaskId = (result) => String(text(result).match(/Started task (\S+)/)?.[1] ?? '');
+  const pieceOne = await call('task_start', { goal: 'Piece one of the smoke', parent: taskId });
+  const pieceTwo = await call('task_start', { goal: 'Piece two of the smoke', parent: taskId });
+  check(
+    'task_start splits a piece out of a task and queues it instead of starting it',
+    pieceOne.isError !== true &&
+      text(pieceOne).includes('"status":"pending"') &&
+      text(pieceOne).includes(`Queued as a subtask of ${taskId}`),
+    text(pieceOne).split('\n')[0],
+  );
+
+  const treeList = await call('task_list', {});
+  check(
+    'task_list prints the decomposition as a tree, with the queue counted on its parent',
+    text(treeList).includes('Tasks (3)') &&
+      text(treeList).includes('(2 subtasks, 2 open)') &&
+      /^ {2}- task-/m.test(text(treeList)),
+    text(treeList).split('\n')[1],
+  );
+
+  const treeView = await call('task_show', { id: taskId, view: 'tree' });
+  check(
+    'task_show {"view":"tree"} answers with the decomposition and carries no Σ',
+    treeView.isError !== true &&
+      text(treeView).includes('Piece one of the smoke') &&
+      text(treeView).includes('Piece two of the smoke') &&
+      !text(treeView).includes('"goal"'),
+    text(treeView).split('\n')[0],
+  );
+
+  const branchHook = runHook('UserPromptSubmit');
+  check(
+    'the injection carries the branch and the next sibling, and no queued state',
+    branchHook.context.includes('Branch: Smoke the stdio MCP server [active] -> this task') &&
+      branchHook.context.includes('Queued after this: "Piece two of the smoke"') &&
+      // The sibling behind the work in flight is named, not carried: its Σ is what a flat plan
+      // would have put in the prompt on every turn of the piece being worked on.
+      !branchHook.context.includes('"goal":"Piece two of the smoke"'),
+    branchHook.context.split('\n').find((line) => line.startsWith('Branch:')) ?? '(no branch line)',
+  );
+
+  const closingEarly = await call('task_finish', { summary: 'Tried to close early', id: taskId });
+  check(
+    'a decomposition cannot be closed while a subtask is still open',
+    closingEarly.isError === true && text(closingEarly).includes('open subtask'),
+    text(closingEarly).split('\n')[0],
+  );
+
+  await call('task_finish', { summary: 'Piece one done', id: subtaskId(pieceOne) });
+  await call('task_finish', { summary: 'Piece two done', id: subtaskId(pieceTwo) });
 
   const history = await call('task_history', { limit: 10 });
   check(

@@ -85,7 +85,7 @@ describe('runMatrix', () => {
   it('runs every runtime × horizon × seed cell with oracle accuracy 1', async () => {
     const cells = await runMatrix(
       {
-        runtimes: ['skillstate', 'prompt', 'memory', 'stateful'],
+        runtimes: ['state3', 'prompt', 'memory', 'stateful'],
         horizons: [4],
         seeds: [42, 43],
         maxRetries: 1,
@@ -101,8 +101,8 @@ describe('runMatrix', () => {
       expect(cell.provider).toBe('oracle');
     }
     expect(cells.map((c) => c.runtime)).toEqual([
-      'skillstate',
-      'skillstate',
+      'state3',
+      'state3',
       'prompt',
       'prompt',
       'memory',
@@ -134,7 +134,7 @@ describe('summarizeMatrix', () => {
           invalidSteps: 1,
         },
       }),
-      makeCell({ runtime: 'skillstate', metrics: { accuracy: 0.9 } }),
+      makeCell({ runtime: 'state3', metrics: { accuracy: 0.9 } }),
     ];
 
     const rows = summarizeMatrix(cells);
@@ -148,7 +148,7 @@ describe('summarizeMatrix', () => {
     expect(promptRow?.avgPromptChars).toBeCloseTo(15);
     expect(promptRow?.totalTokens).toBe(10);
     expect(promptRow?.invalidSteps).toBe(1);
-    expect(rows[1]?.runtime).toBe('skillstate');
+    expect(rows[1]?.runtime).toBe('state3');
     expect(rows[1]?.runs).toBe(1);
     expect(rows[1]?.avgAccuracy).toBeCloseTo(0.9);
   });

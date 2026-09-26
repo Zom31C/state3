@@ -147,7 +147,7 @@ describe('parseProjectsSpec', () => {
 
   it('rejects JSON that does not parse or is not an object of strings', () => {
     expect(() => parseProjectsSpec('{oops', cwd)).toThrow(
-      /SKILLSTATE_PROJECTS looks like JSON but does not parse/,
+      /STATE3_PROJECTS looks like JSON but does not parse/,
     );
     expect(() => parseProjectsSpec('{"worker": 3}', cwd)).toThrow(
       /project "worker" must map to a directory string/,

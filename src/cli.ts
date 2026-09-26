@@ -194,11 +194,11 @@ function matrixOptionsFrom(options: RunOptions): MatrixOptions {
  */
 export function usageText(): string {
   return [
-    'skillstate — SKILL.state runtime: long-horizon work on an external, validated state Σ',
+    'state3 — SKILL.state runtime: long-horizon work on an external, validated state Σ',
     '',
     'Usage:',
-    '  skillstate task <subcommand>   read and write the task state Σ (full list below)',
-    '  skillstate <run flags>         run one episode, or a matrix of them, against a model',
+    '  state3 task <subcommand>   read and write the task state Σ (full list below)',
+    '  state3 <run flags>         run one episode, or a matrix of them, against a model',
     '',
     'Run flags (--horizon, --seed, --runtime, --provider, --model, --out, --quiet, …) are',
     'documented in README.md.',

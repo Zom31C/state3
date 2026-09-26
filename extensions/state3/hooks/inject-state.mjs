@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 // UserPromptSubmit / PreCompact / SessionStart / SubagentStart hook: injects the compact
 // active task state so the model sees Σ instead of relying on the transcript. When
-// SKILLSTATE_PROJECTS declares further roots, their active tasks are injected too,
+// STATE3_PROJECTS declares further roots, their active tasks are injected too,
 // so a supervising session sees each worker's Σ without a tool call.
 // On SessionStart it also injects the project brief — the knowledge base as one line per
 // page — because that is the one moment the transcript holds nothing to orient by. On every
 // other event the brief stays out: the session has already seen it, and paying for it again
 // on each prompt would cost more than the map is worth.
 // On SubagentStart it injects neither Σ nor the brief but a few lines of orientation instead:
-// a delegated agent begins with no transcript and usually no skillstate tools, so it needs to
+// a delegated agent begins with no transcript and usually no state3 tools, so it needs to
 // know that a task exists and which step is in flight — not the whole state, which it would
-// pay for again on every one of its own turns. SKILLSTATE_SUBAGENT_STATE=off leaves it silent.
+// pay for again on every one of its own turns. STATE3_SUBAGENT_STATE=off leaves it silent.
 // Never blocks a turn — on any problem it prints nothing and exits 0.
 // Σ lives in the project's state.db, and reading SQLite needs the driver, so a root that
 // has one is read through the repository build (dist/tasks/inject.js). The legacy JSON
@@ -20,20 +20,26 @@
 // A legacy root has no database and therefore no pages, so it never has a brief to inject.
 import { existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { INJECT_MARKER, findSkillstateHome } from '../lib/home.mjs';
+import { INJECT_MARKER, findState3Home } from '../lib/home.mjs';
 
-const STATE_DIRNAME = '.skillstate';
+const STATE_DIRNAME = '.state3';
 /** Mirrors STATE_DB_FILENAME in src/db/database.ts. */
 const STATE_DB_FILENAME = 'state.db';
+/**
+ * Mirrors LEGACY_STATE_DIRNAME in src/tasks/migrate-root.ts: the state directory of the
+ * pre-rename build. Only the name is mirrored, and only to keep the carry-over cheap — the
+ * copy itself is done by the build, so the two halves cannot disagree about what it means.
+ */
+const LEGACY_STATE_DIRNAME = '.skillstate';
 const KNOWN_EVENTS = new Set(['UserPromptSubmit', 'PreCompact', 'SessionStart', 'SubagentStart']);
 // Above this size Σ stops being an O(1) prompt component, so the agent is told to compress it.
 const STATE_SIZE_HINT_CHARS = 4000;
 // Set to `off` to leave a delegated subagent without orientation: the right choice for an agent
 // whose work has nothing to do with the task in flight, and whose every turn would otherwise
 // carry these lines.
-const SUBAGENT_STATE_ENV = 'SKILLSTATE_SUBAGENT_STATE';
+const SUBAGENT_STATE_ENV = 'STATE3_SUBAGENT_STATE';
 // Records written before `skill` and `notation` existed carry neither; the runtime
 // reads them as the default skill in plain notation, and so does this hook.
 const DEFAULT_SKILL = 'dev-task';
@@ -177,7 +183,7 @@ function subagentBriefLines(record) {
 let injectModule;
 async function reader() {
   if (injectModule !== undefined) return injectModule;
-  const home = findSkillstateHome(import.meta.url, INJECT_MARKER);
+  const home = findState3Home(import.meta.url, INJECT_MARKER);
   if (home === null) {
     injectModule = null;
   } else {
@@ -189,6 +195,28 @@ async function reader() {
     }
   }
   return injectModule;
+}
+
+/**
+ * Carries a pre-rename state root over and returns the line worth reporting, or null.
+ *
+ * Gated on the filesystem rather than on the build: a project with no state at all must not
+ * pay for loading dist on every prompt, which is what an unconditional call would cost. Only
+ * the cheap half is here — the copy, its marker and the "somebody is writing this database"
+ * refusal all belong to the build, so there is one implementation of the rule.
+ */
+async function carryOver(rootDir, hasDatabase) {
+  if (hasDatabase) return null;
+  if (basename(rootDir) !== STATE_DIRNAME) return null;
+  if (!existsSync(join(dirname(rootDir), LEGACY_STATE_DIRNAME))) return null;
+  const module = await reader();
+  if (module === null || typeof module.carryOverStateRoot !== 'function') return null;
+  try {
+    const note = module.carryOverStateRoot(rootDir);
+    return typeof note === 'string' ? note : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -208,13 +236,22 @@ async function reader() {
  */
 async function injectionFor(rootDir, { brief = false, subagent = false, drift = false } = {}) {
   const dbPath = join(rootDir, STATE_DB_FILENAME);
+  // Ahead of the existence check below, because the carry-over can create the very database
+  // that check looks for: without it a renamed project reads as one that never had any state.
+  const carried = await carryOver(rootDir, existsSync(dbPath));
+  /** Attaches the one-time carry-over line to whatever this root answered, warnings aside. */
+  const withNote = (result) =>
+    carried === null || result === null || result.warn !== undefined
+      ? result
+      : { ...result, warn: carried };
+
   if (existsSync(dbPath)) {
     const module = await reader();
     if (module === null || typeof module.readInjection !== 'function') {
       return {
         warn:
-          `${dbPath} needs the skillstate build: run "npm run build" in the repository, ` +
-          'or set SKILLSTATE_HOME to it',
+          `${dbPath} needs the state3 build: run "npm run build" in the repository, ` +
+          'or set STATE3_HOME to it',
       };
     }
     let injection;
@@ -223,22 +260,26 @@ async function injectionFor(rootDir, { brief = false, subagent = false, drift = 
     } catch (err) {
       return { warn: `cannot read ${dbPath}: ${err instanceof Error ? err.message : String(err)}` };
     }
-    if (injection === null || typeof injection !== 'object') return null;
+    if (injection === null || typeof injection !== 'object') return withNote(null);
     if (injection.kind === 'context') {
-      return {
+      return withNote({
         task: typeof injection.task === 'string' ? injection.task : null,
         brief: typeof injection.brief === 'string' ? injection.brief : null,
-      };
+      });
     }
     // A build from before the brief existed answers with Σ alone under its own kind. Accepted
-    // rather than dropped: an extension and a SKILLSTATE_HOME build are not upgraded together,
+    // rather than dropped: an extension and a STATE3_HOME build are not upgraded together,
     // and losing Σ silently is the one failure this hook must not have.
-    if (injection.kind === 'head') return { task: injection.text, brief: null };
+    if (injection.kind === 'head') return withNote({ task: injection.text, brief: null });
     if (injection.kind === 'unreadable') {
       return { warn: `cannot read ${dbPath}: ${String(injection.reason)}` };
     }
-    return null;
+    return withNote(null);
   }
+
+  // No database and the neighbour that holds one could not be copied: that is a reason, not an
+  // empty project, and the two must not answer the same way.
+  if (carried !== null) return { warn: carried };
 
   const record = await loadActiveTask(rootDir);
   if (record === null) return null;
@@ -316,7 +357,7 @@ function leadFor(event) {
  */
 function briefSection(brief) {
   return [
-    '## Project brief (skillstate)',
+    '## Project brief (state3)',
     'What this project has written down for an agent with no context, as one line per page — a snapshot taken at session start, so a page changed since then is newer than this.',
     brief,
   ].join('\n');
@@ -344,7 +385,7 @@ if (selfTestAt !== -1) {
 const projectDir = typeof event.cwd === 'string' && event.cwd !== '' ? event.cwd : process.cwd();
 // The host reports its own startup directory as `cwd`, which is not necessarily the
 // project, so an explicit override wins for the primary root.
-const envStateDir = process.env.SKILLSTATE_STATE_DIR;
+const envStateDir = process.env.STATE3_STATE_DIR;
 const stateDir =
   typeof envStateDir === 'string' && envStateDir.trim() !== ''
     ? resolve(envStateDir)
@@ -393,14 +434,14 @@ if (primary !== null && primary.warn !== undefined) warnings.push(primary.warn);
 if (primary !== null && typeof primary.task === 'string') {
   sections.push(
     [
-      '## Active task state (skillstate)',
+      '## Active task state (state3)',
       leadFor(eventName),
       primary.task,
-      // A subagent is told to report rather than to patch: it usually has no skillstate tools,
+      // A subagent is told to report rather than to patch: it usually has no state3 tools,
       // and two agents patching one Σ is how a plan item gets marked done twice.
       ...(isSubagentStart
         ? [
-            'Report what you changed and what you actually verified — the session that delegated you owns Σ and records it there. Patch the state yourself only if you were given the skillstate tools.',
+            'Report what you changed and what you actually verified — the session that delegated you owns Σ and records it there. Patch the state yourself only if you were given the state3 tools.',
             'If next.risk is "destructive" or "external", stop and report it: asking the user is the orchestrator\'s job, not yours.',
           ]
         : [
@@ -421,7 +462,7 @@ if (primary !== null && typeof primary.brief === 'string') {
 // root, no active task, duplicate of the primary root) is skipped without hiding the rest.
 // Not for a subagent: it was delegated inside this project, and every worker's Σ on top of its
 // own orientation is context it cannot act on. A supervising session still gets them all.
-const projectsSpec = process.env.SKILLSTATE_PROJECTS;
+const projectsSpec = process.env.STATE3_PROJECTS;
 if (!isSubagentStart && typeof projectsSpec === 'string' && projectsSpec.trim() !== '') {
   let entries = null;
   try {
@@ -454,7 +495,7 @@ if (!isSubagentStart && typeof projectsSpec === 'string' && projectsSpec.trim() 
     if (subsections.length > 0) {
       sections.push(
         [
-          '## Supervised projects (skillstate)',
+          '## Supervised projects (state3)',
           ...subsections.flat(),
           'Patch these with the project argument: task_patch {"project":"<name>", …}.',
         ].join('\n'),
@@ -463,7 +504,7 @@ if (!isSubagentStart && typeof projectsSpec === 'string' && projectsSpec.trim() 
   }
 }
 
-for (const line of warnings) process.stderr.write(`skillstate: ${line}\n`);
+for (const line of warnings) process.stderr.write(`state3: ${line}\n`);
 
 if (sections.length > 0) {
   process.stdout.write(
