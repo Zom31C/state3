@@ -79,8 +79,12 @@ const CANDIDATE_COLUMNS =
   'id, skill, notation, state, created_at, updated_at, parent, goal, status, rowid AS seq';
 
 /**
- * The order the injection and the tools agree on: the work in flight, then the work that
- * stalled, then the queue behind it.
+ * The order the injection and the tools agree on: the work in flight, then the queue, then the
+ * work that stalled.
+ *
+ * The queue outranks a blocker because the frontier answers "what can be worked on now", and a
+ * blocked task by definition cannot be. Ranking it first meant one task parked for weeks stood
+ * in front of every ready piece in the project, which is what a cold session then injected.
  *
  * Mirrors `pickFrontier` in src/tasks/store.ts. The rule lives twice — there as a sort over
  * summaries, here as a query — because a hook runs on every prompt and cannot afford to
@@ -88,8 +92,8 @@ const CANDIDATE_COLUMNS =
  * for the reason given there: a queued subtask nobody has touched waits behind its older
  * siblings, while a task somebody was in the middle of is found by when it was last touched.
  */
-const FRONTIER_ORDER = `CASE status WHEN 'active' THEN 0 WHEN 'blocked' THEN 1
-              WHEN 'pending' THEN 2 ELSE 3 END,
+const FRONTIER_ORDER = `CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1
+              WHEN 'blocked' THEN 2 ELSE 3 END,
          CASE WHEN status = 'pending' THEN created_at END,
          CASE WHEN status = 'pending' THEN rowid END,
          updated_at DESC, id DESC`;

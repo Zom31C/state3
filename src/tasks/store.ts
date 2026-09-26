@@ -160,10 +160,14 @@ interface HistoryRow {
 }
 
 /**
- * Which of several open tasks is the one to act on: the work in flight, then the work that
- * stalled, then the queue behind it.
+ * Which of several open tasks is the one to act on: the work in flight, then the queue, then the
+ * work that stalled.
+ *
+ * The queue outranks a blocker because this order answers "what can be worked on now", and a
+ * blocked task by definition cannot be. With a blocker first, one task parked for weeks stood in
+ * front of every ready piece in the project, and that is what a cold session was handed.
  */
-const STATUS_RANK: Readonly<Record<string, number>> = { active: 0, blocked: 1, pending: 2 };
+const STATUS_RANK: Readonly<Record<string, number>> = { active: 0, pending: 1, blocked: 2 };
 
 /**
  * The order a decomposition reads in: the order its pieces were split out, with the row's
@@ -178,15 +182,14 @@ export function queueOrder(a: TaskSummary, b: TaskSummary): number {
 }
 
 /**
- * Which of several open tasks is the one to act on: the work in flight, then the work that
- * stalled, then the queue behind it.
+ * Which of several open tasks is the one to act on, by the rank above.
  *
  * The tiebreak inside a rank differs by what the rank means, and that split is the reason the
  * queue has a rank of its own. A `pending` subtask is one nobody has touched, so it waits behind
  * its older siblings in `queueOrder`: without that, splitting a job into three subtasks would
- * hand back the last one created and leave the first two queued forever. An `active` or
- * `blocked` task is one somebody was in the middle of, so `updatedAt` decides and a resumed
- * session lands back where it stopped.
+ * hand back the last one created and leave the first two queued forever. An `active` or `blocked`
+ * task is one somebody was in the middle of, so `updatedAt` decides and a resumed session lands
+ * back where it stopped.
  */
 function pickFrontier(tasks: readonly TaskSummary[]): string | null {
   const open = tasks.filter((task) => task.status !== 'done');

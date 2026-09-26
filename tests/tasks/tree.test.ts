@@ -95,6 +95,31 @@ describe('which task the tools act on', () => {
     expect(await store.activeId()).toBe(at(subs, 1).meta.id);
   });
 
+  it('hands over a ready piece rather than a task that is blocked', async () => {
+    const { subs } = await splitThreeStored();
+    const stuck = await store.start('Stuck on a decision');
+    await store.patch({ status: 'blocked', blockers: ['waiting on the user'] }, stuck.meta.id);
+
+    // The blocker is the newest open task, so "most recently updated" picks it, and a rank of its
+    // own is what stops one parked task from standing in front of the whole queue: the frontier
+    // answers what can be worked on now, and a blocked task by definition cannot be.
+    expect(await store.activeId()).toBe(at(subs, 0).meta.id);
+  });
+
+  it('still lands on a blocked task when nothing is ready to work on', async () => {
+    const stuck = await store.start('Stuck on a decision');
+    await store.patch({ status: 'blocked', blockers: ['waiting on the user'] }, stuck.meta.id);
+
+    // Downranking a blocker must not hide it: with no queue to hand over it is still the work, and
+    // an agent must be able to patch its way out without looking the id up first.
+    expect(await store.activeId()).toBe(stuck.meta.id);
+    const injection = readInjection(dir);
+    expect(injection.kind).toBe('context');
+    if (injection.kind !== 'context' || injection.task === null) return;
+    expect(injection.task).toContain(`Task ${stuck.meta.id}`);
+    expect(injection.task).toContain('waiting on the user');
+  });
+
   it('comes back to the parent once every subtask is closed', async () => {
     const { root, subs } = await splitThreeStored();
     for (const sub of subs) await store.finish('piece done', sub.meta.id);
