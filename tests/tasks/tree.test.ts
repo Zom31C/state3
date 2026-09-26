@@ -209,4 +209,41 @@ describe('what a prompt carries', () => {
     // It was handed one piece of work; naming the next one is an invitation to start it.
     expect(injection.task).not.toContain('Queued after this');
   });
+
+  it('names queued work under another root at a session start, and not on every prompt', async () => {
+    // The shape a cold session actually lands in: the frontier picks the unrelated active root,
+    // because the decomposition's parent is a container and its pieces are only pending. Without
+    // this line nothing in the prompt says the queue exists, and the session starts new work
+    // beside it instead of resuming what was split.
+    await splitThreeStored();
+    const other = await store.start('Unrelated job in flight');
+
+    const atStart = readInjection(dir, { drift: true });
+    expect(atStart.kind).toBe('context');
+    if (atStart.kind !== 'context' || atStart.task === null) return;
+    expect(atStart.task).toContain(`Task ${other.meta.id}`);
+    expect(atStart.task).toContain(
+      'Also open elsewhere: 3 queued in 1 decomposition, 1 other open root',
+    );
+    // The task in flight is a root, so there is no branch and no queue of its own to report.
+    expect(atStart.task).not.toContain('Queued after this');
+
+    const onPrompt = readInjection(dir);
+    expect(onPrompt.kind).toBe('context');
+    if (onPrompt.kind !== 'context' || onPrompt.task === null) return;
+    expect(onPrompt.task).not.toContain('Also open elsewhere');
+  });
+
+  it('stays quiet when the branch and the queue already cover every open task', async () => {
+    const { subs } = await splitThreeStored();
+    await store.patch({ status: 'active' }, at(subs, 0).meta.id);
+
+    const atStart = readInjection(dir, { drift: true });
+    expect(atStart.kind).toBe('context');
+    if (atStart.kind !== 'context' || atStart.task === null) return;
+    expect(atStart.task).toContain('Queued after this');
+    // The parent is named by Branch and the two siblings by the queue line: counting them again
+    // would only make the number harder to read.
+    expect(atStart.task).not.toContain('Also open elsewhere');
+  });
 });

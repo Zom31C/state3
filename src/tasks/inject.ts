@@ -224,6 +224,55 @@ function branchLines(db: SqlDatabase, row: CandidateRow, queue: boolean): string
   return lines;
 }
 
+/**
+ * Open work this injection does not already name, as one line, or null when there is none.
+ *
+ * The branch and the queue cover the tree the task in flight belongs to, and nothing else: a
+ * decomposition under another root is invisible to a session that starts cold, because the
+ * frontier picks one task and a parent with open children is a container, never the pick. A cold
+ * session that cannot see queued work does not resume it — it starts something new beside it.
+ *
+ * Session start only, like the artifact drift and for the same reason: a project accumulates open
+ * tasks it is not working on (a job blocked last month is open forever), and a line repeated on
+ * every prompt would become a permanent tax announcing something that has not changed.
+ * `task_list` is one call away for the rest of the session.
+ *
+ * Siblings are left out of the count: the queue line already names the next one and counts the
+ * rest, and naming them twice would only make the number harder to read.
+ *
+ * Never throws, on the same terms as `branchLines`.
+ */
+function elsewhereLine(db: SqlDatabase, row: CandidateRow): string | null {
+  try {
+    const named = new Set(branchOf(db, row.id).map((task) => task.id));
+    const open = db.prepare(`SELECT id, parent FROM task WHERE status <> 'done'`).all() as {
+      id: string;
+      parent: string | null;
+    }[];
+    const elsewhere = open.filter((task) => {
+      if (named.has(task.id)) return false;
+      return row.parent === null || task.parent !== row.parent;
+    });
+    if (elsewhere.length === 0) return null;
+
+    const roots = elsewhere.filter((task) => task.parent === null).length;
+    const decompositions = new Set(
+      elsewhere.filter((task) => task.parent !== null).map((task) => task.parent),
+    );
+    const parts: string[] = [];
+    if (decompositions.size > 0) {
+      parts.push(
+        `${elsewhere.length - roots} queued in ${decompositions.size} decomposition` +
+          `${decompositions.size === 1 ? '' : 's'}`,
+      );
+    }
+    if (roots > 0) parts.push(`${roots} other open root${roots === 1 ? '' : 's'}`);
+    return `Also open elsewhere: ${parts.join(', ')} — task_list prints the tree.`;
+  } catch {
+    return null;
+  }
+}
+
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -289,13 +338,17 @@ function readTaskHead(
   // Above Σ rather than below it: the branch says which piece of a larger job the state below
   // describes, and a resumed session reads top to bottom.
   const branch = branchLines(db, row, options.queue);
-  // Both of these are the once-per-session extras, which is what `drift` gates: a surprise
+  // All three of these are the once-per-session extras, which is what `drift` gates: a surprise
   // reported at a session start costs one line, and repeated on every prompt it costs more than
   // the surprise was worth (§15.5).
+  const elsewhere = options.drift ? elsewhereLine(db, row) : null;
   const diverged = options.drift ? divergedSource(rootDir) : null;
   const drift = options.drift ? driftLines(db, row.id, state, rootDir) : [];
   const text = [
     ...branch,
+    // Beside the branch and above Σ, because both answer "where does this task sit among the
+    // work" and a resumed session reads that before it reads the state itself.
+    ...(elsewhere === null ? [] : [elsewhere]),
     render(task),
     // Ahead of the artifact drift: files that moved under Σ are a reason to re-read them, while
     // a second state root still being written is a reason to doubt Σ wholesale.

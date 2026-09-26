@@ -590,6 +590,21 @@ try {
     branchHook.context.split('\n').find((line) => line.startsWith('Branch:')) ?? '(no branch line)',
   );
 
+  // A cold session lands on whatever is at the frontier, and a decomposition is never it: the
+  // parent is a container and its pieces are only queued. Without this line the queue is
+  // invisible to a session that starts here, and the session begins new work beside it instead
+  // of resuming what was split — which is exactly what the first cold run of this build did.
+  const unrelated = await call('task_start', { goal: 'Another job in flight' });
+  const coldHook = runHook('SessionStart');
+  check(
+    'a session start names the open work the frontier did not pick',
+    coldHook.context.includes(`Task ${subtaskId(unrelated)}`) &&
+      coldHook.context.includes(
+        'Also open elsewhere: 2 queued in 1 decomposition, 1 other open root',
+      ),
+    coldHook.context.split('\n').find((line) => line.startsWith('Also open')) ?? '(no line)',
+  );
+
   const closingEarly = await call('task_finish', { summary: 'Tried to close early', id: taskId });
   check(
     'a decomposition cannot be closed while a subtask is still open',
@@ -599,6 +614,9 @@ try {
 
   await call('task_finish', { summary: 'Piece one done', id: subtaskId(pieceOne) });
   await call('task_finish', { summary: 'Piece two done', id: subtaskId(pieceTwo) });
+  // Closed before the parent so the last `task_finish` below, which names no id, finds the
+  // decomposition and not this one.
+  await call('task_finish', { summary: 'Another job done', id: subtaskId(unrelated) });
 
   const history = await call('task_history', { limit: 10 });
   check(
