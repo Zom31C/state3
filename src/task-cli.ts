@@ -5,8 +5,8 @@ import { formatDoctorReport, inspectStateRoot } from './tasks/doctor.js';
 import { formatMigrationReport, migrateRootToDatabase } from './tasks/migrate.js';
 import { isNotation, NOTATIONS } from './tasks/notation.js';
 import { describeProjects, parseProjectsSpec } from './tasks/projects.js';
-import { formatTaskList, renderTaskHead, subtreeRows } from './tasks/render.js';
-import type { HistoryEntry, StartOptions } from './tasks/store.js';
+import { describeMove, formatTaskList, renderTaskHead, subtreeRows } from './tasks/render.js';
+import type { HistoryEntry, PatchReport, StartOptions } from './tasks/store.js';
 import { TaskStore } from './tasks/store.js';
 
 export type TaskStorePort = Pick<
@@ -279,7 +279,10 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
     throw new Error(`--notation expects one of: ${NOTATIONS.join(', ')}`);
   }
   if (options.parent !== null && subcommand !== 'start') {
-    throw new Error('--parent is only valid for task start');
+    throw new Error(
+      '--parent is only valid for task start; to move a task that already exists, patch it with ' +
+        `'{"parent":"<task id>"}' — or '{"parent":null}' to make it a root task`,
+    );
   }
   if (options.tree && subcommand !== 'show') {
     throw new Error('--tree is only valid for task show');
@@ -297,7 +300,9 @@ const SUBCOMMAND_HELP: Record<TaskSubcommand, string> = {
     'create a task from a goal; --plan adds steps, --parent splits it out of another task, ' +
     '--skill and --notation shape Σ',
   show: 'print Σ of the open task, or of --id; --tree prints the decomposition under it instead',
-  patch: 'merge a JSON patch into Σ; "-" reads the patch from stdin',
+  patch:
+    'merge a JSON patch into Σ; "-" reads the patch from stdin, and {"parent":…} moves the task ' +
+    'in the tree instead of touching Σ',
   finish: 'mark the task done and append the summary to decisions',
   list: 'list tasks as a tree, with skill, status, progress, and the build that is answering',
   history: 'print the audit trail of patches, rejected ones included; --limit N',
@@ -459,10 +464,17 @@ async function runStoreCommand(
       if (patch === null) {
         throw new Error('task patch requires a JSON patch argument (or "-" to read from stdin)');
       }
+      const report: PatchReport = {};
       const task = await (options.id === null
-        ? store.patch(patch)
-        : store.patch(patch, options.id));
+        ? store.patch(patch, undefined, report)
+        : store.patch(patch, options.id, report));
       deps.log(renderTaskHead(task));
+      // Printed because Σ does not carry it: a `parent` patch moves the task in the tree while
+      // the state above reads exactly as it did before, so without this line the move — the one
+      // thing the patch did — is invisible in the output.
+      if (report.moved !== undefined) {
+        deps.log(`${describeMove(report.moved)} — \`state3 task list\` prints the tree`);
+      }
       return;
     }
     case 'finish': {

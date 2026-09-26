@@ -3,7 +3,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { StateDict } from '../src/core/types.js';
 import { devTaskSchema } from '../src/tasks/schema.js';
 import type { DevTaskState } from '../src/tasks/schema.js';
-import type { HistoryEntry, StartOptions, StoredTask, TaskSummary } from '../src/tasks/store.js';
+import type {
+  HistoryEntry,
+  PatchReport,
+  StartOptions,
+  StoredTask,
+  TaskSummary,
+} from '../src/tasks/store.js';
 import type { TaskCliDeps, TaskStorePort } from '../src/task-cli.js';
 import {
   formatHistory,
@@ -116,15 +122,27 @@ class FakeStore {
     return found;
   }
 
-  async patch(patch: StateDict, id?: string): Promise<StoredTask> {
+  async patch(patch: StateDict, id?: string, report?: PatchReport): Promise<StoredTask> {
     this.calls.push(`patch|${JSON.stringify(patch)}|${id ?? '-'}`);
     if (this.patchFailure !== null) throw this.patchFailure;
     const found = this.resolve(id);
     if (found === null) throw new FakeTaskNotFoundError('No active task found');
     this.entries.push({ at: this.stamp(), patch, ok: true });
+    // `parent` addresses the tree rather than Σ, so it never reaches the merged state — as in the
+    // store. The fake applies the move without re-checking it; the refusals are tested there.
+    const statePatch: StateDict = { ...patch };
+    const movesTree = 'parent' in statePatch;
+    const requested = statePatch['parent'];
+    delete statePatch['parent'];
+    if (movesTree) {
+      const from = found.meta.parent;
+      const to = typeof requested === 'string' && requested.trim() !== '' ? requested.trim() : null;
+      found.meta.parent = to;
+      if (report !== undefined && from !== to) report.moved = { from, to };
+    }
     const merged: DevTaskState = {
       ...this.dev(found),
-      ...(patch as Partial<DevTaskState>),
+      ...(statePatch as Partial<DevTaskState>),
     };
     found.state = asDict(merged);
     found.meta.updatedAt = this.stamp();
@@ -326,6 +344,17 @@ describe('parseTaskArgs', () => {
     );
     expect(() => parseTaskArgs(['list', '--notation', 'compact'])).toThrow(
       /--notation is only valid for task start/,
+    );
+  });
+
+  it('rejects --parent on any other subcommand, and names the patch that moves a task', () => {
+    expect(() => parseTaskArgs(['patch', '{"status":"blocked"}', '--parent', 'task-1'])).toThrow(
+      /--parent is only valid for task start/,
+    );
+    // The flag is refused, but what it was reaching for is available one level down: a refusal
+    // that does not say so reads as "a task cannot be moved at all".
+    expect(() => parseTaskArgs(['show', '--parent', 'task-1'])).toThrow(
+      /patch it with '\{"parent":"<task id>"\}'/,
     );
   });
 
@@ -545,6 +574,21 @@ describe('runTaskCommand', () => {
     expect(store.calls).toContain('patch|{"status":"blocked"}|-');
     expect(lines[0]).toContain('Task task-1 [dev-task] (blocked):');
     expect(lines[0]).toContain('"status":"blocked"');
+  });
+
+  it('moves a task in the tree with a parent patch, and says so', async () => {
+    const store = new FakeStore();
+    const { deps, lines } = makeDeps(store);
+    await store.start('The decomposition');
+    await store.start('A piece of it', { parent: 'task-1' });
+
+    await runTaskCommand(parseTaskArgs(['patch', '{"parent":null}', '--id', 'task-2']), deps);
+
+    expect(store.tasks[1]?.meta.parent).toBeNull();
+    expect(lines[1]).toContain('Moved out of task-1 into a root task');
+    // The key addressed the tree, so Σ gained nothing to show for it — the printed state reads
+    // exactly as it did before the move, which is why the line below it is not optional.
+    expect(lines[0]).not.toContain('parent');
   });
 
   it('reads the patch from stdin when the argument is a dash', async () => {

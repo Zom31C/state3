@@ -68,7 +68,26 @@ export interface HistoryEntry {
 export interface PatchReport {
   /** Verification stamps this patch carried, replaced and detached. */
   stamps?: StampReport;
+  /**
+   * The move in the tree this patch made, when it made one: the parent the task had and the one
+   * it has now, either side null for a root task.
+   *
+   * Reported for the reason the stamps are: Σ cannot show it. A task's place in the tree is a
+   * column, so the state an answer renders reads the same before and after, and a move nobody is
+   * told about is how a decomposition gets quietly rearranged.
+   */
+  moved?: { from: string | null; to: string | null };
 }
+
+/**
+ * What a patch's `parent` key asks the tree for, and whether the tree can take it.
+ *
+ * A result rather than a throw because a refusal here is recorded in the history like any other:
+ * the caller turns it into the same `reject` that a schema failure becomes.
+ */
+type ReparentResult =
+  | { ok: true; from: string | null; to: string | null }
+  | { ok: false; category: RejectCategory; message: string };
 
 export interface TaskSummary {
   id: string;
@@ -428,7 +447,10 @@ export class TaskStore {
       createdAt: string;
       updatedAt: string;
       state: StateDict;
-      /** Only read on insert: where a task sits in the tree does not change afterwards. */
+      /**
+       * Only read on insert. A Σ write must not move a task in the tree, least of all by
+       * omitting a value, so re-filing one is its own statement — see `patch`.
+       */
       parent?: string | null;
     },
   ): void {
@@ -546,20 +568,105 @@ export class TaskStore {
    * task — would hang the new work off a branch nothing reaches any more.
    */
   private checkParent(db: SqlDatabase, parent: string | undefined): string | null {
-    if (parent === undefined || parent.trim() === '') return null;
-    const id = parent.trim();
+    const requested = normalizeParent(parent);
+    if (requested === null) return null;
+    const row = this.parentRowOrNull(db, requested);
+    if (row === null) throw new TaskPatchError('guard', splitRefusal(requested, 'missing'));
+    if (row.status === 'done') throw new TaskPatchError('guard', splitRefusal(requested, 'done'));
+    return requested;
+  }
+
+  /**
+   * The row a requested parent names, or null when no task has that id.
+   *
+   * One lookup for both writes that file a task under another one — `start`, and a patch carrying
+   * `parent` — with no opinion of its own: what a missing or a finished parent means differs by
+   * direction, and a move has one more thing to check first (see `checkReparent`).
+   */
+  private parentRowOrNull(db: SqlDatabase, id: string): { id: string; status: string } | null {
     const row = db.prepare('SELECT id, status FROM task WHERE id = ?').get(id) as
       { id: string; status: string } | undefined;
-    if (row === undefined) {
-      throw new TaskPatchError('guard', `no task with id "${id}" to split this one out of`);
+    return row ?? null;
+  }
+
+  /**
+   * What a patch's `parent` asks the tree for, checked against the tree.
+   *
+   * These are the refusals no skill guard can make: a guard reads one state, and the shape of
+   * the decomposition lives in other rows. The cycle is the one that matters — every reader
+   * walks the branch (the injection, the listing, `activeId`), so a loop degrades all of them at
+   * once, and it would be reachable by a legal call instead of only by a hand-edited database.
+   *
+   * The task keeps its status and its own subtasks: a move re-files the piece where it belongs,
+   * it does not restart it, and demoting work in flight to `pending` would hand the frontier to
+   * a sibling the caller said nothing about.
+   */
+  private checkReparent(
+    db: SqlDatabase,
+    taskId: string,
+    currentParent: string | null,
+    requested: StateValue,
+  ): ReparentResult {
+    let to: string | null;
+    if (requested === null) to = null;
+    else if (typeof requested === 'string') to = normalizeParent(requested);
+    else {
+      return {
+        ok: false,
+        category: 'type-coercion',
+        message:
+          '"parent" moves this task in the tree, so it takes a task id, or null to make it a ' +
+          `root task — not ${kindOfValue(requested)}`,
+      };
     }
-    if (row.status === 'done') {
-      throw new TaskPatchError(
-        'guard',
-        `task ${id} is done, so it takes no new subtasks; start a root task instead`,
-      );
+    if (to === currentParent) return { ok: true, from: currentParent, to };
+    if (to === null) return { ok: true, from: currentParent, to };
+    if (to === taskId) {
+      return { ok: false, category: 'guard', message: `task ${taskId} cannot be its own parent` };
     }
-    return id;
+
+    const parentRow = this.parentRowOrNull(db, to);
+    if (parentRow === null) {
+      return { ok: false, category: 'guard', message: moveRefusal(to, 'missing') };
+    }
+
+    // Walked up from the new parent rather than down from this task: the branch above is a
+    // handful of rows while a decomposition can be wide, and the first step that meets this
+    // task's id is the loop the move would close.
+    const seen = new Set<string>();
+    let cursor: string | null = to;
+    while (cursor !== null) {
+      if (cursor === taskId) {
+        return {
+          ok: false,
+          category: 'guard',
+          message:
+            `task ${to} already sits under ${taskId}, so moving this one there would make it ` +
+            'its own ancestor',
+        };
+      }
+      if (seen.has(cursor)) {
+        return {
+          ok: false,
+          category: 'guard',
+          message:
+            `the parents above task ${to} loop back on themselves — the tree is corrupt, so ` +
+            'nothing can be filed under it until that is fixed',
+        };
+      }
+      seen.add(cursor);
+      const above = db.prepare('SELECT parent FROM task WHERE id = ?').get(cursor) as
+        { parent: string | null } | undefined;
+      cursor = above?.parent ?? null;
+    }
+
+    // Last, so the loop above wins the wording: a finished *descendant* of this task is refused
+    // either way, and "move it under an open task instead" is advice that cannot work for any of
+    // them. Naming the loop is the only refusal here that tells the caller the truth.
+    if (parentRow.status === 'done') {
+      return { ok: false, category: 'guard', message: moveRefusal(to, 'done') };
+    }
+    return { ok: true, from: currentParent, to };
   }
 
   /**
@@ -586,6 +693,10 @@ export class TaskStore {
   /**
    * Applies a patch to Σ. `report`, when given, is filled with what the write cost that Σ
    * itself does not show — see `PatchReport`.
+   *
+   * One key addresses the tree instead of the state: `parent` re-files this task under another
+   * one, or under nothing, and is validated against the tree rather than against the skill's
+   * schema — see `checkReparent`.
    */
   async patch(patch: StateDict, id?: string, report?: PatchReport): Promise<StoredTask> {
     const taskId = id ?? (await this.activeId());
@@ -613,9 +724,22 @@ export class TaskStore {
       throw new TaskPatchError(category, message);
     };
 
+    // `parent` addresses the tree rather than Σ: a task's place in the decomposition is a
+    // column, and no skill schema has the field. Taken out before validation so the strict
+    // schema never sees it — the "unknown key" it would answer with is exactly the refusal this
+    // replaces — and written in the same transaction below, so a patch either moves the task and
+    // records the move, or does neither.
+    //
+    // A key that is there with no value means "no opinion", not "detach": an in-process caller
+    // spreading an absent option produces one, and reading it as `null` would move a task nobody
+    // asked to move.
+    const statePatch: StateDict = { ...patch };
+    const requestedParent = statePatch.parent;
+    delete statePatch.parent;
+
     // Path keys ("plan[1].status") are expanded before the guard runs, so domain
     // rules see the same wholesale shape they were written against.
-    const expanded = expandPathPatch(state, patch);
+    const expanded = expandPathPatch(state, statePatch);
     if (!expanded.ok) return reject('path', expanded.message);
 
     const validation = validatePatch(skill, state, expanded.patch);
@@ -637,6 +761,16 @@ export class TaskStore {
       }
     }
 
+    // The other rule the skill guard cannot make, on the same grounds: where this task sits is
+    // a column, and whether the move closes a loop is a question about other rows.
+    let moved: { from: string | null; to: string | null } | null = null;
+    if (requestedParent !== undefined) {
+      const checked = this.checkReparent(db, taskId, row.parent ?? null, requestedParent);
+      if (!checked.ok) return reject(checked.category, checked.message);
+      moved = { from: checked.from, to: checked.to };
+    }
+    const didMove = moved !== null && moved.from !== moved.to;
+
     // Stamped before validation, so the stamps are checked like everything else the write
     // produces, and before the transaction, so a refused patch spawns no git subprocess.
     const stamps = stampVerifications(state, merged, () => ({
@@ -653,7 +787,10 @@ export class TaskStore {
 
     // Written before the transaction so a patch that the schema then refuses leaves no
     // note behind: nothing was superseded by a write that never happened.
-    const note = stampHistoryNote(stamps);
+    const notes = [didMove ? moveNote(moved) : null, stampHistoryNote(stamps)].filter(
+      (line): line is string => line !== null,
+    );
+    const note = notes.length === 0 ? null : notes.join('; ');
 
     db.transaction(() => {
       this.upsert(db, {
@@ -664,6 +801,12 @@ export class TaskStore {
         updatedAt: now,
         state: merged,
       });
+      if (didMove && moved !== null) {
+        // Its own statement: `upsert` leaves the row's place in the tree alone on conflict, so
+        // that a Σ write cannot move a task by omission, and so the move is visible here as the
+        // one thing this patch did to the tree.
+        db.prepare('UPDATE task SET parent = ? WHERE id = ?').run(moved.to, taskId);
+      }
       // The patch is recorded as sent: the history shows what the agent asked for,
       // which is what an audit of a rejected or surprising patch needs. The note carries
       // what the write then did to the stamps, which the patch cannot show.
@@ -673,7 +816,10 @@ export class TaskStore {
       recordArtifactStamps(db, taskId, merged, projectDirOf(this.rootDir), now);
     });
 
-    if (report !== undefined) report.stamps = stamps;
+    if (report !== undefined) {
+      report.stamps = stamps;
+      if (didMove && moved !== null) report.moved = moved;
+    }
     return this.readTask(taskId);
   }
 
@@ -1030,4 +1176,53 @@ function isUniqueConstraintError(err: unknown): boolean {
   if (typeof err !== 'object' || err === null) return false;
   const code = (err as { code?: unknown }).code;
   return code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || code === 'SQLITE_CONSTRAINT_UNIQUE';
+}
+
+/**
+ * A requested parent as an id, or null for "no parent".
+ *
+ * An empty string means the same thing in both directions — splitting a task out of nothing and
+ * moving one out of its decomposition — because the callers spell "none" however their payload
+ * happens to allow, and the tree has one answer.
+ */
+function normalizeParent(parent: string | undefined | null): string | null {
+  if (parent === undefined || parent === null) return null;
+  const id = parent.trim();
+  return id === '' ? null : id;
+}
+
+/** Why an id cannot hold a new subtask, worded for `start`. */
+function splitRefusal(id: string, reason: 'missing' | 'done'): string {
+  return reason === 'missing'
+    ? `no task with id "${id}" to split this one out of`
+    : `task ${id} is done, so it takes no new subtasks; start a root task instead`;
+}
+
+/** Why an id cannot take an existing task, worded for a move. */
+function moveRefusal(id: string, reason: 'missing' | 'done'): string {
+  return reason === 'missing'
+    ? `no task with id "${id}" to move this one under`
+    : `task ${id} is done, so it takes no new subtasks; move this one under an open task, ` +
+        'or send {"parent": null} to make it a root task';
+}
+
+/** A value a refusal names as the kind of thing it is, rather than as its JSON. */
+function kindOfValue(value: StateValue): string {
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value === 'object') return 'an object';
+  return `a ${typeof value}`;
+}
+
+/**
+ * What a move in the tree reads like in the audit trail, or null when nothing moved.
+ *
+ * The history stores the patch as sent, which does name the new parent — but not the old one, so
+ * the entry alone cannot answer where the task came from, and "where did this decomposition's
+ * shape come from" is exactly what an audit of a tree asks.
+ */
+function moveNote(move: { from: string | null; to: string | null } | null): string | null {
+  if (move === null || move.from === move.to) return null;
+  if (move.to === null) return `moved out of ${move.from ?? 'the tree'} into a root task`;
+  if (move.from === null) return `filed under ${move.to}, was a root task`;
+  return `moved from ${move.from} under ${move.to}`;
 }

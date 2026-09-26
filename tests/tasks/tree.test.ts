@@ -2,11 +2,12 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { StateDict } from '../../src/core/types.js';
 import { readInjection } from '../../src/tasks/inject.js';
 import { devTaskSchema } from '../../src/tasks/schema.js';
 import type { DevTaskState } from '../../src/tasks/schema.js';
 import { TaskPatchError, TaskStore } from '../../src/tasks/store.js';
-import type { StoredTask } from '../../src/tasks/store.js';
+import type { PatchReport, StoredTask } from '../../src/tasks/store.js';
 
 let dir: string;
 let store: TaskStore;
@@ -156,6 +157,186 @@ describe('closing a decomposition', () => {
     const all = await store.list();
     expect(all).toHaveLength(3);
     expect(all.find((task) => task.id === root.meta.id)?.openSubtasks).toBe(3);
+  });
+});
+
+describe('re-parenting a task', () => {
+  /** A root with one subtask that was itself split, plus an unrelated root to move it under. */
+  async function twoDecompositions(): Promise<{
+    first: StoredTask;
+    piece: StoredTask;
+    inner: StoredTask;
+    second: StoredTask;
+  }> {
+    const first = await store.start('First decomposition');
+    const piece = await store.start('A piece of it', { parent: first.meta.id });
+    const inner = await store.start('Split out of that piece', { parent: piece.meta.id });
+    const second = await store.start('Second decomposition');
+    return { first, piece, inner, second };
+  }
+
+  /**
+   * A root with one leaf subtask, plus an unrelated root to move it under.
+   *
+   * The moved task has no subtask of its own here on purpose: a task that has been split is a
+   * container, and neither `activeId` nor the injection ever lands on one, so a test about "the
+   * task is still the work in flight" has to move a leaf.
+   */
+  async function leafAndSomewhereToPutIt(): Promise<{
+    root: StoredTask;
+    leaf: StoredTask;
+    elsewhere: StoredTask;
+  }> {
+    const root = await store.start('First decomposition');
+    const leaf = await store.start('The piece in flight', { parent: root.meta.id });
+    const elsewhere = await store.start('Second decomposition');
+    return { root, leaf, elsewhere };
+  }
+
+  it('moves a task under another one, and its own subtasks come with it', async () => {
+    const { piece, inner, second } = await twoDecompositions();
+
+    const moved = await store.patch({ parent: second.meta.id }, piece.meta.id);
+
+    expect(moved.meta.parent).toBe(second.meta.id);
+    // One row changes, so what was split out of this piece stays split out of it: the subtree
+    // hangs off the task, not off the branch the task happened to be filed under.
+    expect((await store.branchOf(inner.meta.id)).map((task) => task.goal)).toEqual([
+      'Second decomposition',
+      'A piece of it',
+      'Split out of that piece',
+    ]);
+  });
+
+  it('makes a task a root again, which lets the decomposition it left be closed', async () => {
+    const { first, piece } = await twoDecompositions();
+
+    expect((await store.patch({ parent: null }, piece.meta.id)).meta.parent).toBeNull();
+    expect((await store.list()).find((task) => task.id === first.meta.id)?.openSubtasks).toBe(0);
+    expect(dev(await store.finish('nothing left under it', first.meta.id)).status).toBe('done');
+  });
+
+  it('keeps the status of the task it moves, so work in flight is not queued again', async () => {
+    const { leaf, elsewhere } = await leafAndSomewhereToPutIt();
+    await store.patch({ status: 'active' }, leaf.meta.id);
+
+    const moved = await store.patch({ parent: elsewhere.meta.id }, leaf.meta.id);
+
+    // Demoting it to "pending" — what a *new* subtask gets — would hand the frontier to a
+    // sibling nobody mentioned, and the agent that moved the task would lose its own Σ.
+    expect(dev(moved).status).toBe('active');
+    expect(await store.activeId()).toBe(leaf.meta.id);
+  });
+
+  it('refuses a parent that was never a task, and leaves the tree as it was', async () => {
+    const { piece, first } = await twoDecompositions();
+
+    await expect(store.patch({ parent: 'task-nope' }, piece.meta.id)).rejects.toThrow(
+      /no task with id "task-nope" to move this one under/,
+    );
+    await expect(store.patch({ parent: 'task-nope' }, piece.meta.id)).rejects.toThrow(
+      TaskPatchError,
+    );
+    expect((await store.show(piece.meta.id)).meta.parent).toBe(first.meta.id);
+  });
+
+  it('refuses a parent that is finished', async () => {
+    const { piece } = await twoDecompositions();
+    const closed = await store.start('Work that is over');
+    await store.finish('shipped', closed.meta.id);
+
+    await expect(store.patch({ parent: closed.meta.id }, piece.meta.id)).rejects.toThrow(
+      /takes no new subtasks/,
+    );
+  });
+
+  it('refuses to file a task under itself', async () => {
+    const { piece } = await twoDecompositions();
+
+    await expect(store.patch({ parent: piece.meta.id }, piece.meta.id)).rejects.toThrow(
+      /cannot be its own parent/,
+    );
+  });
+
+  it('refuses a parent that already sits under this task', async () => {
+    const { piece, inner } = await twoDecompositions();
+
+    await expect(store.patch({ parent: inner.meta.id }, piece.meta.id)).rejects.toThrow(
+      /would make it its own ancestor/,
+    );
+    expect((await store.show(piece.meta.id)).meta.parent).not.toBe(inner.meta.id);
+  });
+
+  it('refuses a value that is not an id, and says what the key takes', async () => {
+    const { piece } = await twoDecompositions();
+
+    await expect(store.patch({ parent: 42 }, piece.meta.id)).rejects.toThrow(
+      /it takes a task id, or null to make it a root task — not a number/,
+    );
+  });
+
+  it('refuses a finished descendant as a loop, not as a finished parent', async () => {
+    const { piece, inner } = await twoDecompositions();
+    await store.finish('done for now', inner.meta.id);
+
+    // Both refusals are true of this move, but only one of them is any use: "move it under an
+    // open task instead" cannot work for a descendant of this task, open or finished.
+    await expect(store.patch({ parent: inner.meta.id }, piece.meta.id)).rejects.toThrow(
+      /would make it its own ancestor/,
+    );
+  });
+
+  it('reads a parent key with no value as no opinion, not as a detach', async () => {
+    const { piece, first } = await twoDecompositions();
+    // The shape an in-process caller produces by spreading an absent option; over JSON the key is
+    // simply not there. Read as null, it would move a task nobody asked to move.
+    const patch = { decisions: ['a note'], parent: undefined } as unknown as StateDict;
+
+    const report: PatchReport = {};
+    const after = await store.patch(patch, piece.meta.id, report);
+
+    expect(after.meta.parent).toBe(first.meta.id);
+    expect(report.moved).toBeUndefined();
+    // The rest of the patch still applied, and the keyless field did not leak into Σ.
+    expect(dev(after).decisions).toEqual(['a note']);
+    expect(Object.keys(after.state)).not.toContain('parent');
+  });
+
+  it('reports the move and records where the task came from', async () => {
+    const { first, piece, second } = await twoDecompositions();
+
+    const report: PatchReport = {};
+    await store.patch({ parent: second.meta.id }, piece.meta.id, report);
+
+    // Σ cannot show it — the parent is a column, and the state renders the same either way — so
+    // a move nobody is told about is a move that cannot be audited afterwards.
+    expect(report.moved).toEqual({ from: first.meta.id, to: second.meta.id });
+    const entries = await store.history(piece.meta.id);
+    expect(entries.at(entries.length - 1)?.note).toContain(
+      `moved from ${first.meta.id} under ${second.meta.id}`,
+    );
+  });
+
+  it('reports nothing when the parent it was given is the one the task already had', async () => {
+    const { first, piece } = await twoDecompositions();
+
+    const report: PatchReport = {};
+    await store.patch({ parent: first.meta.id }, piece.meta.id, report);
+
+    expect(report.moved).toBeUndefined();
+  });
+
+  it('moves the branch the prompt carries with it', async () => {
+    const { leaf, elsewhere } = await leafAndSomewhereToPutIt();
+    // Active and just touched, so it stays the frontier after the move: the injection then has
+    // to name the new branch, which is the only line in the prompt that says where this is.
+    await store.patch({ status: 'active', parent: elsewhere.meta.id }, leaf.meta.id);
+
+    const injection = readInjection(dir);
+    expect(injection.kind).toBe('context');
+    if (injection.kind !== 'context' || injection.task === null) return;
+    expect(injection.task).toContain('Branch: Second decomposition [active] -> this task');
+    expect(injection.task).not.toContain('First decomposition');
   });
 });
 

@@ -181,11 +181,23 @@ class FakeTaskStore {
     this.record('patch', [patch, id]);
     if (this.errors.patch !== undefined) throw this.errors.patch;
     const task = this.resolve(id, 'no active task');
+    // `parent` addresses the tree rather than Σ, so it never reaches the merge. The fake applies
+    // the move without re-checking it — the refusals belong to the store and are tested there.
+    const statePatch: StateDict = { ...patch };
+    const movesTree = 'parent' in statePatch;
+    const requested = statePatch['parent'];
+    delete statePatch['parent'];
     // Path keys ("plan[1].status") are expanded before anything else runs, as in the store.
-    const expanded = expandPathPatch(task.state, patch);
+    const expanded = expandPathPatch(task.state, statePatch);
     if (!expanded.ok) throw new FakePatchError('path', expanded.message);
     task.state = mergeState(task.state, expanded.patch);
     task.meta.updatedAt = '2026-09-05T10:05:00.000Z';
+    if (movesTree) {
+      const from = task.meta.parent;
+      const to = typeof requested === 'string' && requested.trim() !== '' ? requested.trim() : null;
+      task.meta.parent = to;
+      if (report !== undefined && from !== to) report.moved = { from, to };
+    }
     this.entries.push({ at: task.meta.updatedAt, patch: { ...patch }, ok: true });
     if (report !== undefined && this.stamps !== null) report.stamps = this.stamps;
     return task;
@@ -712,6 +724,44 @@ describe('task_patch', () => {
 
     expect(result.ok).toBe(true);
     expect(result.content).not.toContain('no longer attached');
+  });
+
+  it('names both ends of a move in the tree, which Σ cannot show', async () => {
+    const { store, call } = setup();
+    await store.start('the decomposition');
+    await store.start('a piece of it', { parent: 'task-1' });
+    await store.start('somewhere else');
+
+    const result = await call('task_patch', { patch: { parent: 'task-3' }, id: 'task-2' });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('Moved from task-1 under task-3');
+    // The rendered Σ reads the same either way — the parent is a column — so without that line
+    // the answer would not say the task is anywhere else than it was.
+    expect(jsonLine(result.content)).not.toContain('task-3');
+  });
+
+  it('names a task detached into a root, and one filed under its first decomposition', async () => {
+    const { store, call } = setup();
+    await store.start('the decomposition');
+    await store.start('a piece of it', { parent: 'task-1' });
+
+    const detached = await call('task_patch', { patch: { parent: null }, id: 'task-2' });
+    expect(detached.content).toContain('Moved out of task-1 into a root task');
+
+    const filed = await call('task_patch', { patch: { parent: 'task-1' }, id: 'task-2' });
+    expect(filed.content).toContain('Filed under task-1 as a subtask');
+  });
+
+  it('says nothing about the tree when the patch moved nothing', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+
+    const result = await call('task_patch', { patch: { decisions: ['one more'] } });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).not.toContain('Moved');
+    expect(result.content).not.toContain('Filed under');
   });
 
   it('applies a path key that changes one plan item', async () => {

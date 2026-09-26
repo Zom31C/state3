@@ -20,6 +20,7 @@ export const PATCH_SEMANTICS: string = `Patch semantics (ΔΣ merged into Σ wit
 - An element may also be named by its own id: {"plan[id=5].notes": "…"}, {"plan[id=5]": null}. Safer than an index, because a step's id and its position differ as soon as a step is added or removed.
 - A path key with null and no keys below it removes that element: {"verifications[2]": null}. Removal shifts the indexes below it, so a patch removing two elements is applied in the order its keys were written.
 - Prefer a path key over resending the array. One field cannot be sent both wholesale and by path in the same patch.
+- One key addresses the tree instead of Σ: {"parent": "<task id>"} re-files this task under another one, taking its own subtasks with it, and {"parent": null} makes it a root task. Its status does not change. Refused when the new parent does not exist, is done, or already sits under this task — that move would close a loop no reader could walk.
 - A rejected patch never modifies the state. Read the diagnostic category (${patchCategoryList()}), fix the patch, and retry.`;
 
 export const STATE_HYGIENE: string = `State hygiene:

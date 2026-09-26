@@ -612,6 +612,30 @@ try {
     text(closingEarly).split('\n')[0],
   );
 
+  // Moving a task is the one patch Σ cannot show — the parent is a column, and the state renders
+  // the same before and after — so both the refusal and the confirmation have to be words.
+  const cycle = await call('task_patch', { patch: { parent: subtaskId(pieceOne) }, id: taskId });
+  check(
+    'a task cannot be moved under its own subtask, and the refusal says why',
+    cycle.isError === true &&
+      text(cycle).includes('would make it its own ancestor') &&
+      !text(cycle).includes('unknown-key'),
+    text(cycle).split('\n')[0],
+  );
+
+  const moved = await call('task_patch', {
+    patch: { parent: subtaskId(unrelated) },
+    id: subtaskId(pieceTwo),
+  });
+  check(
+    'a patch re-files a task under another one and names both ends of the move',
+    moved.isError !== true &&
+      text(moved).includes(`Moved from ${taskId} under ${subtaskId(unrelated)}`),
+    text(moved)
+      .split('\n')
+      .find((line) => line.startsWith('Moved')) ?? '(no move line)',
+  );
+
   await call('task_finish', { summary: 'Piece one done', id: subtaskId(pieceOne) });
   await call('task_finish', { summary: 'Piece two done', id: subtaskId(pieceTwo) });
   // Closed before the parent so the last `task_finish` below, which names no id, finds the

@@ -339,6 +339,19 @@ export function renderTaskBrief(task: StoredTask): string {
 }
 
 /**
+ * A task's place in the tree changed, as the sentence both entry points print.
+ *
+ * One wording for the MCP answer and the CLI because the fact is the same, and each surface adds
+ * its own pointer to the tree afterwards. Naming both ends is what makes a wrong id visible
+ * while it is still cheap to undo: Σ cannot show the move, since the parent is a column.
+ */
+export function describeMove(move: { from: string | null; to: string | null }): string {
+  if (move.to === null) return `Moved out of ${move.from ?? 'its decomposition'} into a root task`;
+  if (move.from === null) return `Filed under ${move.to} as a subtask`;
+  return `Moved from ${move.from} under ${move.to}`;
+}
+
+/**
  * One task's decomposition: the task itself, then each descendant behind its parent.
  *
  * Widened one level per pass until the set stops growing, so a cycle in `parent` — corrupt data,

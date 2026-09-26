@@ -10,6 +10,7 @@ import { isNotation, NOTATIONS } from '../tasks/notation.js';
 import type { ProjectEntry, StoreResolver, TaskStorePort } from '../tasks/ports.js';
 import { describeProjects } from '../tasks/projects.js';
 import {
+  describeMove,
   formatTaskList,
   renderStateSize,
   renderTaskHead,
@@ -407,6 +408,20 @@ function stampNote(report: PatchReport): string {
   return lines.length === 0 ? '' : `\n${lines.join('\n')}`;
 }
 
+/**
+ * The move in the tree this patch made, as a line under the answer.
+ *
+ * Σ cannot show it, and the answer renders Σ: a task's parent is a column, so the state reads the
+ * same before and after, and the caller — which asked for the move by id but cannot see the
+ * branch it landed in — is the one who has to be told. Naming both ends is what makes a wrong id
+ * visible at the moment it is still cheap to undo.
+ */
+function movedNote(report: PatchReport): string {
+  const move = report.moved;
+  if (move === undefined) return '';
+  return `\n${describeMove(move)}; task_show {"view":"tree"} prints the decomposition.`;
+}
+
 async function patchTask(
   resolver: StoreResolver,
   args: Record<string, unknown>,
@@ -424,6 +439,7 @@ async function patchTask(
     const task = await store.patch(patch.value, id.value, report);
     return success(
       `Patched task ${task.meta.id}.\n\n${renderState(task)}` +
+        movedNote(report) +
         stampNote(report) +
         artifactNote(store, task.state, patch.value),
     );
@@ -568,7 +584,7 @@ const PATCH_SCHEMA: Record<string, unknown> = {
     patch: {
       type: 'object',
       description:
-        'State fields to merge into the current state (only the changed ones). A null value deletes a key. A key like "plan[1].status" changes one array item without resending the array, and "plan[+]" appends one.',
+        'State fields to merge into the current state (only the changed ones). A null value deletes a key. A key like "plan[1].status" changes one array item without resending the array, and "plan[+]" appends one. One key addresses the tree instead of the state: "parent" moves this task under another one — its own subtasks come with it — and {"parent": null} makes it a root task again.',
       additionalProperties: true,
     },
     id: { type: 'string', description: 'Task id. Defaults to the active task.' },
