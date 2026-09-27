@@ -1,8 +1,42 @@
 {
-  "context": {
-    "includeDirectories": [
-      "D:\\Projects\\RaceGame"
+  "$version": 4,
+  "permissions": {
+    "allow": [
+      "Bash(npx *)",
+      "Bash(npm test)",
+      "Bash(npm run *)",
+      "mcp__state3__task_patch",
+      "Bash(bun *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "mcp__state3__task_finish",
+      "Bash(git *)",
+      "mcp__state3__task_start",
+      "Bash(npm root *)",
+      "Bash(cd *)",
+      "Bash(dir *)",
+      "Bash(type *)",
+      "Bash(qwen *)",
+      "Bash(findstr *)",
+      "Bash(echo *)",
+      "Bash(copy *)",
+      "Bash(node *)",
+      "Bash(del *)",
+      "mcp__skillstate__page",
+      "Bash(gh *)",
+      "Bash(winget *)",
+      "Bash(\"c:\\program files\\github cli\\gh.exe\" *)",
+      "Bash($c *)",
+      "Bash(write-output)",
+      "Bash($hits *)",
+      "Bash(foreach-object *)",
+      "Bash(select-object *)",
+      "mcp__state3__page",
+      "Bash(powershell *)",
+      "mcp__state3__task_list",
+      "mcp__state3__task_show",
+      "Bash(tail *)",
+      "mcp__state3__search"
     ]
-  },
-  "$version": 4
+  }
 }
