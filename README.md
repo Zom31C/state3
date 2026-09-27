@@ -44,7 +44,7 @@ npm run run -- task list                       # дерево задач: отс
 npm run run -- task history --limit 10         # аудит, включая отвергнутые патчи
 npm run run -- task finish "Миграция завершена, тесты зелёные"
 npm run run -- task migrate                    # легаси-JSON -> state.db (--purge: не архивировать)
-npm run run -- task doctor                     # integrity, версия схемы, счётчики, висячие связи
+npm run run -- task doctor                     # integrity, версия схемы, счётчики, висячие связи, сироты и петли в дереве задач
 ```
 
 Состояние хранится в одном файле `.state3/state.db` (SQLite, WAL): задачи, история патчей, страницы базы знаний и связи между ними (каталог в `.gitignore`). Флаг `--root <dir>` задаёт другой каталог состояния. Корень прежнего формата (`<id>.json` + `<id>.history.jsonl`) переносится подкомандой `task migrate` — легаси-файлы архивируются, а не удаляются; `task doctor` сообщает о состоянии корня (см. §12 [INTEGRATION.md](./INTEGRATION.md)).

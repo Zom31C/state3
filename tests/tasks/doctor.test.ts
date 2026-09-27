@@ -4,7 +4,11 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { openStateDatabase } from '../../src/db/database.js';
 import { SCHEMA_VERSION } from '../../src/db/schema.js';
-import { formatDoctorReport, inspectStateRoot } from '../../src/tasks/doctor.js';
+import {
+  formatDoctorReport,
+  inspectParentEdges,
+  inspectStateRoot,
+} from '../../src/tasks/doctor.js';
 import { TaskStore } from '../../src/tasks/store.js';
 
 let dir: string;
@@ -87,6 +91,8 @@ describe('inspectStateRoot', () => {
     expect(report.counts.searchRows).toBe(1);
     expect(report.unreadableTasks).toEqual([]);
     expect(report.danglingLinks).toEqual([]);
+    expect(report.orphanedTasks).toEqual([]);
+    expect(report.parentCycles).toEqual([]);
     expect(severities(report)).not.toContain('warn');
     expect(severities(report)).not.toContain('fail');
     expect(formatDoctorReport(report)).toContain('nothing to fix');
@@ -159,6 +165,46 @@ describe('inspectStateRoot', () => {
     expect(formatDoctorReport(report)).toContain('dangling link');
   });
 
+  it('reports a loop in task.parent, which the listing and the frontier only work around', async () => {
+    const store = track(new TaskStore(dir));
+    const root = await store.start('The decomposition');
+    const piece = await store.start('A piece of it', { parent: root.meta.id });
+    // A foreign key allows this edge — both rows exist — and `checkReparent` is what refuses it,
+    // reading before the write transaction: two processes racing it can leave exactly this.
+    store
+      .database()
+      .prepare('UPDATE task SET parent = ? WHERE id = ?')
+      .run(piece.meta.id, root.meta.id);
+    store.close();
+
+    const report = await inspectStateRoot(dir);
+    const text = formatDoctorReport(report);
+
+    expect(report.parentCycles).toEqual([[root.meta.id, piece.meta.id]]);
+    expect(report.orphanedTasks).toEqual([]);
+    expect(text).toContain('task.parent loops');
+    expect(text).toContain(`${root.meta.id} -> ${piece.meta.id} -> ${root.meta.id}`);
+  });
+
+  it('reports a parent that is not in this root', async () => {
+    const store = await storeWithTask();
+    store.close();
+
+    // The foreign key refuses this edge, so it takes a connection with the keys off — which is
+    // what a database copied or edited by hand amounts to.
+    const db = track(openStateDatabase(dbPath()));
+    db.pragma('foreign_keys = OFF');
+    const row = db.prepare('SELECT id FROM task LIMIT 1').get() as { id: string };
+    db.prepare('UPDATE task SET parent = ? WHERE id = ?').run('task-gone', row.id);
+    db.close();
+    open.pop();
+
+    const report = await inspectStateRoot(dir);
+    expect(report.orphanedTasks).toEqual([{ id: row.id, parent: 'task-gone' }]);
+    expect(report.parentCycles).toEqual([]);
+    expect(formatDoctorReport(report)).toContain('is not in this root');
+  });
+
   it('fails on a schema version this build does not know, and puts FAIL first', async () => {
     const store = await storeWithTask();
     store.close();
@@ -209,5 +255,50 @@ describe('inspectStateRoot', () => {
     expect(report.schemaVersion).toBe(0);
     expect(severities(report)).toContain('fail');
     expect((await readFile(dbPath())).equals(before)).toBe(true);
+  });
+});
+
+describe('inspectParentEdges', () => {
+  it('finds nothing to report in a well-formed decomposition', () => {
+    const edges = [
+      { id: 'root', parent: null },
+      { id: 'a', parent: 'root' },
+      { id: 'b', parent: 'root' },
+      { id: 'a1', parent: 'a' },
+    ];
+
+    expect(inspectParentEdges(edges)).toEqual({ orphaned: [], cycles: [] });
+  });
+
+  it('names an edge that leads to a row this root does not hold', () => {
+    expect(inspectParentEdges([{ id: 'a', parent: 'gone' }])).toEqual({
+      orphaned: [{ id: 'a', parent: 'gone' }],
+      cycles: [],
+    });
+  });
+
+  it('reads a task that is its own parent as a loop of one', () => {
+    expect(inspectParentEdges([{ id: 'a', parent: 'a' }]).cycles).toEqual([['a']]);
+  });
+
+  it('reports a loop once, whichever of its members the walk starts from', () => {
+    const edges = [
+      { id: 'a', parent: 'b' },
+      { id: 'b', parent: 'a' },
+    ];
+
+    expect(inspectParentEdges(edges).cycles).toEqual([['a', 'b']]);
+    expect(inspectParentEdges([...edges].reverse()).cycles).toHaveLength(1);
+  });
+
+  it('reports the loop alone when a tail leads into it', () => {
+    const edges = [
+      { id: 'tail', parent: 'a' },
+      { id: 'a', parent: 'b' },
+      { id: 'b', parent: 'c' },
+      { id: 'c', parent: 'a' },
+    ];
+
+    expect(inspectParentEdges(edges).cycles).toEqual([['a', 'b', 'c']]);
   });
 });

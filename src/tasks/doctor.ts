@@ -46,6 +46,10 @@ export interface DoctorReport {
   unreadableTasks: { id: string; reason: string }[];
   /** `link` edges pointing at a task or page that is not there. */
   danglingLinks: { from: string; to: string; rel: string }[];
+  /** `task.parent` edges pointing at a row this root does not hold. */
+  orphanedTasks: { id: string; parent: string }[];
+  /** Loops in `task.parent`, each as the ids that form it, in the order the edges point. */
+  parentCycles: string[][];
   findings: Finding[];
 }
 
@@ -56,6 +60,66 @@ function count(db: SqlDatabase, sql: string): number {
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** One `parent` edge of the task tree, as the check below reads it. */
+export interface ParentEdge {
+  id: string;
+  parent: string | null;
+}
+
+/**
+ * What `parent` can hold that the tree cannot: edges leading nowhere, and edges leading back
+ * around.
+ *
+ * Neither is reachable through one call — a foreign key polices the first and `checkReparent` the
+ * second — and both are survivable, which is exactly why nothing else reports them: the listing
+ * prints an orphan as a root and appends the members of a loop flat, the branch walk stops at the
+ * first id it has already seen, and the frontier falls back to the flat order. Degraded
+ * everywhere and named nowhere is what this ends.
+ *
+ * Pure so a test can decide the shapes without a database: the walk is the whole rule.
+ */
+export function inspectParentEdges(edges: readonly ParentEdge[]): {
+  orphaned: { id: string; parent: string }[];
+  cycles: string[][];
+} {
+  const known = new Set(edges.map((edge) => edge.id));
+  const orphaned: { id: string; parent: string }[] = [];
+  const parentOf = new Map<string, string>();
+  for (const edge of edges) {
+    if (edge.parent === null) continue;
+    if (known.has(edge.parent)) {
+      parentOf.set(edge.id, edge.parent);
+    } else {
+      // An edge to a row that is not there cannot take part in a loop, so it is dropped here
+      // rather than walked: the orphan is the finding, and the walk would end on it anyway.
+      orphaned.push({ id: edge.id, parent: edge.parent });
+    }
+  }
+
+  const cycles: string[][] = [];
+  // Walked once per task, not once per edge: a node reached again from another start is already
+  // accounted for, either as part of a loop found then or as a tail leading into one.
+  const settled = new Set<string>();
+  for (const start of parentOf.keys()) {
+    if (settled.has(start)) continue;
+    const path: string[] = [];
+    const position = new Map<string, number>();
+    let current: string | undefined = start;
+    while (current !== undefined && !settled.has(current)) {
+      const at = position.get(current);
+      if (at !== undefined) {
+        cycles.push(path.slice(at));
+        break;
+      }
+      position.set(current, path.length);
+      path.push(current);
+      current = parentOf.get(current);
+    }
+    for (const id of path) settled.add(id);
+  }
+  return { orphaned, cycles };
 }
 
 /**
@@ -135,6 +199,8 @@ export async function inspectStateRoot(
     counts: { tasks: 0, taskHistory: 0, pages: 0, links: 0, searchRows: 0 },
     unreadableTasks: [],
     danglingLinks: [],
+    orphanedTasks: [],
+    parentCycles: [],
     findings,
   };
 
@@ -189,6 +255,33 @@ export async function inspectStateRoot(
         text:
           `search index holds ${report.counts.searchRows} row(s) but there are ${indexed} ` +
           'task(s) and page(s) — the index is out of sync',
+      });
+    }
+
+    // The tree is the one structure no constraint fully polices: a foreign key keeps `parent`
+    // pointing at a row that exists, but only `checkReparent` — which reads before the write
+    // transaction, so two processes can race it — keeps it acyclic, and a file copied or edited
+    // with the keys off can break either. Everything downstream degrades quietly, so this is the
+    // place that names it.
+    const parentEdges = db.prepare('SELECT id, parent FROM task').all() as ParentEdge[];
+    const tree = inspectParentEdges(parentEdges);
+    report.orphanedTasks = tree.orphaned;
+    report.parentCycles = tree.cycles;
+    for (const orphan of tree.orphaned) {
+      findings.push({
+        severity: 'warn',
+        text:
+          `task ${orphan.id} sits under ${orphan.parent}, which is not in this root — the listing ` +
+          'prints it as a root and its branch ends there',
+      });
+    }
+    for (const cycle of tree.cycles) {
+      const loop = [...cycle, cycle[0] ?? ''].join(' -> ');
+      findings.push({
+        severity: 'warn',
+        text:
+          `task.parent loops: ${loop} — the listing appends these tasks flat and the frontier ` +
+          'picks from the flat order, so no decomposition here can be addressed',
       });
     }
 
