@@ -58,6 +58,15 @@ describe('isDocumentableFile', () => {
     expect(isDocumentableFile('tools/dev')).toBe(true);
     expect(isDocumentableFile('LICENSE')).toBe(false);
   });
+
+  it('takes a hidden file, whose dot is part of the name and not a missing extension', () => {
+    expect(isDocumentableFile('.gitignore')).toBe(true);
+    expect(isDocumentableFile('.env')).toBe(true);
+    expect(isDocumentableFile('.prettierrc.json')).toBe(true);
+    expect(isDocumentableFile('.qwen/settings.json')).toBe(true);
+    // A hidden directory is still not a file: git reports what is under it.
+    expect(isDocumentableFile('.state3')).toBe(false);
+  });
 });
 
 describe('PageStore.coverage', () => {

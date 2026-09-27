@@ -49,6 +49,46 @@ describe('extractSourceFiles', () => {
     ]);
   });
 
+  it('keeps the dot a hidden path opens with, because it is part of the name git reports', () => {
+    const body = [
+      'The host rewrites .qwen/settings.json and the state lives in .state3/state.db.',
+      'A workflow is .github/workflows/ci.yml; the root holds .gitignore and .env.',
+    ].join('\n');
+
+    // Read as the punctuation of the sentence in front, the dot left the anchor naming
+    // qwen/settings.json — a path git never reports, so the page could not go stale however
+    // the file moved, and coverage kept listing a file a page does name.
+    expect(extractSourceFiles(body)).toEqual([
+      '.qwen/settings.json',
+      '.state3/state.db',
+      '.github/workflows/ci.yml',
+      '.gitignore',
+      '.env',
+    ]);
+  });
+
+  it('still leaves out a hidden directory, which is not a file to anchor to', () => {
+    expect(extractSourceFiles('state lives in .state3 and dist, not in .github alone')).toEqual([]);
+  });
+
+  it('takes a bare extension in prose for a path, the cheaper of the two mistakes', () => {
+    // "The newest .js in dist" anchors to a path that does not exist. It is inert — git never
+    // reports it, so neither staleness nor coverage can see it — and the alternative is
+    // missing .gitignore and .env, which SOURCE_EXTENSIONS holds extensions for and which a
+    // page must be able to anchor to.
+    expect(extractSourceFiles('the newest .js in dist, not the .gitignore')).toEqual([
+      '.js',
+      '.gitignore',
+    ]);
+  });
+
+  it('still reads as punctuation a dot that ends a sentence or quotes "here"', () => {
+    expect(extractSourceFiles('run .\\tools\\check.ps1, then see ... src/kb/sources.ts.')).toEqual([
+      'tools/check.ps1',
+      'src/kb/sources.ts',
+    ]);
+  });
+
   it('names a file once however often the page mentions it', () => {
     expect(extractSourceFiles('scripts/Car.cs, then scripts/Car.cs:12 again')).toEqual([
       'scripts/Car.cs',

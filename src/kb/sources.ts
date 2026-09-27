@@ -72,15 +72,23 @@ export const SOURCE_EXTENSIONS: readonly string[] = [
  */
 export const SOURCE_FILES_LIMIT = 50;
 
-/** A token that looks like `path/to/file.ext`, optionally followed by `:line` or `:from-to`. */
-const FILE_REFERENCE = /[A-Za-z0-9_.\\/-]+\.[A-Za-z0-9]{1,10}(?::\d+(?:-\d+)?)?/g;
+/**
+ * A token that looks like `path/to/file.ext`, optionally followed by `:line` or `:from-to`.
+ *
+ * The part before the extension dot may be empty, because a hidden file in the project root
+ * has nothing in front of its dot: `.gitignore` and `.env` are paths, and the entries
+ * SOURCE_EXTENSIONS holds for them are worth nothing if the tokenizer cannot reach the name.
+ */
+const FILE_REFERENCE = /[A-Za-z0-9_.\\/-]*\.[A-Za-z0-9]{1,10}(?::\d+(?:-\d+)?)?/g;
 
 /** Anything a URL is made of, so `https://host/path/file.md` is not read as a project file. */
 const URL = /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi;
 
 /** Punctuation a reference picks up from the sentence around it. */
 const TRAILING_JUNK = /[.,;:!?()[\]{}<>"'`*]+$/;
-const LEADING_JUNK = /^[.,;:!?()[\]{}<>"'`*]+/;
+const LEADING_JUNK_CHAR = /^[.,;:!?()[\]{}<>"'`*]/;
+/** A dot before a name opens a hidden path — `.qwen/settings.json` — and is not punctuation. */
+const STARTS_HIDDEN_PATH = /^\.[A-Za-z0-9_]/;
 
 const KNOWN_EXTENSIONS = new Set(SOURCE_EXTENSIONS);
 
@@ -110,21 +118,47 @@ export function extractSourceFiles(body: string): string[] {
 function normalize(token: string): string | null {
   // The line reference is part of the token but not of the path.
   const withoutLines = token.replace(/:\d+(?:-\d+)?$/, '');
-  const cleaned = withoutLines.replace(LEADING_JUNK, '').replace(TRAILING_JUNK, '');
+  const cleaned = stripLeadingJunk(withoutLines).replace(TRAILING_JUNK, '');
   const path = cleaned.replace(/\\/g, '/');
   if (path === '') return null;
 
   const slash = path.lastIndexOf('/');
-  const name = path.slice(slash + 1);
-  const dot = name.lastIndexOf('.');
-  // No dot in the last segment means no extension, and a directory is not a file to anchor
-  // to: git reports the files under it, not the folder.
-  if (dot <= 0) return null;
-  const extension = name.slice(dot + 1).toLowerCase();
+  const extension = extensionOf(path.slice(slash + 1));
+  // No extension means the last segment is a directory, and a directory is not a file to
+  // anchor to: git reports the files under it, not the folder.
+  if (extension === null) return null;
   const hasDirectory = slash >= 0;
   if (!hasDirectory && !KNOWN_EXTENSIONS.has(extension)) return null;
   // A leading "./" or "/" is how a body quotes a path, not how git names it.
   return path.replace(/^\.\//, '').replace(/^\/+/, '');
+}
+
+/**
+ * The token without the punctuation the sentence around it left in front.
+ *
+ * One character at a time, because a dot is both: it ends a sentence and it opens a hidden
+ * path. `.qwen/settings.json` keeps its dot, an ellipsis in front of a path loses every dot
+ * but the last, and the `.` quoting "here" in `.\tools\check.ps1` is still punctuation.
+ */
+function stripLeadingJunk(token: string): string {
+  let rest = token;
+  while (LEADING_JUNK_CHAR.test(rest) && !STARTS_HIDDEN_PATH.test(rest)) rest = rest.slice(1);
+  return rest;
+}
+
+/**
+ * The extension of a file name, or null when the name has none.
+ *
+ * A leading dot belongs to the name — `.gitignore`, `.env`, `.prettierrc.json` — so it does
+ * not leave the name without an extension: what follows it is the extension. That is what the
+ * "gitignore" and "env" entries of SOURCE_EXTENSIONS are for, and until this read them a
+ * hidden file in the project root could not anchor a page however often a body named it.
+ */
+function extensionOf(name: string): string | null {
+  const visible = name.startsWith('.') ? name.slice(1) : name;
+  const dot = visible.lastIndexOf('.');
+  if (dot >= 0) return visible.slice(dot + 1).toLowerCase();
+  return name.startsWith('.') && visible !== '' ? visible.toLowerCase() : null;
 }
 
 /**
@@ -189,9 +223,8 @@ export function isDocumentableFile(path: string): boolean {
   const slash = path.lastIndexOf('/');
   const name = path.slice(slash + 1);
   if (GENERATED_FILE_NAMES.has(name)) return false;
-  const dot = name.lastIndexOf('.');
-  const extension = dot <= 0 ? '' : name.slice(dot + 1).toLowerCase();
-  return KNOWN_EXTENSIONS.has(extension) || slash >= 0;
+  const extension = extensionOf(name);
+  return (extension !== null && KNOWN_EXTENSIONS.has(extension)) || slash >= 0;
 }
 
 /** The paths of a stored page row; an empty column reads as no anchor. */
