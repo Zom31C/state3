@@ -167,6 +167,36 @@ function branchOf(db: SqlDatabase, id: string): BranchRow[] {
 }
 
 /**
+ * How many levels above the task the prompt names, besides the root.
+ *
+ * The branch line rides on every prompt of the task, so it is the one place where the tree can
+ * hand back what splitting work into it just saved. Measured on a chain of 15 levels with
+ * sentence-long goals, the uncapped line ran to 1752 chars — 84% of everything the injection
+ * carried, against the ~700 chars of Σ it was there to annotate.
+ *
+ * Depth is the axis that grows without bound, and the two ends of the chain are what a reader
+ * needs: the root says which job this is a piece of, the nearest levels say which piece. The
+ * middle is navigation, and navigation has its own address — `task_show {"view":"tree"}`. The
+ * count is kept so the line still says the chain continues above what is shown.
+ */
+const BRANCH_NEAREST_LEVELS = 2;
+
+/**
+ * The branch line's segments: the root, the levels nearest the task, and a count of what was left
+ * out between them.
+ *
+ * Nothing is elided while the whole chain fits, so a decomposition four levels deep — the shape
+ * nearly every tree has — reads in full and the cap costs it nothing.
+ */
+function branchPath(branch: readonly BranchRow[]): string[] {
+  const ancestors = branch.slice(0, -1).map((task) => `${task.goal} [${task.status}]`);
+  const [root, ...above] = ancestors;
+  if (root === undefined || above.length <= BRANCH_NEAREST_LEVELS) return ancestors;
+  const nearest = above.slice(-BRANCH_NEAREST_LEVELS);
+  return [root, `… ${above.length - nearest.length} more`, ...nearest];
+}
+
+/**
  * The subtasks of the same parent still to come after this one, in the order they were split.
  *
  * Compared on `created_at` and then on `rowid`, which is `queueOrder` in src/tasks/store.ts as
@@ -207,10 +237,7 @@ function branchLines(db: SqlDatabase, row: CandidateRow, queue: boolean): string
   try {
     const branch = branchOf(db, row.id);
     if (branch.length > 1) {
-      const path = branch.map((task, index) =>
-        index === branch.length - 1 ? 'this task' : `${task.goal} [${task.status}]`,
-      );
-      lines.push(`Branch: ${path.join(' -> ')}`);
+      lines.push(`Branch: ${[...branchPath(branch), 'this task'].join(' -> ')}`);
     }
     if (queue !== true) return lines;
 

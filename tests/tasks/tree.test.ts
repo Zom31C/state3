@@ -55,6 +55,32 @@ async function splitThreeStored(): Promise<{ root: StoredTask; subs: StoredTask[
   return { root, subs };
 }
 
+/**
+ * A chain `depth` levels deep, each task split out of the one before it; returns the goals,
+ * root first.
+ *
+ * The deepest task is the one a prompt carries without any help: every level above it has an open
+ * subtask, so none of them is at the frontier, and the leaf is the only candidate.
+ */
+async function chainOf(depth: number): Promise<string[]> {
+  const goals: string[] = [];
+  let parent: string | undefined;
+  for (let level = 0; level < depth; level++) {
+    const goal = `Level ${level} of the chain`;
+    const task = await store.start(goal, parent === undefined ? {} : { parent });
+    goals.push(goal);
+    parent = task.meta.id;
+  }
+  return goals;
+}
+
+/** The `Branch:` line of the next prompt injection, or a placeholder that fails an assertion. */
+function injectedBranch(): string {
+  const injection = readInjection(dir);
+  if (injection.kind !== 'context' || injection.task === null) return '(no injection)';
+  return injection.task.split('\n').find((line) => line.startsWith('Branch:')) ?? '(no branch)';
+}
+
 describe('splitting a task', () => {
   it('queues the subtask behind the work in flight and records whose it is', async () => {
     const { root, subs } = await splitThreeStored();
@@ -402,6 +428,31 @@ describe('what a prompt carries', () => {
     if (injection.kind !== 'context' || injection.task === null) return;
     expect(injection.task).not.toContain('Branch:');
     expect(injection.task).not.toContain('Queued after this');
+  });
+
+  it('reads a chain four levels deep in full, so the cap costs an ordinary tree nothing', async () => {
+    await chainOf(4);
+
+    expect(injectedBranch()).toBe(
+      'Branch: Level 0 of the chain [active] -> Level 1 of the chain [pending] -> ' +
+        'Level 2 of the chain [pending] -> this task',
+    );
+  });
+
+  it('names the root and the two nearest levels of a deep chain, and counts what it left out', async () => {
+    // Depth is the axis that grows without bound, and the branch line rides on every prompt: on a
+    // chain of 15 levels with sentence-long goals it ran to 1752 chars, 84% of everything the
+    // injection carried. What a reader needs is the two ends — which job this is a piece of, and
+    // which piece — so the middle becomes a count, like the queue behind it.
+    await chainOf(6);
+
+    const line = injectedBranch();
+    expect(line).toBe(
+      'Branch: Level 0 of the chain [active] -> … 2 more -> Level 3 of the chain [pending] -> ' +
+        'Level 4 of the chain [pending] -> this task',
+    );
+    expect(line).not.toContain('Level 1 of the chain');
+    expect(line).not.toContain('Level 2 of the chain');
   });
 
   it('tells a delegated subagent which piece it is on, but not what comes next', async () => {
