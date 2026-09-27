@@ -292,6 +292,29 @@ function branchLines(db: SqlDatabase, row: CandidateRow, queue: boolean): string
   return lines;
 }
 
+/** The order statuses read in, as `FRONTIER_ORDER` ranks them: workable first, parked last. */
+const STATUS_RANK: Readonly<Record<string, number>> = { active: 0, pending: 1, blocked: 2 };
+
+/**
+ * The statuses of a group of tasks, as the parenthetical a reader decides by: `blocked` for one
+ * task, `1 active, 2 blocked` for several, workable statuses first.
+ *
+ * A count on its own says "there is open work over there" and nothing about whether it can be
+ * touched. This line exists to stop a cold session starting new work beside a decomposition, and a
+ * session that walks into a root parked a month ago has paid the same price the line was meant to
+ * remove — it just pays it later. One word per group is cheap on a line that rides once per
+ * session, and it is the difference between "also open" and "also open, and not yours to take".
+ */
+function statusBreakdown(statuses: readonly string[]): string {
+  const counts = new Map<string, number>();
+  for (const status of statuses) counts.set(status, (counts.get(status) ?? 0) + 1);
+  const rank = (status: string): number => STATUS_RANK[status] ?? 3;
+  return [...counts.entries()]
+    .sort((a, b) => rank(a[0]) - rank(b[0]) || (a[0] < b[0] ? -1 : 1))
+    .map(([status, count]) => (statuses.length === 1 ? status : `${count} ${status}`))
+    .join(', ');
+}
+
 /**
  * Open work this injection does not already name, as one line, or null when there is none.
  *
@@ -313,9 +336,10 @@ function branchLines(db: SqlDatabase, row: CandidateRow, queue: boolean): string
 function elsewhereLine(db: SqlDatabase, row: CandidateRow): string | null {
   try {
     const named = new Set(branchOf(db, row.id).map((task) => task.id));
-    const open = db.prepare(`SELECT id, parent FROM task WHERE status <> 'done'`).all() as {
+    const open = db.prepare(`SELECT id, parent, status FROM task WHERE status <> 'done'`).all() as {
       id: string;
       parent: string | null;
+      status: string;
     }[];
     const elsewhere = open.filter((task) => {
       if (named.has(task.id)) return false;
@@ -323,18 +347,26 @@ function elsewhereLine(db: SqlDatabase, row: CandidateRow): string | null {
     });
     if (elsewhere.length === 0) return null;
 
-    const roots = elsewhere.filter((task) => task.parent === null).length;
-    const decompositions = new Set(
-      elsewhere.filter((task) => task.parent !== null).map((task) => task.parent),
-    );
+    const rootRows = elsewhere.filter((task) => task.parent === null);
+    const queued = elsewhere.filter((task) => task.parent !== null);
+    const decompositions = new Set(queued.map((task) => task.parent));
     const parts: string[] = [];
     if (decompositions.size > 0) {
+      // Only a blocked piece is named inside a decomposition: the rest are queued by definition,
+      // and a queue that cannot be started is what a reader must not walk into.
+      const blocked = queued.filter((task) => task.status === 'blocked').length;
       parts.push(
-        `${elsewhere.length - roots} queued in ${decompositions.size} decomposition` +
-          `${decompositions.size === 1 ? '' : 's'}`,
+        `${queued.length} queued in ${decompositions.size} decomposition` +
+          `${decompositions.size === 1 ? '' : 's'}` +
+          `${blocked === 0 ? '' : ` (${blocked} blocked)`}`,
       );
     }
-    if (roots > 0) parts.push(`${roots} other open root${roots === 1 ? '' : 's'}`);
+    if (rootRows.length > 0) {
+      parts.push(
+        `${rootRows.length} other open root${rootRows.length === 1 ? '' : 's'} ` +
+          `(${statusBreakdown(rootRows.map((task) => task.status))})`,
+      );
+    }
     return `Also open elsewhere: ${parts.join(', ')} — task_list prints the tree.`;
   } catch {
     return null;
@@ -437,12 +469,13 @@ function readTaskHead(
   // block announces the active task state, and this is the one case where the piece it carries
   // has not been taken yet.
   const takeover = takeoverLine(state, options.queue);
-  // All four of these are the once-per-session extras, which is what `drift` gates: a surprise
+  // All five of these are the once-per-session extras, which is what `drift` gates: a surprise
   // reported at a session start costs one line, and repeated on every prompt it costs more than
   // the surprise was worth (§15.5).
   const elsewhere = options.drift ? elsewhereLine(db, row) : null;
   const diverged = options.drift ? divergedSource(rootDir) : null;
   const drift = options.drift ? driftLines(db, row.id, state, rootDir) : [];
+  const stamp = options.drift ? stateStampLine(row.updated_at, state) : null;
   const runtime = options.drift ? buildStampLine() : null;
   const text = [
     ...(takeover === null ? [] : [takeover]),
@@ -450,6 +483,8 @@ function readTaskHead(
     // Beside the branch and above Σ, because both answer "where does this task sit among the
     // work" and a resumed session reads that before it reads the state itself.
     ...(elsewhere === null ? [] : [elsewhere]),
+    // Immediately above Σ: it says how much of the tree the state below still describes.
+    ...(stamp === null ? [] : [stamp]),
     render(task),
     // Ahead of the artifact drift: files that moved under Σ are a reason to re-read them, while
     // a second state root still being written is a reason to doubt Σ wholesale.
@@ -495,6 +530,58 @@ function driftLines(db: SqlDatabase, taskId: string, state: StateDict, rootDir: 
 function buildStampLine(): string | null {
   try {
     return formatBuildStamp(runtimeInfoSync());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * How old Σ is and against which tree it was written, as the line a session start carries.
+ *
+ * Pages say this about themselves — `page {"op":"get"}` prints the commit a body is anchored to and
+ * what moved under it — and tasks did not, so a resumed session could not tell a Σ written this
+ * morning from one written three days and forty commits ago, and read both as an account of the
+ * tree as it stands now. The moment comes from the row's `updated_at`, which the frontier query
+ * already carries, and the commit from the newest stamp in `verifications`, which the runtime
+ * writes on every patch that touches a check. No git subprocess: the host puts its own git snapshot
+ * into the same context, and the two are only comparable while this side costs nothing.
+ *
+ * The stamp is a proxy and is worded as one — "newest check stamped", not "Σ was written at this
+ * commit" — because a patch that touches no verification leaves every stamp where it was. A skill
+ * whose Σ has no `verifications` gets the moment alone.
+ *
+ * Never throws, on the same terms as the annotations around it.
+ *
+ * Exported for the same reason `applyGuardedMove` is: the commit half of the line is written by the
+ * stamping in src/tasks/verifications.ts, which outside a repository stamps `null`, so a test that
+ * wants to see a commit in it has to stage one.
+ */
+export function stateStampLine(updatedAt: string, state: StateDict): string | null {
+  try {
+    const entries = state.verifications;
+    let at: string | null = null;
+    let commit: string | null = null;
+    if (Array.isArray(entries)) {
+      for (const entry of entries) {
+        if (!isPlainObject(entry)) continue;
+        const stamped = entry.at;
+        if (typeof stamped !== 'string' || stamped === '') continue;
+        // The stamps are ISO instants, which order correctly as strings.
+        if (at === null || stamped > at) {
+          at = stamped;
+          commit = typeof entry.commit === 'string' && entry.commit !== '' ? entry.commit : null;
+        }
+      }
+    }
+    const written = typeof updatedAt === 'string' && updatedAt !== '' ? updatedAt : null;
+    if (written === null && at === null) return null;
+    const parts = [
+      written === null ? null : `Σ last written ${written}`,
+      at === null
+        ? null
+        : `newest check stamped ${at}${commit === null ? '' : ` at commit ${commit}`}`,
+    ].filter((part): part is string => part !== null);
+    return `${parts.join('; ')}.`;
   } catch {
     return null;
   }

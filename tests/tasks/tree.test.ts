@@ -669,6 +669,50 @@ describe('what a prompt carries', () => {
     expect(onPrompt.task).not.toContain('Also open elsewhere');
   });
 
+  it('names the status of a root open elsewhere, so a parked one is not walked into', async () => {
+    const { subs } = await splitThreeStored();
+    await store.patch({ status: 'active' }, at(subs, 0).meta.id);
+    const parked = await store.start('Parked until the user decides');
+    await store.patch({ status: 'blocked', blockers: ['waiting on the user'] }, parked.meta.id);
+
+    const atStart = readInjection(dir, { drift: true });
+    expect(atStart.kind).toBe('context');
+    if (atStart.kind !== 'context' || atStart.task === null) return;
+    // A count alone says "there is open work over there"; the status is what says whether it can
+    // be touched, and this root has been waiting on somebody else's decision.
+    expect(atStart.task).toContain('Also open elsewhere: 1 other open root (blocked)');
+  });
+
+  it('counts the statuses when more than one root is open elsewhere', async () => {
+    const { subs } = await splitThreeStored();
+    await store.patch({ status: 'active' }, at(subs, 0).meta.id);
+    const parked = await store.start('Parked until the user decides');
+    await store.patch({ status: 'blocked', blockers: ['waiting on the user'] }, parked.meta.id);
+    await store.start('Another job in flight');
+
+    const atStart = readInjection(dir, { drift: true });
+    expect(atStart.kind).toBe('context');
+    if (atStart.kind !== 'context' || atStart.task === null) return;
+    expect(atStart.task).toContain('2 other open roots (1 active, 1 blocked)');
+  });
+
+  it('counts a blocked piece inside a queue elsewhere, because that queue cannot be started', async () => {
+    const { subs } = await splitThreeStored();
+    await store.patch(
+      { status: 'blocked', blockers: ['waiting on the user'] },
+      at(subs, 1).meta.id,
+    );
+    const other = await store.start('Unrelated job in flight');
+
+    const atStart = readInjection(dir, { drift: true });
+    expect(atStart.kind).toBe('context');
+    if (atStart.kind !== 'context' || atStart.task === null) return;
+    expect(atStart.task).toContain(`Task ${other.meta.id}`);
+    expect(atStart.task).toContain(
+      'Also open elsewhere: 3 queued in 1 decomposition (1 blocked), 1 other open root (active)',
+    );
+  });
+
   it('stays quiet when the branch and the queue already cover every open task', async () => {
     const { subs } = await splitThreeStored();
     await store.patch({ status: 'active' }, at(subs, 0).meta.id);

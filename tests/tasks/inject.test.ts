@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { STATE_DB_FILENAME } from '../../src/db/database.js';
 import { PageStore } from '../../src/kb/store.js';
-import { readInjection } from '../../src/tasks/inject.js';
+import { readInjection, stateStampLine } from '../../src/tasks/inject.js';
 import type { Injection } from '../../src/tasks/inject.js';
 import { STATE_DELTA_THRESHOLD_CHARS } from '../../src/tasks/render.js';
 import { TaskStore } from '../../src/tasks/store.js';
@@ -452,5 +452,63 @@ describe('readInjection drift', () => {
     expect(taskOf(readInjection(dir, { drift: true, subagent: true }))).not.toContain(
       'runtime: state3 ',
     );
+  });
+
+  it('says how old Σ is at a session start, and nothing about it on a prompt', async () => {
+    const task = await store.start('Ship it');
+    await store.patch({ verifications: [{ check: 'npm test', status: 'pass' }] }, task.meta.id);
+    store.close();
+
+    const atStart = taskOf(readInjection(dir, { drift: true }));
+    expect(atStart).toContain('Σ last written ');
+    expect(atStart).toContain('newest check stamped ');
+    // A temp root is not a repository, so the stamp carries no commit — and the line leaves the
+    // clause out instead of printing "commit null".
+    expect(atStart).not.toContain('commit null');
+
+    expect(taskOf(readInjection(dir))).not.toContain('Σ last written');
+  });
+});
+
+describe('stateStampLine', () => {
+  it('names the newest stamp and its commit beside the moment Σ was written', () => {
+    expect(
+      stateStampLine('2026-09-27T15:37:52.764Z', {
+        verifications: [
+          { check: 'npm test', status: 'pass', at: '2026-09-27T14:00:00.000Z', commit: 'aaa1111' },
+          {
+            check: 'npm run lint',
+            status: 'pass',
+            at: '2026-09-27T15:00:00.000Z',
+            commit: 'bbb2222',
+          },
+        ],
+      }),
+    ).toBe(
+      'Σ last written 2026-09-27T15:37:52.764Z; ' +
+        'newest check stamped 2026-09-27T15:00:00.000Z at commit bbb2222.',
+    );
+  });
+
+  it('keeps the moment when there is no commit to name', () => {
+    // Outside a repository every stamp carries `commit: null`, and a skill whose Σ has no
+    // verifications at all carries no stamp: the moment Σ was written is still worth a line,
+    // because that is the half a resumed session reads its own progress against.
+    const written = 'Σ last written 2026-09-27T15:37:52.764Z.';
+    expect(
+      stateStampLine('2026-09-27T15:37:52.764Z', {
+        verifications: [
+          { check: 'npm test', status: 'pass', at: '2026-09-27T14:00:00.000Z', commit: null },
+        ],
+      }),
+    ).toBe(
+      'Σ last written 2026-09-27T15:37:52.764Z; newest check stamped 2026-09-27T14:00:00.000Z.',
+    );
+    expect(stateStampLine('2026-09-27T15:37:52.764Z', { verifications: [] })).toBe(written);
+    expect(stateStampLine('2026-09-27T15:37:52.764Z', {})).toBe(written);
+  });
+
+  it('says nothing when there is neither a moment nor a stamp', () => {
+    expect(stateStampLine('', {})).toBe(null);
   });
 });
