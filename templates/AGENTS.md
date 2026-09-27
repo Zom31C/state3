@@ -159,11 +159,14 @@ step in flight, while a queued subtask costs its parent one line.** `plan` is fo
 of the level you are on; a piece big enough to delegate, or to outlive this session, is a subtask
 — `task_start {"goal":…,"parent":"<this task id>"}`. It starts `pending`, the queue order is the
 order the pieces were created, and the injection names the next one under `Queued after this`. Set
-it `active` in the same patch that closes the piece before it. Statuses are `pending` | `active` |
+it `active` in the same patch that closes the piece before it; the first piece of a split has no
+predecessor to close, so nothing promotes it — while it sits at the frontier the injection says
+`Queued, not yet taken` above `Branch:`, and taking it means `{"status":"active"}` in your first
+patch. Statuses are `pending` | `active` |
 `blocked` | `done`.
 
 A prompt carries the **branch**, not the tree: above Σ of the task in flight stand at most two
-lines — `Branch: <root goal> [status] -> … -> this task`, and `Queued after this: "<goal>" (<id>)
+lines, three while the piece at the frontier is still `pending` — `Branch: <root goal> [status] -> … -> this task`, and `Queued after this: "<goal>" (<id>)
 
 - N more`. No sibling's Σ rides along; the queue lives in rows no prompt holds. Tools and the
 injection act on the **frontier**, the open task with nothing open underneath it: a task that has

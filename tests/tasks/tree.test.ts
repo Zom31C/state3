@@ -614,6 +614,37 @@ describe('what a prompt carries', () => {
     expect(injection.task).not.toContain('Queued after this');
   });
 
+  it('tells a session to take the queued piece the frontier handed it, and stops once taken', async () => {
+    // The shape a cold session lands in after a split: nothing promotes a piece when a
+    // decomposition is made, so the frontier carries a task still marked "pending" under a header
+    // that calls it the active state. Without this line the session reads it as somebody else's
+    // work and spends its first calls on task_list and task_show to find out what to do.
+    const { subs } = await splitThreeStored();
+
+    const injection = readInjection(dir);
+    expect(injection.kind).toBe('context');
+    if (injection.kind !== 'context' || injection.task === null) return;
+    expect(injection.task).toContain(`Task ${at(subs, 0).meta.id}`);
+    expect(injection.task.split('\n')[0]).toBe(
+      'Queued, not yet taken: this piece is at the frontier but still "pending" — take it by ' +
+        'sending {"status":"active"} with your first patch.',
+    );
+
+    await store.patch({ status: 'active' }, at(subs, 0).meta.id);
+    const taken = readInjection(dir);
+    if (taken.kind !== 'context' || taken.task === null) return;
+    expect(taken.task).not.toContain('Queued, not yet taken');
+  });
+
+  it('leaves a delegated subagent without the takeover line: Σ is not its to claim', async () => {
+    await splitThreeStored();
+
+    const injection = readInjection(dir, { subagent: true });
+    expect(injection.kind).toBe('context');
+    if (injection.kind !== 'context' || injection.task === null) return;
+    expect(injection.task).not.toContain('Queued, not yet taken');
+  });
+
   it('names queued work under another root at a session start, and not on every prompt', async () => {
     // The shape a cold session actually lands in: the frontier picks the unrelated active root,
     // because the decomposition's parent is a container and its pieces are only pending. Without

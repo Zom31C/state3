@@ -22,7 +22,9 @@ next to the English template.
   on compaction — not on every request. opencode has no per-prompt injection event, so the
   brief is what the session sees once, and `project_brief` is how you refresh it.
 - Work is a tree, and the Σ that reaches you is the one at the **frontier** — the open task with
-  nothing open underneath it. Above it the plugin puts at most two lines:
+  nothing open underneath it. While the piece at the frontier is still `pending` — the first piece
+  of a split has no predecessor to close, so nothing promotes it — one line above Σ says to take
+  it with `{"status":"active"}`. Otherwise the plugin puts at most two lines above it:
   `Branch: <root goal> [status] -> … -> this task` and `Queued after this: "<goal>" (<id>)
   - N more`. A task that has been split is a container and is never injected: read the tree with
 `state3_task_list`, or one decomposition with `state3_task_show {"view":"tree"}`.

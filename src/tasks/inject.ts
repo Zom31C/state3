@@ -14,7 +14,7 @@ import {
   rootMigrationNote,
 } from './migrate-root.js';
 import { DEFAULT_NOTATION, isNotation } from './notation.js';
-import { renderTaskBrief, renderTaskHead } from './render.js';
+import { renderTaskBrief, renderTaskHead, taskStatus } from './render.js';
 import { RISK_LEVELS } from './schema.js';
 import type { RiskLevel } from './schema.js';
 import type { StoredTask, TaskMeta } from './store.js';
@@ -308,6 +308,33 @@ function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * The piece at the frontier is still queued, as the one line that tells the session to take it.
+ *
+ * Nothing promotes a queued piece when a decomposition is made: `handOver` in store.ts runs
+ * inside the close of a sibling, so the first piece of a split stays `pending` while its parent
+ * is a container the frontier skips. The frontier then picks exactly that piece and the injection
+ * carries it under a header that calls it the active state — a cold session reads `(pending)` as
+ * "not mine" and spends its first calls on `task_list` and `task_show` to find out what it is
+ * supposed to do, which is what this line replaces. Measured on the session start of
+ * 27.09.2026: two calls and ~5 thousand characters to learn one word.
+ *
+ * Read from Σ rather than from the row's `status` column: the task header below this line prints
+ * Σ's status, and the two contradicting each other would be worse than either alone. A skill
+ * whose Σ has no status reads as `unknown` here and gets no line, which is the same policy
+ * `handOver` follows — a state this runtime cannot validate is a reason to leave it alone.
+ *
+ * Off for a delegated subagent, with the queue line and for the same reason: it was handed one
+ * piece of work and does not own Σ — the session that delegated it patches the status.
+ */
+function takeoverLine(state: StateDict, queue: boolean): string | null {
+  if (queue !== true || taskStatus(state) !== 'pending') return null;
+  return (
+    'Queued, not yet taken: this piece is at the frontier but still "pending" — take it by ' +
+    'sending {"status":"active"} with your first patch.'
+  );
+}
+
 /** Σ of the task to inject, or the reason it could not be read; `text` is null when none is open. */
 interface TaskHead {
   text: string | null;
@@ -369,6 +396,10 @@ function readTaskHead(
   // Above Σ rather than below it: the branch says which piece of a larger job the state below
   // describes, and a resumed session reads top to bottom.
   const branch = branchLines(db, row, options.queue);
+  // Above the branch, because it corrects the header the adapters print over all of this: the
+  // block announces the active task state, and this is the one case where the piece it carries
+  // has not been taken yet.
+  const takeover = takeoverLine(state, options.queue);
   // All three of these are the once-per-session extras, which is what `drift` gates: a surprise
   // reported at a session start costs one line, and repeated on every prompt it costs more than
   // the surprise was worth (§15.5).
@@ -376,6 +407,7 @@ function readTaskHead(
   const diverged = options.drift ? divergedSource(rootDir) : null;
   const drift = options.drift ? driftLines(db, row.id, state, rootDir) : [];
   const text = [
+    ...(takeover === null ? [] : [takeover]),
     ...branch,
     // Beside the branch and above Σ, because both answer "where does this task sit among the
     // work" and a resumed session reads that before it reads the state itself.

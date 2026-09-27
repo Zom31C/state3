@@ -34,7 +34,10 @@ every turn of the step in flight, while a queued subtask costs its parent one
 line. A subtask starts `pending`, queued behind the work in flight, and the
 runtime hands it over when its turn comes — the injection names the next piece
 under `Queued after this`. Set it `active` in the same patch that closes the
-piece before it; the queue order is the order the pieces were created. Statuses
+piece before it; the queue order is the order the pieces were created. The first
+piece of a split has no predecessor to close, so nothing promotes it: while it
+sits at the frontier the injection says `Queued, not yet taken` above `Branch:`,
+and taking it means `{"status":"active"}` in your first patch. Statuses
 are `pending` | `active` | `blocked` | `done`. A subtask cannot be created under
 a parent that does not exist or is already closed.
 
@@ -130,7 +133,9 @@ startup directory, which is not necessarily the project, and
 
 The injected state orients you before Σ does. Above it stand at most two lines:
 the `Branch:` from the root goal down to the task in flight, and
-`Queued after this: "<goal>" (<id>) + N more` when a piece is queued behind it.
+`Queued after this: "<goal>" (<id>) + N more` when a piece is queued behind it —
+plus `Queued, not yet taken:` above them while the piece at the frontier is still
+`pending`, which is the line telling you to make it `active`.
 `task_show {"view":"tree"}` answers with the decomposition under a task — one
 line per task, no Σ and no P.
 
