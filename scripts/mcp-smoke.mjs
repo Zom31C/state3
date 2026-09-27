@@ -48,6 +48,27 @@ await client.connect(
 const text = (result) => String(result.content[0].text);
 const call = (name, args) => client.callTool({ name, arguments: args });
 
+/**
+ * The build directory out of a `runtime:` line, without the diagnostic riding behind it.
+ *
+ * `formatRuntimeInfo` puts the directory and the warning inside one pair of parentheses —
+ * `(D:\repo\dist — STALE: src is newer than this build; …)` — so cutting at the last `)` alone
+ * yields a path with a sentence in it. That is the one case this script has to survive: STALE is
+ * what a build lagging behind `src` prints, and inspecting that build is what the RESTART check
+ * below does.
+ */
+const buildDirOf = (line) => {
+  if (line === undefined) return null;
+  const open = line.indexOf('(');
+  const close = line.lastIndexOf(')');
+  if (open === -1 || close <= open) return null;
+  const dir = line
+    .slice(open + 1, close)
+    .split(' — ')[0]
+    .trim();
+  return dir === '' ? null : dir;
+};
+
 try {
   const list = await client.listTools();
   const names = list.tools.map((t) => t.name).sort();
@@ -721,16 +742,34 @@ try {
   const runtimeLine = text(await call('task_list', {}))
     .split('\n')
     .find((line) => line.startsWith('runtime: state3 '));
-  const loadedFrom = runtimeLine?.slice(runtimeLine.indexOf('(') + 1, runtimeLine.lastIndexOf(')'));
-  const runtimeModule = loadedFrom === undefined ? null : join(loadedFrom, 'runtime-info.js');
+  const loadedFrom = buildDirOf(runtimeLine);
+  const runtimeModule = loadedFrom === null ? null : join(loadedFrom, 'runtime-info.js');
   check(
     'a server running the newest build asks for no restart',
     runtimeLine !== undefined && !runtimeLine.includes('RESTART'),
     runtimeLine ?? '(no runtime line)',
   );
-  if (runtimeModule === null || !existsSync(runtimeModule)) {
-    check('the runtime line names a build this script can inspect', false, String(runtimeModule));
-  } else {
+  check(
+    'the build directory survives a runtime line carrying a diagnostic',
+    buildDirOf('runtime: state3 0.1.0 (D:\\repo\\dist)') === 'D:\\repo\\dist' &&
+      buildDirOf(
+        'runtime: state3 0.1.0 (D:\\repo\\dist — STALE: src is newer than this build; rebuild)',
+      ) === 'D:\\repo\\dist' &&
+      buildDirOf('runtime: state3 0.1.0 (D:\\repo\\dist — RESTART: replaced at 2026-09-27)') ===
+        'D:\\repo\\dist' &&
+      buildDirOf('runtime: state3 0.1.0 without parentheses') === null,
+    String(loadedFrom),
+  );
+  // Asserted in both directions: recorded only on failure, this check vanished from the count in
+  // the run that passed, and a smoke whose number of checks moves with its outcome is one whose
+  // regressions are hard to spot.
+  const inspectable = runtimeModule !== null && existsSync(runtimeModule);
+  check(
+    'the runtime line names a build this script can inspect',
+    inspectable,
+    String(runtimeModule),
+  );
+  if (inspectable) {
     const stamp = statSync(runtimeModule);
     const rebuilt = new Date();
     utimesSync(runtimeModule, rebuilt, rebuilt);
