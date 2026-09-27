@@ -1,7 +1,13 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { formatRuntimeInfo, rebuiltAfterStart, runtimeInfo } from '../src/runtime-info.js';
+import {
+  formatBuildStamp,
+  formatRuntimeInfo,
+  rebuiltAfterStart,
+  runtimeInfo,
+  runtimeInfoSync,
+} from '../src/runtime-info.js';
 
 const REBUILT = '2026-09-26T12:30:00.000Z';
 
@@ -44,7 +50,13 @@ describe('rebuiltAfterStart', () => {
 });
 
 describe('formatRuntimeInfo', () => {
-  const fresh = { version: '1.2.3', loadedFrom: '/app/dist', staleBuild: false, rebuiltAt: null };
+  const fresh = {
+    version: '1.2.3',
+    loadedFrom: '/app/dist',
+    builtAt: null,
+    staleBuild: false,
+    rebuiltAt: null,
+  };
 
   it('prints one line naming the version and the build', () => {
     expect(formatRuntimeInfo(fresh)).toBe('runtime: state3 1.2.3 (/app/dist)');
@@ -69,5 +81,50 @@ describe('formatRuntimeInfo', () => {
     const line = formatRuntimeInfo({ ...fresh, staleBuild: true, rebuiltAt: REBUILT });
     expect(line).toContain('STALE');
     expect(line).not.toContain('RESTART');
+  });
+});
+
+describe('formatBuildStamp', () => {
+  const built = {
+    version: '1.2.3',
+    loadedFrom: '/app/dist',
+    builtAt: '2026-09-27T14:37:14.620Z',
+    staleBuild: false,
+    rebuiltAt: null,
+  };
+
+  it('names the build and when it was written, which is what a session start compares against', () => {
+    expect(formatBuildStamp(built)).toBe(
+      'runtime: state3 1.2.3 (/app/dist, built 2026-09-27T14:37:14.620Z)',
+    );
+  });
+
+  it('says when the sources have moved past the build it is stamping', () => {
+    const line = formatBuildStamp({ ...built, staleBuild: true });
+    expect(line).toContain('built 2026-09-27T14:37:14.620Z');
+    expect(line).toContain('STALE');
+    expect(line).toContain('rebuild');
+  });
+
+  it('leaves the moment out when the code running is the sources, and never claims a restart', () => {
+    // `rebuiltAt` compares the disk against the start of the process rendering the injection, and
+    // that process started milliseconds ago, so the clause would always come out clean and mean
+    // nothing here. The tools' own line carries it (§16.20); this one carries the build's age,
+    // which is the half a session start can compare that line against.
+    expect(formatBuildStamp({ ...built, builtAt: null, rebuiltAt: REBUILT })).toBe(
+      'runtime: state3 1.2.3 (/app/dist)',
+    );
+  });
+});
+
+describe('runtimeInfoSync', () => {
+  it('answers with the same facts the promise does, because the injection cannot await one', () => {
+    const info = runtimeInfoSync();
+
+    expect(info.version.length).toBeGreaterThan(0);
+    expect(info.loadedFrom).toMatch(/(dist|src)$/);
+    // Under vitest the sources run, so there is no build to stamp and nothing to be stale about.
+    expect(info.builtAt).toBe(null);
+    expect(info.staleBuild).toBe(false);
   });
 });

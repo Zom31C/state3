@@ -1,4 +1,4 @@
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -36,6 +36,11 @@ export interface RuntimeInfo {
   version: string;
   /** Directory the running code was loaded from. */
   loadedFrom: string;
+  /**
+   * When the build on disk was written — the newest `.js` under it — or null when the code running
+   * is the sources, where "the build" is not a thing that exists.
+   */
+  builtAt: string | null;
   /** True when sources are newer than the loaded build and that build is `dist`. */
   staleBuild: boolean;
   /**
@@ -45,10 +50,11 @@ export interface RuntimeInfo {
   rebuiltAt: string | null;
 }
 
-async function packageVersion(): Promise<string> {
+function packageVersion(): string {
   try {
-    const raw = await readFile(join(packageRoot, 'package.json'), 'utf-8');
-    const parsed = JSON.parse(raw) as { version?: unknown };
+    const parsed = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf-8')) as {
+      version?: unknown;
+    };
     return typeof parsed.version === 'string' && parsed.version !== '' ? parsed.version : 'unknown';
   } catch {
     return 'unknown';
@@ -56,10 +62,10 @@ async function packageVersion(): Promise<string> {
 }
 
 /** Newest mtime among files with `suffix` under `dir`, or null when there are none. */
-async function newestMtime(dir: string, suffix: string): Promise<number | null> {
+function newestMtime(dir: string, suffix: string): number | null {
   let entries;
   try {
-    entries = await readdir(dir, { withFileTypes: true });
+    entries = readdirSync(dir, { withFileTypes: true });
   } catch {
     return null;
   }
@@ -67,13 +73,13 @@ async function newestMtime(dir: string, suffix: string): Promise<number | null> 
   for (const entry of entries) {
     const full = join(dir, entry.name);
     if (entry.isDirectory()) {
-      const nested = await newestMtime(full, suffix);
+      const nested = newestMtime(full, suffix);
       if (nested !== null && (newest === null || nested > newest)) newest = nested;
       continue;
     }
     if (!entry.name.endsWith(suffix)) continue;
     try {
-      const info = await stat(full);
+      const info = statSync(full);
       if (newest === null || info.mtimeMs > newest) newest = info.mtimeMs;
     } catch {
       // A file that vanished mid-scan must not break the report.
@@ -102,23 +108,34 @@ export function rebuiltAfterStart(
  * call they annotate. Both flags are reported only for a `dist` build: under tsx the
  * sources are what runs, so a stale `dist` says nothing, and a tsx process here is a
  * one-shot CLI that is gone before the sources move again.
+ *
+ * Synchronous, and the async `runtimeInfo` below is a wrapper: the injection renders inside a
+ * synchronous read (§16.34) and needs the same facts, and one walk of the tree beats two
+ * implementations of it. The walk is 61 files under `dist` plus the sources, which is well under
+ * a millisecond — cheap enough that even the per-call users, `task_list` and the CLI, do not
+ * notice it, and the injection pays it once per session.
  */
-export async function runtimeInfo(): Promise<RuntimeInfo> {
+export function runtimeInfoSync(): RuntimeInfo {
   const loadedFrom = moduleDir;
   const isDist = dirname(loadedFrom) === packageRoot && loadedFrom.endsWith('dist');
+  let builtAt: string | null = null;
   let staleBuild = false;
   let rebuiltAt: string | null = null;
   if (isDist) {
-    const [src, dist] = await Promise.all([
-      newestMtime(join(packageRoot, 'src'), '.ts'),
-      newestMtime(loadedFrom, '.js'),
-    ]);
+    const src = newestMtime(join(packageRoot, 'src'), '.ts');
+    const dist = newestMtime(loadedFrom, '.js');
     staleBuild = src !== null && dist !== null && src > dist;
-    // The scan is already paid for `staleBuild`, so learning that the process trails the disk
-    // costs nothing on top of learning that the disk trails the sources.
+    // The scan is already paid for `staleBuild`, so learning that the process trails the disk —
+    // and when the disk was written at all — costs nothing on top of it.
     rebuiltAt = rebuiltAfterStart(processStartedAt, dist);
+    builtAt = dist === null ? null : new Date(dist).toISOString();
   }
-  return { version: await packageVersion(), loadedFrom, staleBuild, rebuiltAt };
+  return { version: packageVersion(), loadedFrom, builtAt, staleBuild, rebuiltAt };
+}
+
+/** The same facts for the callers that were written against a promise. */
+export async function runtimeInfo(): Promise<RuntimeInfo> {
+  return runtimeInfoSync();
 }
 
 /**
@@ -138,4 +155,26 @@ export function formatRuntimeInfo(info: RuntimeInfo): string {
       'older than the repository';
   }
   return `runtime: state3 ${info.version} (${build})`;
+}
+
+/**
+ * The build stamp a session start injects: `runtime: state3 0.1.0 (D:\…\dist, built <when>)`.
+ *
+ * The tools' line above answers for the server process, and says `RESTART` when the disk moved
+ * under it; nothing answered for the injection, which a hook renders from whatever build is on
+ * disk at the moment it runs. The two are the halves of one divergence — the incident §16.20 was
+ * written for — and a session could only discover it by watching a queue handover fail twice.
+ * Printed side by side they are comparable: `built 14:37` here against `RESTART … replaced at
+ * 15:02` from a tool says the host is running code older than the repository.
+ *
+ * No `RESTART` clause of its own: `rebuiltAt` compares the disk against the start of *this*
+ * process, and the process that renders an injection started milliseconds before it did, so the
+ * comparison would always come out clean and mean nothing.
+ */
+export function formatBuildStamp(info: RuntimeInfo): string {
+  const built = info.builtAt === null ? '' : `, built ${info.builtAt}`;
+  const line = `runtime: state3 ${info.version} (${info.loadedFrom}${built})`;
+  return info.staleBuild
+    ? `${line} — STALE: src is newer than this build; rebuild and restart the host`
+    : line;
 }

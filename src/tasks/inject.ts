@@ -6,6 +6,7 @@ import type { StateDict, StateValue } from '../core/types.js';
 import { STATE_DB_FILENAME, openStateDatabase } from '../db/database.js';
 import type { SqlDatabase } from '../db/database.js';
 import { renderDatabaseBrief } from '../kb/brief.js';
+import { formatBuildStamp, runtimeInfoSync } from '../runtime-info.js';
 import { driftedArtifacts, driftWarnings, storedArtifactStamps } from './artifact-stamps.js';
 import {
   divergedSource,
@@ -436,12 +437,13 @@ function readTaskHead(
   // block announces the active task state, and this is the one case where the piece it carries
   // has not been taken yet.
   const takeover = takeoverLine(state, options.queue);
-  // All three of these are the once-per-session extras, which is what `drift` gates: a surprise
+  // All four of these are the once-per-session extras, which is what `drift` gates: a surprise
   // reported at a session start costs one line, and repeated on every prompt it costs more than
   // the surprise was worth (§15.5).
   const elsewhere = options.drift ? elsewhereLine(db, row) : null;
   const diverged = options.drift ? divergedSource(rootDir) : null;
   const drift = options.drift ? driftLines(db, row.id, state, rootDir) : [];
+  const runtime = options.drift ? buildStampLine() : null;
   const text = [
     ...(takeover === null ? [] : [takeover]),
     ...branch,
@@ -453,6 +455,10 @@ function readTaskHead(
     // a second state root still being written is a reason to doubt Σ wholesale.
     ...(diverged === null ? [] : [divergenceNote(diverged)]),
     ...drift,
+    // Last, because it annotates the block rather than the state: this is the build that rendered
+    // everything above, which is what makes it comparable with the `runtime:` line the tools
+    // print for the server process (§16.20).
+    ...(runtime === null ? [] : [runtime]),
   ].join('\n');
   return { text, risk: riskOf(state), unreadable: null };
 }
@@ -471,6 +477,26 @@ function driftLines(db: SqlDatabase, taskId: string, state: StateDict, rootDir: 
     );
   } catch {
     return [];
+  }
+}
+
+/**
+ * Which build rendered this injection, as the line a session start carries.
+ *
+ * The hook renders Σ from whatever `dist` is on disk when it runs, while the MCP server the same
+ * session calls keeps the build it was started with; §16.20 made the server say so, and nothing
+ * said which build the injection came from, so the divergence stayed invisible until a queue
+ * handover failed twice and the session had to work out why. The two lines are comparable only if
+ * both are printed, and this one costs a session start, not a turn.
+ *
+ * Never throws, on the same terms as the annotations around it: a diagnostic must not cost the
+ * turn the state it annotates.
+ */
+function buildStampLine(): string | null {
+  try {
+    return formatBuildStamp(runtimeInfoSync());
+  } catch {
+    return null;
   }
 }
 

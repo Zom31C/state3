@@ -428,4 +428,29 @@ describe('readInjection drift', () => {
     expect(text).not.toContain('Artifacts changed on disk');
     expect(text).toContain('goal: Ship it');
   });
+
+  it('names the build that rendered the block at a session start, and not on a prompt', async () => {
+    // The other half of the divergence §16.20 could not show: the tools say which build the server
+    // process answers from, and nothing said which one the injection was rendered from, so a
+    // session worked it out only after a queue handover had failed twice.
+    await store.start('Ship it');
+    store.close();
+
+    const atStart = taskOf(readInjection(dir, { drift: true }));
+    const lines = atStart.split('\n');
+    const stamp = lines.find((line) => line.startsWith('runtime: state3 '));
+    expect(stamp).toBeDefined();
+    // Under vitest the sources are what runs, so there is no build to stamp and no staleness.
+    expect(stamp).toContain('src');
+    expect(stamp).not.toContain('built ');
+    // Last line, because it annotates the block rather than the state in it.
+    expect(lines.at(-1)).toBe(stamp);
+
+    expect(taskOf(readInjection(dir))).not.toContain('runtime: state3 ');
+    // Nor a delegated subagent: `drift` is off for one, and the build that rendered its
+    // orientation is not something it can act on.
+    expect(taskOf(readInjection(dir, { drift: true, subagent: true }))).not.toContain(
+      'runtime: state3 ',
+    );
+  });
 });
