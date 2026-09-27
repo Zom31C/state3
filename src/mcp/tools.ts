@@ -465,6 +465,27 @@ function choseTargetNote(id: string | undefined): string {
   return id === undefined ? ' No id was given: the runtime picked the frontier.' : '';
 }
 
+/**
+ * The `confirm` list of a patch: absent means nothing is confirmed.
+ *
+ * Checked here rather than left to the store so that a caller who typos the argument gets an
+ * argument error and not a refusal about the log — the two are different mistakes and only one of
+ * them is worth a round trip to discover.
+ */
+function optionalConfirm(
+  args: Record<string, unknown>,
+): { ok: true; value: string[] } | { ok: false; message: string } {
+  const raw = args.confirm;
+  if (raw === undefined || raw === null) return { ok: true, value: [] };
+  if (!Array.isArray(raw) || raw.some((entry) => typeof entry !== 'string')) {
+    return {
+      ok: false,
+      message: 'confirm must be an array of strings: "decisions" and/or "verifications"',
+    };
+  }
+  return { ok: true, value: raw };
+}
+
 async function patchTask(
   resolver: StoreResolver,
   args: Record<string, unknown>,
@@ -477,9 +498,11 @@ async function patchTask(
   if (!patch.ok) return failure(patch.message);
   const id = optionalString(args, 'id');
   if (!id.ok) return failure(id.message);
+  const confirm = optionalConfirm(args);
+  if (!confirm.ok) return failure(confirm.message);
   try {
     const report: PatchReport = {};
-    const task = await store.patch(patch.value, id.value, report);
+    const task = await store.patch(patch.value, id.value, report, confirm.value);
     return success(
       `Patched task ${task.meta.id}.${choseTargetNote(id.value)}\n\n${renderState(task)}` +
         handOverNote(report.handedOver) +
@@ -637,6 +660,12 @@ const PATCH_SCHEMA: Record<string, unknown> = {
       additionalProperties: true,
     },
     id: { type: 'string', description: 'Task id. Defaults to the active task.' },
+    confirm: {
+      type: 'array',
+      items: { type: 'string' },
+      description:
+        'The append-only logs this patch means to rewrite wholesale: "decisions" and/or "verifications". Needed only when the patch sends the whole array and that array holds fewer entries than before — such a patch is refused otherwise, because a log entry lost to a key that meant to append one is the accident this prevents. Appending needs nothing: send {"decisions[+]":…}.',
+    },
     project: PROJECT_ARG,
   },
   required: ['patch'],

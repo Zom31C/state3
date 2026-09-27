@@ -22,7 +22,12 @@ export interface TaskStorePort {
   readonly rootDir?: string;
   start(goal: string, options?: StartOptions): Promise<StoredTask>;
   show(id?: string): Promise<StoredTask>;
-  patch(patch: StateDict, id?: string, report?: PatchReport): Promise<StoredTask>;
+  patch(
+    patch: StateDict,
+    id?: string,
+    report?: PatchReport,
+    confirm?: readonly string[],
+  ): Promise<StoredTask>;
   finish(summary: string, id?: string, report?: FinishReport): Promise<StoredTask>;
   list(): Promise<TaskSummary[]>;
   history(id?: string, limit?: number): Promise<HistoryEntry[]>;

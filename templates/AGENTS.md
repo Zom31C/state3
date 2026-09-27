@@ -103,7 +103,10 @@ Patch after **every meaningful step** — a file written, a check run, a decisio
 blocker found. Not at the end: the end is exactly when the transcript gets compacted.
 
 - Send only the fields that changed. Nested objects merge recursively, scalars replace,
-  `null` deletes a key (`{"artifacts":{"src/old.ts":null}}`), arrays are replaced wholesale.
+  `null` deletes a key (`{"artifacts":{"src/old.ts":null}}`), arrays are replaced wholesale —
+  except that a wholesale `decisions` or `verifications` key which would lose an entry is refused:
+  append with `{"decisions[+]":"…"}`, and rewriting a log whole takes `confirm: ["decisions"]`
+  (`--confirm` in the CLI).
   Object keys are addressed nested like that, never as a dotted top-level key:
   `{"artifacts.src/old.ts":null}` names no field and is rejected as `unknown-key`.
 - Cheaper for arrays — a **path key** touches one element: `{"plan[1].status":"done"}`,

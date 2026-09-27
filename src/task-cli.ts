@@ -52,6 +52,8 @@ export interface TaskCliOptions {
   subcommand: TaskSubcommand;
   goal: string | null;
   plan: string[];
+  /** With `patch`: the append-only logs this patch means to rewrite wholesale. */
+  confirm: string[];
   id: string | null;
   patch: StateDict | null;
   summary: string | null;
@@ -135,6 +137,7 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
   let help = false;
   let purge = false;
   const plan: string[] = [];
+  const confirm: string[] = [];
   const positional: string[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -178,6 +181,11 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
       case '--purge':
         purge = true;
         break;
+      case '--confirm':
+        for (const field of takeValue(token).split(',')) {
+          if (field.trim() !== '') confirm.push(field.trim());
+        }
+        break;
       case '--help':
       case '-h':
         help = true;
@@ -205,6 +213,7 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
       subcommand: subcommand ?? 'list',
       goal: null,
       plan,
+      confirm: [],
       id,
       patch: null,
       summary: null,
@@ -229,6 +238,7 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
     subcommand,
     goal: null,
     plan,
+    confirm,
     id,
     patch: null,
     summary: null,
@@ -283,6 +293,9 @@ export function parseTaskArgs(argv: readonly string[]): TaskCliOptions {
   if (options.purge && subcommand !== 'migrate') {
     throw new Error('--purge is only valid for task migrate');
   }
+  if (options.confirm.length > 0 && subcommand !== 'patch') {
+    throw new Error('--confirm is only valid for task patch');
+  }
   if (options.skill !== null && subcommand !== 'start') {
     throw new Error('--skill is only valid for task start');
   }
@@ -315,8 +328,8 @@ const SUBCOMMAND_HELP: Record<TaskSubcommand, string> = {
     '--skill and --notation shape Σ',
   show: 'print Σ of the open task, or of --id; --tree prints the decomposition under it instead',
   patch:
-    'merge a JSON patch into Σ; "-" reads the patch from stdin, and {"parent":…} moves the task ' +
-    'in the tree instead of touching Σ',
+    'merge a JSON patch into Σ; "-" reads the patch from stdin, {"parent":…} moves the task ' +
+    'in the tree instead of touching Σ, and --confirm rewrites an append-only log whole',
   finish: 'mark the task done and append the summary to decisions',
   list: 'list tasks as a tree, with skill, status, progress, and the build that is answering',
   history: 'print the audit trail of patches, rejected ones included; --limit N',
@@ -337,6 +350,11 @@ const FLAG_HELP: readonly (readonly [flag: string, text: string])[] = [
   ['--notation <name>', 'how to write Σ: plain prose or compact pseudocode'],
   ['--limit <n>', 'history entries to print (default 20)'],
   ['--purge', 'with migrate: delete the legacy files instead of moving them into an archive'],
+  [
+    '--confirm <fields>',
+    'with patch: rewrite these append-only logs whole (decisions,verifications) — ' +
+      'without it a patch that shortens one is refused',
+  ],
 ];
 
 /** The documented flags, as parseTaskArgs spells them. */
@@ -356,6 +374,7 @@ export function taskHelpText(): string {
     'Examples:',
     '  state3 task start "Ship the adapter" --plan "read the spec" --notation compact',
     '  state3 task patch - < patch.json',
+    '  state3 task patch --confirm decisions - < rewritten-log.json',
     '  state3 task list --root ../other-project/.state3',
   ].join('\n');
 }
@@ -490,8 +509,8 @@ async function runStoreCommand(
       }
       const report: PatchReport = {};
       const task = await (options.id === null
-        ? store.patch(patch, undefined, report)
-        : store.patch(patch, options.id, report));
+        ? store.patch(patch, undefined, report, options.confirm)
+        : store.patch(patch, options.id, report, options.confirm));
       deps.log(renderTaskHead(task));
       // Printed because Σ carries none of it: the move is a column, and the stamps and the log
       // entries a patch detached exist nowhere else once the write has landed. The CLI has no

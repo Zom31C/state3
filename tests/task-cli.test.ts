@@ -282,6 +282,7 @@ describe('parseTaskArgs', () => {
       subcommand: 'start',
       goal: 'Refactor auth',
       plan: ['Read code', 'Write tests'],
+      confirm: [],
       id: null,
       patch: null,
       summary: null,

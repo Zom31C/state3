@@ -105,7 +105,7 @@ describe('inject-state hook', () => {
 
     const onPrompt = contextOf(await runSelfTestEvent('UserPromptSubmit'));
     expect(onPrompt).toContain('Call task_patch after every step');
-    expect(onPrompt).toContain('A bare "decisions" or "plan" key replaces the array');
+    expect(onPrompt).toContain('A bare "decisions" key that would lose an entry is refused');
     // The tutorial is 504 characters, P holds it in full one call away, and carrying it on every
     // prompt did not stop the drift it warns about — a session pays for it once, at its start.
     expect(onPrompt).not.toContain('arrays are replaced wholesale');

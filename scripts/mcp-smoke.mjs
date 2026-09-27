@@ -557,17 +557,29 @@ try {
       ?.slice(0, 90) ?? '',
   );
 
-  // Shortening an append-only log is legal — refusing it would leave Σ unable to compress — but it
-  // must not be silent: after the write Σ holds only what survived, so the answer names the entry
-  // that left and the history keeps its text.
+  // Shortening an append-only log with a wholesale key is refused: compressing Σ stays legal, but
+  // a key that means "append one" is not the way to do it, and reporting the loss afterwards did
+  // not prevent it. Saying the rewrite is meant lets it through, and then the answer still names
+  // the entry that left and the history keeps its text.
   await call('task_patch', {
     patch: { decisions: ['smoke: used stdio', 'smoke: kept one database'] },
   });
-  const shortened = await call('task_patch', {
+  const refused = await call('task_patch', {
     patch: { decisions: ['smoke: kept one database'] },
   });
   check(
-    'shortening an append-only log names the entry that left Σ',
+    'a wholesale key that would shorten an append-only log is refused',
+    refused.isError === true &&
+      text(refused).includes('"decisions" is append-only') &&
+      text(refused).includes('confirm: ["decisions"]'),
+    text(refused).split('\n')[0]?.slice(0, 90) ?? '',
+  );
+  const shortened = await call('task_patch', {
+    patch: { decisions: ['smoke: kept one database'] },
+    confirm: ['decisions'],
+  });
+  check(
+    'a confirmed rewrite of the log goes through and names the entry that left Σ',
     shortened.isError !== true &&
       text(shortened).includes('1 decisions entry(s) are no longer in Σ (2 -> 1)') &&
       text(shortened).includes('"smoke: used stdio"'),

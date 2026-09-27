@@ -79,12 +79,12 @@ describe('TaskStore reporting a shortened log', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('reports the entries a patch dropped and keeps their text in the history', async () => {
+  it('reports the entries a confirmed rewrite dropped and keeps their text in the history', async () => {
     const task = await store.start('Ship it');
     await store.patch({ decisions: ['used stdio', 'kept the legacy root'] }, task.meta.id);
 
     const report: PatchReport = {};
-    await store.patch({ decisions: ['kept the legacy root'] }, task.meta.id, report);
+    await store.patch({ decisions: ['kept the legacy root'] }, task.meta.id, report, ['decisions']);
 
     expect(report.dropped).toEqual({ was: 2, now: 1, entries: ['used stdio'] });
     const entries = await store.history(task.meta.id);
@@ -121,8 +121,101 @@ describe('TaskStore reporting a shortened log', () => {
     await store.patch({ decisions: ['scope cut to the adapter'] }, task.meta.id);
 
     const report: PatchReport = {};
-    await store.patch({ decisions: [] }, task.meta.id, report);
+    await store.patch({ decisions: [] }, task.meta.id, report, ['decisions']);
 
     expect(report.dropped).toEqual({ was: 1, now: 0, entries: ['scope cut to the adapter'] });
+  });
+});
+
+/**
+ * The refusal that replaced the note-after-the-fact for the wholesale case.
+ *
+ * A note could only report a loss that had already landed, and reporting it did not stop it: the
+ * session of 27.09.2026 sent a bare `decisions` key five times with the rule printed in every
+ * prompt. What is refused is the key that means "append one" being used to send the whole array;
+ * a path key that names one entry is precise and stays allowed.
+ */
+describe('TaskStore refusing a wholesale key that shortens a log', () => {
+  let dir: string;
+  let store: TaskStore;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(tmpdir(), 'state3-logrefusal-'));
+    store = new TaskStore(dir);
+  });
+
+  afterEach(async () => {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('refuses the patch, leaves Σ as it was, and records the refusal', async () => {
+    const task = await store.start('Ship it');
+    await store.patch({ decisions: ['used stdio', 'kept the legacy root'] }, task.meta.id);
+
+    await expect(
+      store.patch({ decisions: ['kept the legacy root'] }, task.meta.id),
+    ).rejects.toThrow(/"decisions" is append-only/);
+
+    const after = await store.show(task.meta.id);
+    expect(after.state.decisions).toEqual(['used stdio', 'kept the legacy root']);
+    expect((await store.history(task.meta.id)).at(-1)?.ok).toBe(false);
+  });
+
+  it('names the two ways out: a path key, or saying the rewrite is meant', async () => {
+    const task = await store.start('Ship it');
+    await store.patch({ decisions: ['used stdio', 'kept the legacy root'] }, task.meta.id);
+
+    const refusal = await store
+      .patch({ decisions: ['kept the legacy root'] }, task.meta.id)
+      .then(() => null)
+      .catch((err: unknown) => (err instanceof Error ? err.message : String(err)));
+
+    expect(refusal).toContain('{"decisions[+]":…}');
+    expect(refusal).toContain('{"decisions[3]":null}');
+    expect(refusal).toContain('confirm: ["decisions"]');
+    expect(refusal).toContain('"used stdio"');
+  });
+
+  it('refuses a wholesale key that would shorten the verifications log', async () => {
+    const task = await store.start('Ship it');
+    await store.patch(
+      {
+        verifications: [
+          { check: 'npm test', status: 'pass' },
+          { check: 'npm run lint', status: 'pass' },
+        ],
+      },
+      task.meta.id,
+    );
+
+    await expect(
+      store.patch({ verifications: [{ check: 'npm test', status: 'pass' }] }, task.meta.id),
+    ).rejects.toThrow(/"verifications" is append-only/);
+  });
+
+  it('leaves a reworded verification alone, which the stamp note already reports', async () => {
+    const task = await store.start('Ship it');
+    await store.patch({ verifications: [{ check: 'npm test', status: 'pass' }] }, task.meta.id);
+
+    // Same length, different text: a legitimate correction, not an accident, and refusing it
+    // would refuse the work the stamps exist to keep honest.
+    const report: PatchReport = {};
+    await store.patch(
+      { verifications: [{ check: 'npm test -- --run', status: 'pass' }] },
+      task.meta.id,
+      report,
+    );
+
+    expect(report.stamps?.superseded.length).toBe(1);
+  });
+
+  it('refuses a confirm that names something which is not a log', async () => {
+    const task = await store.start('Ship it');
+    await store.patch({ decisions: ['used stdio'] }, task.meta.id);
+
+    await expect(
+      store.patch({ 'decisions[0]': null }, task.meta.id, undefined, ['plan']),
+    ).rejects.toThrow(/the append-only logs are: decisions, verifications/);
   });
 });

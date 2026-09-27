@@ -18,8 +18,15 @@ import { builtinSkillRegistry } from './registry.js';
 import type { SkillRegistry } from './registry.js';
 import { driftedArtifacts, recordArtifactStamps, storedArtifactStamps } from './artifact-stamps.js';
 import type { DriftedArtifact } from './artifact-stamps.js';
-import { decisionsHistoryNote, droppedDecisions } from './decisions.js';
-import type { DroppedDecisions } from './decisions.js';
+import {
+  LOG_FIELDS,
+  decisionsHistoryNote,
+  droppedDecisions,
+  isLogField,
+  logShrinkRefusal,
+  wholesaleLogShrink,
+} from './decisions.js';
+import type { DroppedDecisions, LogField } from './decisions.js';
 import { stampHistoryNote, stampVerifications } from './verifications.js';
 import type { StampReport } from './verifications.js';
 
@@ -880,8 +887,16 @@ export class TaskStore {
    * One key addresses the tree instead of the state: `parent` re-files this task under another
    * one, or under nothing, and is validated against the tree rather than against the skill's
    * schema — see `checkReparent`.
+   *
+   * `confirm` names the append-only logs this patch means to rewrite wholesale — see
+   * `wholesaleLogShrink` for what is refused without it.
    */
-  async patch(patch: StateDict, id?: string, report?: PatchReport): Promise<StoredTask> {
+  async patch(
+    patch: StateDict,
+    id?: string,
+    report?: PatchReport,
+    confirm?: readonly string[],
+  ): Promise<StoredTask> {
     const taskId = id ?? (await this.activeId());
     if (taskId === null) throw new TaskNotFoundError('No active task found');
 
@@ -929,6 +944,24 @@ export class TaskStore {
     if (!validation.ok) return reject(validation.category, validation.message);
 
     const merged = mergeState(state, expanded.patch);
+
+    // Ahead of the stamps and of every other guard: this one is about entries the write would
+    // destroy, so it must be the first thing that can stop it, and a patch it refuses must not
+    // have spawned the git subprocess that stamps verifications.
+    const confirmed: LogField[] = [];
+    for (const field of confirm ?? []) {
+      if (!isLogField(field)) {
+        return reject(
+          'guard',
+          `confirm names "${String(field)}"; the append-only logs are: ${LOG_FIELDS.join(', ')}`,
+        );
+      }
+      confirmed.push(field);
+    }
+    const shrinks = wholesaleLogShrink(state, statePatch, merged).filter(
+      (shrink) => !confirmed.includes(shrink.field),
+    );
+    if (shrinks.length > 0) return reject('guard', logShrinkRefusal(shrinks));
 
     // A decomposition is not finished while its pieces are open, whatever its own Σ says. The
     // skill guard cannot see this — it reads one state, and the subtasks are other rows — and

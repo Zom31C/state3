@@ -214,9 +214,9 @@ const PATCH_TUTORIAL =
   'After every meaningful step call the task_patch tool with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one, {"verifications[2]":null} removes one, {"plan[id=5].notes":"…"} names a step by its own id — without resending the array; exactly one plan item in_progress, and a finished step whose outcome is already in decisions may be marked {"plan[0].archived":true} to leave this injection).';
 
 const PATCH_REMINDER =
-  'Call the task_patch tool after every step with only the changed fields. A bare "decisions" or ' +
-  '"plan" key replaces the array and drops entries — append with {"decisions[+]":…}, and the Note: ' +
-  'in the answer names what left Σ.';
+  'Call the task_patch tool after every step with only the changed fields. A bare "decisions" key ' +
+  'that would lose an entry is refused — append with {"decisions[+]":…}, remove one with ' +
+  '{"decisions[3]":null}.';
 
 const RISK_REMINDER =
   'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.';

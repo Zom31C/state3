@@ -747,7 +747,9 @@ describe('TaskStore.history', () => {
   it('returns the latest entries and respects the limit', async () => {
     const task = await store.start('Limit test');
     for (let i = 0; i < 5; i++) {
-      await store.patch({ decisions: [`decision ${i}`] }, task.meta.id);
+      // Each patch rewrites the log whole, which the runtime refuses unless the rewrite is meant;
+      // this test is about the history, not about the log, so it says so.
+      await store.patch({ decisions: [`decision ${i}`] }, task.meta.id, undefined, ['decisions']);
     }
 
     const all = await store.history(task.meta.id);

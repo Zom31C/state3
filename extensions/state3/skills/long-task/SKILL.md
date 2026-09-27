@@ -71,6 +71,11 @@ blocker found — call `task_patch` with only the fields that changed:
 - `blockers` + `status: "blocked"` when progress stops; clear them when it
   resumes.
 
+The append-only logs are guarded: a wholesale `decisions` or `verifications` key
+that would lose an entry is refused. Append with `{"decisions[+]": "…"}`, remove
+one deliberately with `{"decisions[3]": null}`, and rewriting a log whole is
+something you say out loud — `confirm: ["decisions"]` (`--confirm` in the CLI).
+
 Arrays are replaced wholesale, so changing one `plan` item means resending the
 whole array — unless you address that item with a **path key**:
 `{"plan[1].status": "done"}` sets one field of one element,
