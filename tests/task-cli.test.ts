@@ -5,6 +5,8 @@ import { droppedDecisions } from '../src/tasks/decisions.js';
 import { devTaskSchema } from '../src/tasks/schema.js';
 import type { DevTaskState } from '../src/tasks/schema.js';
 import type {
+  FinishReport,
+  Handover,
   HistoryEntry,
   PatchReport,
   StartOptions,
@@ -95,6 +97,8 @@ class FakeStore {
         notes: '',
       })),
     });
+    // As in the store: a subtask is queued behind the work in flight, not started.
+    if (options.parent !== undefined) state.status = 'pending';
     const task: StoredTask = {
       meta: {
         id,
@@ -156,7 +160,7 @@ class FakeStore {
     return found;
   }
 
-  async finish(summary: string, id?: string): Promise<StoredTask> {
+  async finish(summary: string, id?: string, report?: FinishReport): Promise<StoredTask> {
     this.calls.push(`finish|${summary}|${id ?? '-'}`);
     const found = this.resolve(id);
     if (found === null) throw new FakeTaskNotFoundError('No active task found');
@@ -166,7 +170,28 @@ class FakeStore {
     state.decisions = [...state.decisions, summary];
     found.state = asDict(state);
     found.meta.updatedAt = this.stamp();
+    if (report !== undefined) {
+      const handed = this.handOver(found);
+      if (handed !== null) report.handedOver = handed;
+    }
     return found;
+  }
+
+  /**
+   * The queue handover, as the store does it: the first sibling still queued, unless another is
+   * already in flight. The fake does not re-check the tree — that belongs to the store's tests.
+   */
+  private handOver(closed: StoredTask): Handover | null {
+    const parent = closed.meta.parent;
+    if (parent === null) return null;
+    const siblings = this.tasks.filter((other) => other !== closed && other.meta.parent === parent);
+    if (siblings.some((other) => this.dev(other).status === 'active')) return null;
+    const next = siblings.find((other) => this.dev(other).status === 'pending');
+    if (next === undefined) return null;
+    const state = this.dev(next);
+    state.status = 'active';
+    next.state = asDict(state);
+    return { id: next.meta.id, goal: state.goal };
   }
 
   async list(): Promise<TaskSummary[]> {
@@ -596,6 +621,20 @@ describe('runTaskCommand', () => {
     // The key addressed the tree, so Σ gained nothing to show for it — the printed state reads
     // exactly as it did before the move, which is why the line below it is not optional.
     expect(lines[0]).not.toContain('parent');
+  });
+
+  it('prints the piece the queue moved on to when a finish hands over', async () => {
+    const store = new FakeStore();
+    const { deps, lines } = makeDeps(store);
+    await store.start('The decomposition');
+    await store.start('Piece one', { parent: 'task-1' });
+    await store.start('Piece two', { parent: 'task-1' });
+
+    await runTaskCommand(parseTaskArgs(['finish', 'piece one done', '--id', 'task-2']), deps);
+
+    // The state printed above the line is the closed task's, which cannot say what is in flight
+    // now — the promotion happened to another row.
+    expect(lines.at(-1)).toContain('Handed over to task-3 — "Piece two"');
   });
 
   it('prints what a patch cost Σ, which the state itself does not show', async () => {

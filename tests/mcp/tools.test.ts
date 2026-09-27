@@ -15,6 +15,8 @@ import type { ProjectEntry } from '../../src/tasks/ports.js';
 import { createProjectResolver, singleStoreResolver } from '../../src/tasks/projects.js';
 import type { DriftedArtifact } from '../../src/tasks/artifact-stamps.js';
 import type {
+  FinishReport,
+  Handover,
   HistoryEntry,
   PatchReport,
   StartOptions,
@@ -146,6 +148,9 @@ class FakeTaskStore {
     this.counter += 1;
     const id = `task-${this.counter}`;
     const at = '2026-09-05T10:00:00.000Z';
+    const state = this.initialState(goal, skill, options.plan ?? []);
+    // As in the store: a subtask is queued behind the work in flight, not started.
+    if (options.parent !== undefined) state['status'] = 'pending';
     const task: StoredTask = {
       meta: {
         id,
@@ -156,7 +161,7 @@ class FakeTaskStore {
         notation,
         parent: options.parent ?? null,
       },
-      state: this.initialState(goal, skill, options.plan ?? []),
+      state,
     };
     this.tasks.push(task);
     return task;
@@ -210,7 +215,7 @@ class FakeTaskStore {
     return task;
   }
 
-  async finish(summary: string, id?: string): Promise<StoredTask> {
+  async finish(summary: string, id?: string, report?: FinishReport): Promise<StoredTask> {
     this.record('finish', [summary, id]);
     if (this.errors.finish !== undefined) throw this.errors.finish;
     const task = this.resolve(id, 'no active task');
@@ -222,7 +227,26 @@ class FakeTaskStore {
       decisions,
       next: { action: 'None — task finished', risk: 'safe' },
     };
+    if (report !== undefined) {
+      const handed = this.handOver(task);
+      if (handed !== null) report.handedOver = handed;
+    }
     return task;
+  }
+
+  /**
+   * The queue handover, as the store does it: the first sibling still queued, unless another one is
+   * already in flight. The fake does not re-check the tree — that belongs to the store's tests.
+   */
+  private handOver(closed: StoredTask): Handover | null {
+    const parent = closed.meta.parent;
+    if (parent === null) return null;
+    const siblings = this.tasks.filter((other) => other !== closed && other.meta.parent === parent);
+    if (siblings.some((other) => other.state['status'] === 'active')) return null;
+    const next = siblings.find((other) => other.state['status'] === 'pending');
+    if (next === undefined) return null;
+    next.state = { ...next.state, status: 'active' };
+    return { id: next.meta.id, goal: String(next.state['goal'] ?? '') };
   }
 
   async list(): Promise<TaskSummary[]> {
@@ -951,6 +975,28 @@ describe('task_finish', () => {
     expect(jsonLine(result.content)).toContain('"status":"done"');
     expect(jsonLine(result.content)).toContain('server shipped and tested');
     expect(store.callCount('instructionsFor')).toBe(0);
+  });
+
+  it('names the piece the queue moved on to, which the closed task cannot', async () => {
+    const { store, call } = setup();
+    await store.start('the decomposition');
+    await store.start('piece one', { parent: 'task-1' });
+    await store.start('piece two', { parent: 'task-1' });
+
+    const result = await call('task_finish', { summary: 'piece one done', id: 'task-2' });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('Handed over to task-3 — "piece two"');
+  });
+
+  it('says nothing about the queue when the task it closed had none', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+
+    const result = await call('task_finish', { summary: 'shipped' });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).not.toContain('Handed over');
   });
 
   it('rejects a missing summary', async () => {

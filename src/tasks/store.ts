@@ -80,12 +80,31 @@ export interface PatchReport {
    */
   moved?: { from: string | null; to: string | null };
   /**
+   * The task the queue was handed over to, when this patch closed the one in flight.
+   *
+   * Reported because the finished task's Σ cannot say it: the handover happened to another row,
+   * and a caller that is not told has to spend a read to learn what is in flight now.
+   */
+  handedOver?: Handover;
+  /**
    * The entries the append-only `decisions` log lost to this patch, when it lost any.
    *
    * Reported for the reason the stamps are: after the write Σ holds only what survived, so the
    * answer and the history are the two places the dropped text still exists in.
    */
   dropped?: DroppedDecisions;
+}
+
+/** The piece of work the queue moved on to when the one before it was closed. */
+export interface Handover {
+  id: string;
+  goal: string;
+}
+
+/** What closing a task did that its own Σ cannot show, filled in by `finish`. */
+export interface FinishReport {
+  /** The task the queue was handed over to, when closing this one left work at the frontier. */
+  handedOver?: Handover;
 }
 
 /**
@@ -692,6 +711,106 @@ export class TaskStore {
     return row?.n ?? 0;
   }
 
+  /**
+   * Promotes the task the queue moves on to when `closedId` closes, and says who it was.
+   *
+   * The handover used to be advice — "set the next piece `active` in the same patch that closes
+   * this one" — and advice is not a mechanism: a session that closes a piece and stops leaves the
+   * next one `pending`, so `task_list` shows the work in flight as still queued, and the invariant
+   * `start` keeps (one piece in flight per decomposition) holds only for as long as everybody
+   * remembers the advice.
+   *
+   * Called inside the transaction that closes the task, so the tree is never observed with a
+   * decomposition that has work left and nothing in flight.
+   *
+   * Skips three cases. Another piece of the same decomposition is already `active`: somebody took
+   * the next one by hand, and promoting a second is exactly the ambiguity `pending` exists to
+   * prevent. The next piece is `blocked`: promoting it would erase the signal that it is waiting on
+   * something, and the frontier already ranks a ready piece above it, so the queue is not stuck.
+   * Its Σ cannot be read by this runtime — a foreign skill, a state written by another schema —
+   * which is a reason to leave the status alone, not a reason to fail the close that was asked for.
+   */
+  private handOver(db: SqlDatabase, closedId: string, now: string): Handover | null {
+    const closed = db.prepare('SELECT parent FROM task WHERE id = ?').get(closedId) as
+      { parent: string | null } | undefined;
+    const parent = closed?.parent ?? null;
+    if (parent === null) return null;
+
+    const busy = db
+      .prepare(`SELECT 1 FROM task WHERE parent = ? AND status = 'active' AND id <> ?`)
+      .get(parent, closedId);
+    if (busy !== undefined) return null;
+
+    // The pieces still queued, in the order the work was split out — `queueOrder` as SQL. The
+    // first one this runtime can validate is the work in flight from here on; a piece written by
+    // a skill it does not have stays queued for the runtime that can read it, and the frontier
+    // skips that one too, since `list()` cannot summarize a row it cannot parse.
+    const queue = db
+      .prepare(
+        `SELECT id, goal FROM task WHERE parent = ? AND status = 'pending' AND id <> ?
+         ORDER BY created_at, rowid`,
+      )
+      .all(parent, closedId) as { id: string; goal: string }[];
+    for (const candidate of queue) {
+      const promoted = this.promote(db, candidate, closedId, now);
+      if (promoted !== null) return promoted;
+    }
+
+    // Nothing left in the queue: the work returns to the task that was split, which is the
+    // frontier now that nothing under it is open. A root is created `active`, so this is about a
+    // decomposition nested inside one — the level whose pieces somebody just finished.
+    if (this.openChildCount(db, parent) > 0) return null;
+    const container = db.prepare('SELECT id, goal, status FROM task WHERE id = ?').get(parent) as
+      { id: string; goal: string; status: string } | undefined;
+    if (container === undefined || container.status !== 'pending') return null;
+    return this.promote(db, container, closedId, now);
+  }
+
+  /**
+   * Writes `status: "active"` to a task the queue handed over, recording why in its history, or
+   * null when its Σ cannot be read and validated by this runtime.
+   */
+  private promote(
+    db: SqlDatabase,
+    task: { id: string; goal: string },
+    closedId: string,
+    now: string,
+  ): Handover | null {
+    try {
+      const row = this.rowOrNull(task.id);
+      if (row === null) return null;
+      const skill = this.skills.get(row.skill);
+      if (skill === undefined) return null;
+      const parsedState = JSON.parse(row.state) as StateValue;
+      if (!isPlainObject(parsedState)) return null;
+      const state: StateDict = { ...parsedState, status: 'active' };
+      if (!skill.schema.safeParse(state).success) return null;
+
+      this.upsert(db, {
+        id: row.id,
+        skill: row.skill,
+        notation: isNotation(row.notation) ? row.notation : DEFAULT_NOTATION,
+        createdAt: row.created_at,
+        updatedAt: now,
+        state,
+      });
+      // Recorded in the promoted task's own history: an audit of "why is this active" that reads
+      // only the state would come up empty, since the patch that did it was nobody's.
+      this.insertHistory(
+        db,
+        row.id,
+        now,
+        { status: 'active' },
+        true,
+        undefined,
+        `promoted by the runtime when ${closedId} was closed: next in the queue`,
+      );
+      return { id: row.id, goal: task.goal };
+    } catch {
+      return null;
+    }
+  }
+
   async show(id?: string): Promise<StoredTask> {
     if (id !== undefined) return this.readTask(id);
     const activeId = await this.activeId();
@@ -760,7 +879,8 @@ export class TaskStore {
     // skill guard cannot see this — it reads one state, and the subtasks are other rows — and
     // closing a parent early is what leaves work orphaned: every view that picks a task to
     // inject walks the tree, so a finished parent hides the open branch under it.
-    if (merged.status === 'done' && state.status !== 'done') {
+    const closesNow = merged.status === 'done' && state.status !== 'done';
+    if (closesNow) {
       const open = this.openChildCount(db, taskId);
       if (open > 0) {
         return reject(
@@ -773,6 +893,7 @@ export class TaskStore {
     // The other rule the skill guard cannot make, on the same grounds: where this task sits is
     // a column, and whether the move closes a loop is a question about other rows.
     let moved: { from: string | null; to: string | null } | null = null;
+    let handedOver: Handover | null = null;
     if (requestedParent !== undefined) {
       const checked = this.checkReparent(db, taskId, row.parent ?? null, requestedParent);
       if (!checked.ok) return reject(checked.category, checked.message);
@@ -826,6 +947,10 @@ export class TaskStore {
       // write cost and the patch cannot show — the stamps it detached, the log entries it dropped,
       // the place in the tree it moved the task to.
       this.insertHistory(db, taskId, now, patch, true, undefined, note);
+      // Closing a task by patch hands the queue over exactly as `finish` does: the two are the
+      // same event, and a mechanism that only one of them has is a mechanism an agent has to
+      // remember to use the other way round.
+      if (closesNow) handedOver = this.handOver(db, taskId, now);
       // Σ was just written, so this is the moment its file artifacts are true of the tree;
       // a later read compares the disk against what was recorded here.
       recordArtifactStamps(db, taskId, merged, projectDirOf(this.rootDir), now);
@@ -835,6 +960,7 @@ export class TaskStore {
       report.stamps = stamps;
       if (didMove && moved !== null) report.moved = moved;
       if (dropped !== null) report.dropped = dropped;
+      if (handedOver !== null) report.handedOver = handedOver;
     }
     return this.readTask(taskId);
   }
@@ -865,7 +991,11 @@ export class TaskStore {
     return driftedArtifacts(parsed, storedArtifactStamps(db, taskId), projectDirOf(this.rootDir));
   }
 
-  async finish(summary: string, id?: string): Promise<StoredTask> {
+  /**
+   * Closes a task, and hands the queue over to the piece behind it in the same transaction.
+   * `report`, when given, is filled with that handover — see `FinishReport`.
+   */
+  async finish(summary: string, id?: string, report?: FinishReport): Promise<StoredTask> {
     const taskId = id ?? (await this.activeId());
     if (taskId === null) throw new TaskNotFoundError('No active task found');
 
@@ -907,6 +1037,7 @@ export class TaskStore {
     }
 
     const db = this.database();
+    let handedOver: Handover | null = null;
     db.transaction(() => {
       this.upsert(db, {
         id: taskId,
@@ -927,8 +1058,10 @@ export class TaskStore {
         },
         true,
       );
+      handedOver = this.handOver(db, taskId, now);
     });
 
+    if (report !== undefined && handedOver !== null) report.handedOver = handedOver;
     return this.readTask(taskId);
   }
 

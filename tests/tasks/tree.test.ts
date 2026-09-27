@@ -7,7 +7,7 @@ import { readInjection } from '../../src/tasks/inject.js';
 import { devTaskSchema } from '../../src/tasks/schema.js';
 import type { DevTaskState } from '../../src/tasks/schema.js';
 import { TaskPatchError, TaskStore } from '../../src/tasks/store.js';
-import type { PatchReport, StoredTask } from '../../src/tasks/store.js';
+import type { FinishReport, PatchReport, StoredTask } from '../../src/tasks/store.js';
 
 let dir: string;
 let store: TaskStore;
@@ -363,6 +363,113 @@ describe('re-parenting a task', () => {
     if (injection.kind !== 'context' || injection.task === null) return;
     expect(injection.task).toContain('Branch: Second decomposition [active] -> this task');
     expect(injection.task).not.toContain('First decomposition');
+  });
+});
+
+describe('handing the queue over', () => {
+  it('promotes the next piece in the queue and says which one it was', async () => {
+    const { subs } = await splitThreeStored();
+
+    const report: FinishReport = {};
+    await store.finish('piece done', at(subs, 0).meta.id, report);
+
+    expect(dev(await store.show(at(subs, 1).meta.id)).status).toBe('active');
+    expect(report.handedOver).toEqual({ id: at(subs, 1).meta.id, goal: STEP_TWO });
+    expect(await store.activeId()).toBe(at(subs, 1).meta.id);
+  });
+
+  it('hands over when a patch closes the task, not only when task_finish does', async () => {
+    const { subs } = await splitThreeStored();
+
+    const report: PatchReport = {};
+    await store.patch({ status: 'done' }, at(subs, 0).meta.id, report);
+
+    // The two are the same event; a mechanism only one of them has is a mechanism an agent has to
+    // remember to use the other way round.
+    expect(report.handedOver).toEqual({ id: at(subs, 1).meta.id, goal: STEP_TWO });
+  });
+
+  it('leaves a blocked piece blocked and promotes the one behind it', async () => {
+    const { subs } = await splitThreeStored();
+    await store.patch(
+      { status: 'blocked', blockers: ['waiting on the user'] },
+      at(subs, 1).meta.id,
+    );
+
+    const report: FinishReport = {};
+    await store.finish('piece done', at(subs, 0).meta.id, report);
+
+    // Promoting it would erase the signal that it is waiting on something, and the frontier
+    // already ranks a ready piece above a blocked one, so the queue is not stuck behind it.
+    expect(dev(await store.show(at(subs, 1).meta.id)).status).toBe('blocked');
+    expect(report.handedOver).toEqual({ id: at(subs, 2).meta.id, goal: STEP_THREE });
+  });
+
+  it('promotes nothing while another piece of the same decomposition is in flight', async () => {
+    const { subs } = await splitThreeStored();
+    await store.patch({ status: 'active' }, at(subs, 2).meta.id);
+
+    const report: FinishReport = {};
+    await store.finish('piece done', at(subs, 0).meta.id, report);
+
+    // Somebody took the third piece by hand; promoting the second as well would recreate exactly
+    // the ambiguity the `pending` status exists to prevent.
+    expect(report.handedOver).toBeUndefined();
+    expect(dev(await store.show(at(subs, 1).meta.id)).status).toBe('pending');
+  });
+
+  it('hands back to the decomposition that was split, once its last piece closes', async () => {
+    const root = await store.start('Outer job');
+    const middle = await store.start('A decomposition inside it', { parent: root.meta.id });
+    const only = await store.start('The single piece', { parent: middle.meta.id });
+
+    const report: FinishReport = {};
+    await store.finish('piece done', only.meta.id, report);
+
+    // The nested level was created `pending` like any subtask, and it is the frontier now that
+    // nothing under it is open — leaving it queued is the same lie `task_list` used to tell.
+    expect(report.handedOver).toEqual({ id: middle.meta.id, goal: 'A decomposition inside it' });
+    expect(await store.activeId()).toBe(middle.meta.id);
+    // The outer job is a container with an open subtask, so it is not the frontier.
+    expect(dev(await store.show(root.meta.id)).status).toBe('active');
+  });
+
+  it('hands nothing over when the task it closed had no queue', async () => {
+    const only = await store.start('A job nobody split');
+
+    const report: FinishReport = {};
+    await store.finish('shipped', only.meta.id, report);
+
+    expect(report.handedOver).toBeUndefined();
+  });
+
+  it('records the promotion in the history of the task it promoted', async () => {
+    const { subs } = await splitThreeStored();
+
+    await store.finish('piece done', at(subs, 0).meta.id);
+
+    // Nobody sent that patch, so without the note an audit of "why is this active" comes up empty.
+    const entries = await store.history(at(subs, 1).meta.id);
+    expect(entries.at(-1)?.note).toContain('promoted by the runtime');
+    expect(entries.at(-1)?.note).toContain(at(subs, 0).meta.id);
+  });
+
+  it('skips a successor this runtime cannot read and hands over to the one behind it', async () => {
+    const { root, subs } = await splitThreeStored();
+    store
+      .database()
+      .prepare('UPDATE task SET skill = ? WHERE goal = ?')
+      .run('no-such-skill', STEP_TWO);
+
+    const report: FinishReport = {};
+    const closed = await store.finish('piece done', at(subs, 0).meta.id, report);
+
+    // A state this build cannot validate is a reason to leave that row's status alone — not a
+    // reason to fail the close, and not a reason to leave the queue looking unattended: the
+    // frontier skips the unreadable piece too, so the readable one behind it is the work.
+    expect(dev(closed).status).toBe('done');
+    expect(report.handedOver).toEqual({ id: at(subs, 2).meta.id, goal: STEP_THREE });
+    expect((await store.list()).find((task) => task.id === root.meta.id)?.openSubtasks).toBe(2);
   });
 });
 

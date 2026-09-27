@@ -11,6 +11,7 @@ import { isNotation, NOTATIONS } from '../tasks/notation.js';
 import type { ProjectEntry, StoreResolver, TaskStorePort } from '../tasks/ports.js';
 import { describeProjects } from '../tasks/projects.js';
 import {
+  describeHandover,
   describeMove,
   formatTaskList,
   renderStateSize,
@@ -19,6 +20,8 @@ import {
   treeOrder,
 } from '../tasks/render.js';
 import type {
+  FinishReport,
+  Handover,
   HistoryEntry,
   PatchReport,
   StartOptions,
@@ -437,6 +440,18 @@ function decisionsNote(report: PatchReport): string {
   return lines.length === 0 ? '' : `\n${lines.join('\n')}`;
 }
 
+/**
+ * The piece the queue moved on to, as a line under the answer.
+ *
+ * The task that just closed cannot report it: it is done, and the handover happened to another
+ * row. Without the line the caller spends a read to learn what is in flight now — the exact call
+ * the handover was supposed to save it.
+ */
+function handOverNote(next: Handover | undefined): string {
+  if (next === undefined) return '';
+  return `\n${describeHandover(next)}; task_show reads its Σ.`;
+}
+
 async function patchTask(
   resolver: StoreResolver,
   args: Record<string, unknown>,
@@ -454,6 +469,7 @@ async function patchTask(
     const task = await store.patch(patch.value, id.value, report);
     return success(
       `Patched task ${task.meta.id}.\n\n${renderState(task)}` +
+        handOverNote(report.handedOver) +
         movedNote(report) +
         stampNote(report) +
         decisionsNote(report) +
@@ -477,8 +493,11 @@ async function finishTask(
   const id = optionalString(args, 'id');
   if (!id.ok) return failure(id.message);
   try {
-    const task = await store.finish(summary.value, id.value);
-    return success(`Finished task ${task.meta.id}.\n\n${renderState(task)}`);
+    const report: FinishReport = {};
+    const task = await store.finish(summary.value, id.value, report);
+    return success(
+      `Finished task ${task.meta.id}.\n\n${renderState(task)}` + handOverNote(report.handedOver),
+    );
   } catch (err) {
     return failureFromError(err, rootNote(store));
   }

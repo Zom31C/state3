@@ -1,6 +1,13 @@
 import type { StateDict } from '../core/types.js';
 import type { DriftedArtifact } from './artifact-stamps.js';
-import type { HistoryEntry, PatchReport, StartOptions, StoredTask, TaskSummary } from './store.js';
+import type {
+  FinishReport,
+  HistoryEntry,
+  PatchReport,
+  StartOptions,
+  StoredTask,
+  TaskSummary,
+} from './store.js';
 
 /**
  * Structural port over the task store. The real `TaskStore` satisfies it, and a
@@ -16,7 +23,7 @@ export interface TaskStorePort {
   start(goal: string, options?: StartOptions): Promise<StoredTask>;
   show(id?: string): Promise<StoredTask>;
   patch(patch: StateDict, id?: string, report?: PatchReport): Promise<StoredTask>;
-  finish(summary: string, id?: string): Promise<StoredTask>;
+  finish(summary: string, id?: string, report?: FinishReport): Promise<StoredTask>;
   list(): Promise<TaskSummary[]>;
   history(id?: string, limit?: number): Promise<HistoryEntry[]>;
   activeId(): Promise<string | null>;

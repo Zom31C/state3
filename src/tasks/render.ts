@@ -2,7 +2,7 @@ import { isPlainObject } from '../core/state.js';
 import type { StateDict, StateValue } from '../core/types.js';
 import { notationReminder } from './notation.js';
 import { queueOrder } from './store.js';
-import type { StoredTask, TaskSummary } from './store.js';
+import type { Handover, StoredTask, TaskSummary } from './store.js';
 
 /** Above this size Σ stops being an O(1) prompt component, so the agent is told to compress it. */
 export const STATE_SIZE_HINT_CHARS = 4000;
@@ -349,6 +349,17 @@ export function describeMove(move: { from: string | null; to: string | null }): 
   if (move.to === null) return `Moved out of ${move.from ?? 'its decomposition'} into a root task`;
   if (move.from === null) return `Filed under ${move.to} as a subtask`;
   return `Moved from ${move.from} under ${move.to}`;
+}
+
+/**
+ * The queue moved on to another task, as the sentence both entry points print.
+ *
+ * Shared for the reason `describeMove` is: one event, one wording, and each surface adds its own
+ * pointer to the read that follows. Naming the goal and not just the id is what lets the caller
+ * tell a handover from a promotion of the wrong piece before it starts working on it.
+ */
+export function describeHandover(next: Handover): string {
+  return `Handed over to ${next.id} — "${next.goal}"`;
 }
 
 /**

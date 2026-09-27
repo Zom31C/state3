@@ -662,6 +662,37 @@ try {
   // decomposition and not this one.
   await call('task_finish', { summary: 'Another job done', id: subtaskId(unrelated) });
 
+  // The queue handover, end to end: closing a piece promotes the next one and the answer names it,
+  // because the Σ the answer renders is the closed task's and cannot say what is in flight now.
+  // Closed out completely, so the `task_history` call below — which names no id — still finds the
+  // smoke's own task and not a leftover from this check.
+  const handoverRoot = await call('task_start', { goal: 'A decomposition to hand over' });
+  const firstPiece = await call('task_start', {
+    goal: 'First piece of it',
+    parent: subtaskId(handoverRoot),
+  });
+  const secondPiece = await call('task_start', {
+    goal: 'Second piece of it',
+    parent: subtaskId(handoverRoot),
+  });
+  const handed = await call('task_finish', {
+    summary: 'First piece done',
+    id: subtaskId(firstPiece),
+  });
+  check(
+    'closing a piece hands the queue over and names the task it promoted',
+    handed.isError !== true &&
+      text(handed).includes(`Handed over to ${subtaskId(secondPiece)}`) &&
+      text(handed).includes('"Second piece of it"'),
+    text(handed)
+      .split('\n')
+      .find((line) => line.startsWith('Handed over')) ?? '(no line)',
+  );
+  // Named by id rather than left to the frontier: the smoke's own task is still open and active
+  // here, and which of the two a tie-break would pick is not what this check is about.
+  await call('task_finish', { summary: 'Second piece done', id: subtaskId(secondPiece) });
+  await call('task_finish', { summary: 'Decomposition done', id: subtaskId(handoverRoot) });
+
   const history = await call('task_history', { limit: 10 });
   check(
     'task_history audits both rejected patches',

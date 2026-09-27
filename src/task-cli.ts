@@ -6,8 +6,20 @@ import { formatDoctorReport, inspectStateRoot } from './tasks/doctor.js';
 import { formatMigrationReport, migrateRootToDatabase } from './tasks/migrate.js';
 import { isNotation, NOTATIONS } from './tasks/notation.js';
 import { describeProjects, parseProjectsSpec } from './tasks/projects.js';
-import { describeMove, formatTaskList, renderTaskHead, subtreeRows } from './tasks/render.js';
-import type { HistoryEntry, PatchReport, StartOptions } from './tasks/store.js';
+import {
+  describeHandover,
+  describeMove,
+  formatTaskList,
+  renderTaskHead,
+  subtreeRows,
+} from './tasks/render.js';
+import type {
+  FinishReport,
+  Handover,
+  HistoryEntry,
+  PatchReport,
+  StartOptions,
+} from './tasks/store.js';
 import { TaskStore } from './tasks/store.js';
 import { stampWarnings } from './tasks/verifications.js';
 
@@ -382,6 +394,16 @@ export const defaultTaskCliDeps: TaskCliDeps = {
   log: (message) => console.log(message),
 };
 
+/**
+ * What the CLI prints when a write handed the queue over, or null when it did not.
+ *
+ * Its own line because Σ does not carry it: the task just closed is done, and the promotion
+ * happened to another row, so nothing in the printed state says what is in flight now.
+ */
+function handOverLine(next: Handover | undefined): string | null {
+  return next === undefined ? null : `${describeHandover(next)} — \`state3 task show\` reads its Σ`;
+}
+
 function describeFailure(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
   if (typeof err === 'object' && err !== null && 'category' in err) {
@@ -478,20 +500,24 @@ async function runStoreCommand(
         deps.log(`${describeMove(report.moved)} — \`state3 task list\` prints the tree`);
       }
       for (const line of [
+        handOverLine(report.handedOver),
         ...(report.stamps === undefined ? [] : stampWarnings(report.stamps)),
         ...decisionsWarnings(report.dropped ?? null),
       ]) {
-        deps.log(line);
+        if (line !== null) deps.log(line);
       }
       return;
     }
     case 'finish': {
       const summary = options.summary;
       if (summary === null) throw new Error('task finish requires a summary argument');
+      const report: FinishReport = {};
       const task = await (options.id === null
-        ? store.finish(summary)
-        : store.finish(summary, options.id));
+        ? store.finish(summary, undefined, report)
+        : store.finish(summary, options.id, report));
       deps.log(renderTaskHead(task));
+      const handed = handOverLine(report.handedOver);
+      if (handed !== null) deps.log(handed);
       return;
     }
     case 'list':
