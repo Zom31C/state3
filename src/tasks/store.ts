@@ -901,6 +901,30 @@ export class TaskStore {
     }
     const didMove = moved !== null && moved.from !== moved.to;
 
+    // A root is never queued: `pending` is a place in a queue, and nothing hands a root over. A
+    // piece detached from its decomposition therefore becomes work in flight — which is how the
+    // frontier already treated it, since a queued task ranks as ready — rather than being refused,
+    // because the move itself is the sensible thing to do and only the status left over from it is
+    // not. Said in the note: the patch as sent does not mention a status change.
+    let promotedOutOfQueue = false;
+    if (didMove && moved !== null && moved.to === null && merged.status === 'pending') {
+      merged.status = 'active';
+      promotedOutOfQueue = true;
+    }
+
+    // Refused here rather than in the skill guard, which reads one state and cannot see the column
+    // that decides it — and only when this patch is what puts the two together, so a row that got
+    // into the shape some other way can still be patched out of it.
+    const parentAfter = moved === null ? (row.parent ?? null) : moved.to;
+    if (parentAfter === null && merged.status === 'pending' && state.status !== 'pending') {
+      return reject(
+        'guard',
+        'a root task cannot be "pending": nothing queues it, so no runtime would ever hand it ' +
+          'over. Set it "active" to take the work up, "blocked" if it is waiting on something, or ' +
+          'file it under a task with {"parent": "<task id>"}.',
+      );
+    }
+
     // Stamped before validation, so the stamps are checked like everything else the write
     // produces, and before the transaction, so a refused patch spawns no git subprocess.
     const stamps = stampVerifications(state, merged, () => ({
@@ -922,6 +946,7 @@ export class TaskStore {
     // note behind: nothing was superseded by a write that never happened.
     const notes = [
       didMove ? moveNote(moved) : null,
+      promotedOutOfQueue ? 'a root task cannot stay queued, so its status became "active"' : null,
       stampHistoryNote(stamps),
       decisionsHistoryNote(dropped),
     ].filter((line): line is string => line !== null);

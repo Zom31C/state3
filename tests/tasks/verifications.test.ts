@@ -264,6 +264,19 @@ describe('stampWarnings', () => {
     expect(lines[0]).toContain('task_history keeps this line');
   });
 
+  it('leaves the lesson to P, and keeps the note down to the fact', () => {
+    const lines = stampWarnings(report([{ check: 'npm test', at: NOW, commit: HEAD }]));
+
+    expect(lines[0]).toContain('"npm test" was at');
+    expect(lines[0]).toContain('task_history keeps this line');
+    // What the note used to carry as well: how to keep a stamp next time. That is in P, where it is
+    // read once per task instead of once per patch, and repeating it made the note longer than the
+    // state it annotated.
+    expect(lines[0]).not.toContain('resend it with the field values');
+    expect(lines[0]).not.toContain('A stamp says which tree a check ran on');
+    expect((lines[0] ?? '').length).toBeLessThan(300);
+  });
+
   it('names a null commit as null instead of printing nothing', () => {
     const lines = stampWarnings(report([{ check: 'npm test', at: NOW, commit: null }]));
 

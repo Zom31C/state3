@@ -183,9 +183,13 @@ export function stampHistoryNote(report: StampReport): string | null {
 /**
  * The lines a patch answer adds for the stamps it detached; empty when it detached none.
  *
- * A note rather than a refusal: shortening a check's wording is a legitimate edit, and
- * refusing it would leave Σ uncompressed. But the answer is the only place the previous
- * values still exist, so it names them and says how to keep a stamp next time.
+ * A note rather than a refusal: shortening a check's wording is a legitimate edit, and refusing it
+ * would leave Σ uncompressed. The values are named because the answer and the history are the only
+ * places they still exist.
+ *
+ * What the note does *not* carry is the lesson — that a resent entry keeps its stamp while a
+ * reworded one is a new claim. That is in P, where it is read once per task instead of once per
+ * patch, and repeating it here made the note longer than the state it was annotating.
  */
 export function stampWarnings(report: StampReport): string[] {
   if (report.superseded.length === 0) return [];
@@ -199,10 +203,7 @@ export function stampWarnings(report: StampReport): string[] {
       shown
         .map((lost) => `"${quote(lost.check)}" was at ${lost.at} commit ${lost.commit ?? 'null'}`)
         .join('; ') +
-      '. A stamp says which tree a check ran on. An entry whose content changed is a new ' +
-      'claim and was stamped with this patch, so a reworded check loses the stamp it had — ' +
-      'resend it with the field values it already has (their order does not matter) to keep ' +
-      'that stamp, and copy the values above into Σ if the wording had to change. ' +
-      'task_history keeps this line.',
+      '. A reworded check is a new claim and was stamped with this patch; task_history keeps this ' +
+      'line and the values it names.',
   ];
 }

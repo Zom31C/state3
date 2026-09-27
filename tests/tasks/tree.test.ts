@@ -473,6 +473,45 @@ describe('handing the queue over', () => {
   });
 });
 
+describe('a status that means a place in a queue', () => {
+  it('refuses to queue a root task, and says what to do instead', async () => {
+    const root = await store.start('A job nobody split');
+
+    await expect(store.patch({ status: 'pending' }, root.meta.id)).rejects.toThrow(
+      /a root task cannot be "pending"/,
+    );
+    await expect(store.patch({ status: 'pending' }, root.meta.id)).rejects.toThrow(TaskPatchError);
+    // Nothing queues a root, so nothing would ever hand it over — and the frontier ranks a queued
+    // task as ready work, which is a lie about a task nobody is waiting to give out.
+    expect(dev(await store.show(root.meta.id)).status).toBe('active');
+  });
+
+  it('takes a detached piece out of the queue instead of leaving it queued', async () => {
+    const first = await store.start('First decomposition');
+    const piece = await store.start('A piece of it', { parent: first.meta.id });
+    expect(dev(piece).status).toBe('pending');
+
+    const detached = await store.patch({ parent: null }, piece.meta.id);
+
+    expect(detached.meta.parent).toBeNull();
+    expect(dev(detached).status).toBe('active');
+    // The patch as sent says nothing about a status, so the note is the only place it is recorded.
+    const entries = await store.history(piece.meta.id);
+    expect(entries.at(-1)?.note).toContain('its status became "active"');
+  });
+
+  it('still lets a root task be blocked, which is the status that means waiting', async () => {
+    const root = await store.start('A job nobody split');
+
+    const blocked = await store.patch(
+      { status: 'blocked', blockers: ['waiting on the user'] },
+      root.meta.id,
+    );
+
+    expect(dev(blocked).status).toBe('blocked');
+  });
+});
+
 describe('reading the tree', () => {
   it('reports the branch root-first and the subtree parents-first', async () => {
     const root = await store.start('top');

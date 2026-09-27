@@ -139,7 +139,7 @@ const DEV_TASK_INTRO: string = `You are a software engineering agent working on 
 
 const DEV_TASK_STATE_DICT: string = `State dictionary (all keys required, strict schema — unknown keys are rejected):
 - goal: one-sentence description of the objective.
-- status: "pending" | "active" | "blocked" | "done". A subtask starts "pending" — queued behind the work in flight, and handed over when its turn comes; "active" is the task being worked now.
+- status: "pending" | "active" | "blocked" | "done". A subtask starts "pending" — queued behind the work in flight, and handed over when its turn comes; "active" is the task being worked now. "pending" means a place in a queue, so a root task cannot have it: nothing would ever hand it over.
 - plan: array of { id, task, status, notes } plus an optional "archived": true. ids are sequential strings "1", "2", … Exactly one item may be "in_progress" at a time. An archived item stays in the array — its index and its id do not move — but the state injected into the prompt leaves it out and says how many it left out.
 - artifacts: map from file path (or resource key) to a one-line description of what it is / what changed.
 - verifications: array of { check, status } where check is the literal command ("npm test", "npm run lint", …) and status is "pass" | "fail" | "pending". Never mark "pass" without real output confirming it. The runtime stamps every entry you add or change with "at" (when) and "commit" (the project's git HEAD, null outside a repository) — send neither yourself. An entry you resend with the same field values keeps the stamp it had, whatever order you write them in; rewording one makes it a new claim, re-stamps it, and the answer names the stamp that was replaced.
