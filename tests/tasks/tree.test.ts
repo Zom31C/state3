@@ -3,10 +3,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { StateDict } from '../../src/core/types.js';
+import { inspectStateRoot } from '../../src/tasks/doctor.js';
 import { readInjection } from '../../src/tasks/inject.js';
 import { devTaskSchema } from '../../src/tasks/schema.js';
 import type { DevTaskState } from '../../src/tasks/schema.js';
-import { TaskPatchError, TaskStore } from '../../src/tasks/store.js';
+import { applyGuardedMove, TaskPatchError, TaskStore } from '../../src/tasks/store.js';
 import type { FinishReport, PatchReport, StoredTask } from '../../src/tasks/store.js';
 
 let dir: string;
@@ -648,5 +649,65 @@ describe('what a prompt carries', () => {
     // The parent is named by Branch and the two siblings by the queue line: counting them again
     // would only make the number harder to read.
     expect(atStart.task).not.toContain('Also open elsewhere');
+  });
+});
+
+/**
+ * The guard inside the write transaction, against the tree another writer left behind.
+ *
+ * Two processes cannot be interleaved inside one synchronous `patch()` call, so what is staged
+ * here is the second half of the race: a move validated against a tree that has since changed, and
+ * the statement that performs it having to notice.
+ */
+describe('applyGuardedMove', () => {
+  it('refuses the move that would close a loop and leaves the tree as the other writer left it', async () => {
+    const { subs } = await splitThreeStored();
+    const first = at(subs, 0).meta.id;
+    const second = at(subs, 1).meta.id;
+    // The other writer filed the first piece under the second one; moving the second under the
+    // first is what this writer had validated before that landed.
+    await store.patch({ parent: second }, first);
+
+    expect(applyGuardedMove(store.database(), first, second)).toBe(false);
+
+    const report = await inspectStateRoot(dir);
+    expect(report.parentCycles).toEqual([]);
+    expect(report.orphanedTasks).toEqual([]);
+  });
+
+  it('applies a move the tree still allows', async () => {
+    const { subs } = await splitThreeStored();
+    const second = at(subs, 1).meta.id;
+    const third = at(subs, 2).meta.id;
+
+    expect(applyGuardedMove(store.database(), second, third)).toBe(true);
+
+    const list = await store.list();
+    expect(list.find((task) => task.id === third)?.parent).toBe(second);
+  });
+
+  it('refuses a parent that was closed while the move was being validated', async () => {
+    const { subs } = await splitThreeStored();
+    const first = at(subs, 0).meta.id;
+    const second = at(subs, 1).meta.id;
+    await store.finish('piece done', first);
+
+    expect(applyGuardedMove(store.database(), first, second)).toBe(false);
+  });
+
+  it('refuses a parent that is not in the root at all', async () => {
+    const { subs } = await splitThreeStored();
+
+    expect(applyGuardedMove(store.database(), 'task-nope', at(subs, 0).meta.id)).toBe(false);
+  });
+
+  it('answers instead of recursing forever when the tree already holds a loop', async () => {
+    const { subs } = await splitThreeStored();
+    const first = at(subs, 0).meta.id;
+    const second = at(subs, 1).meta.id;
+    // Corrupt rows of the kind `doctor` reports: a task filed under itself.
+    store.database().prepare('UPDATE task SET parent = id WHERE id = ?').run(first);
+
+    expect(applyGuardedMove(store.database(), first, second)).toBe(true);
   });
 });

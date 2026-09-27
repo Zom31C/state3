@@ -117,6 +117,24 @@ type ReparentResult =
   | { ok: true; from: string | null; to: string | null }
   | { ok: false; category: RejectCategory; message: string };
 
+/**
+ * Thrown inside the write transaction when the tree turns out not to allow the move the patch was
+ * validated against, so that everything the patch had already written rolls back with it.
+ *
+ * A throw rather than a returned refusal because the refusal has to be recorded in the history,
+ * and a record cannot live inside a write that never happened: the caller catches this outside the
+ * transaction and turns it into the same `reject` a failed walk becomes.
+ */
+class MoveRejectedByTree extends Error {
+  /** The task the move was going to be filed under. */
+  readonly to: string;
+
+  constructor(to: string) {
+    super(`the tree no longer allows a move under ${to}`);
+    this.to = to;
+  }
+}
+
 export interface TaskSummary {
   id: string;
   goal: string;
@@ -255,6 +273,43 @@ function pickFrontier(tasks: readonly TaskSummary[]): string | null {
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
   return ordered[0]?.id ?? null;
+}
+
+/**
+ * Files `taskId` under `to` in one statement, and says whether the tree still allowed it.
+ *
+ * The walk in `TaskStore.checkReparent` runs before the write transaction, because a refusal has to
+ * be recorded in the history and a record cannot live inside a write that never happened. That
+ * leaves a window, and two processes on one root — a supervisor addressing it through `project`
+ * and the worker itself — both fit inside it: each validates against a tree the other has not yet
+ * moved, and between them they close a loop. So the same question is asked again here, inside the
+ * write lock and as part of the statement that moves the row: the new parent has to exist and still
+ * be open, and the walk up from it has to not meet the task being moved.
+ *
+ * `false` means the tree disagreed with the validation that let the write start; the caller rolls
+ * the whole patch back rather than leave a Σ describing a move that did not happen.
+ *
+ * `UNION` and not `UNION ALL`, so a loop already in the data — corrupt rows, which `doctor`
+ * reports — terminates the recursion instead of feeding it.
+ */
+export function applyGuardedMove(db: SqlDatabase, to: string, taskId: string): boolean {
+  const moved = db
+    .prepare(
+      `UPDATE task SET parent = ?
+       WHERE id = ?
+         AND EXISTS (SELECT 1 FROM task WHERE id = ? AND status <> 'done')
+         AND NOT EXISTS (
+           WITH RECURSIVE above(a) AS (
+             SELECT ?
+             UNION
+             SELECT t.parent FROM task AS t JOIN above ON t.id = above.a
+               WHERE t.parent IS NOT NULL
+           )
+           SELECT 1 FROM above WHERE a = ?
+         )`,
+    )
+    .run(to, taskId, to, to, taskId);
+  return moved.changes > 0;
 }
 
 /**
@@ -952,34 +1007,57 @@ export class TaskStore {
     ].filter((line): line is string => line !== null);
     const note = notes.length === 0 ? null : notes.join('; ');
 
-    db.transaction(() => {
-      this.upsert(db, {
-        id: taskId,
-        skill: row.skill,
-        notation: isNotation(row.notation) ? row.notation : DEFAULT_NOTATION,
-        createdAt: row.created_at,
-        updatedAt: now,
-        state: merged,
+    try {
+      db.transaction(() => {
+        this.upsert(db, {
+          id: taskId,
+          skill: row.skill,
+          notation: isNotation(row.notation) ? row.notation : DEFAULT_NOTATION,
+          createdAt: row.created_at,
+          updatedAt: now,
+          state: merged,
+        });
+        if (didMove && moved !== null) {
+          // Its own statement: `upsert` leaves the row's place in the tree alone on conflict, so
+          // that a Σ write cannot move a task by omission, and so the move is visible here as the
+          // one thing this patch did to the tree. Guarded in SQL when it names a parent, because
+          // the walk that allowed the move read the tree before this transaction began.
+          if (moved.to === null) {
+            db.prepare('UPDATE task SET parent = NULL WHERE id = ?').run(taskId);
+          } else if (!applyGuardedMove(db, moved.to, taskId)) {
+            throw new MoveRejectedByTree(moved.to);
+          }
+        }
+        // The patch is recorded as sent: the history shows what the agent asked for,
+        // which is what an audit of a rejected or surprising patch needs. The note carries what the
+        // write cost and the patch cannot show — the stamps it detached, the log entries it
+        // dropped, the place in the tree it moved the task to.
+        this.insertHistory(db, taskId, now, patch, true, undefined, note);
+        // Closing a task by patch hands the queue over exactly as `finish` does: the two are the
+        // same event, and a mechanism that only one of them has is a mechanism an agent has to
+        // remember to use the other way round.
+        if (closesNow) handedOver = this.handOver(db, taskId, now);
+        // Σ was just written, so this is the moment its file artifacts are true of the tree;
+        // a later read compares the disk against what was recorded here.
+        recordArtifactStamps(db, taskId, merged, projectDirOf(this.rootDir), now);
       });
-      if (didMove && moved !== null) {
-        // Its own statement: `upsert` leaves the row's place in the tree alone on conflict, so
-        // that a Σ write cannot move a task by omission, and so the move is visible here as the
-        // one thing this patch did to the tree.
-        db.prepare('UPDATE task SET parent = ? WHERE id = ?').run(moved.to, taskId);
-      }
-      // The patch is recorded as sent: the history shows what the agent asked for,
-      // which is what an audit of a rejected or surprising patch needs. The note carries what the
-      // write cost and the patch cannot show — the stamps it detached, the log entries it dropped,
-      // the place in the tree it moved the task to.
-      this.insertHistory(db, taskId, now, patch, true, undefined, note);
-      // Closing a task by patch hands the queue over exactly as `finish` does: the two are the
-      // same event, and a mechanism that only one of them has is a mechanism an agent has to
-      // remember to use the other way round.
-      if (closesNow) handedOver = this.handOver(db, taskId, now);
-      // Σ was just written, so this is the moment its file artifacts are true of the tree;
-      // a later read compares the disk against what was recorded here.
-      recordArtifactStamps(db, taskId, merged, projectDirOf(this.rootDir), now);
-    });
+    } catch (err) {
+      if (!(err instanceof MoveRejectedByTree)) throw err;
+      // Rolled back, so nothing was written and the refusal can still be recorded outside the
+      // write that never happened. The walk is repeated to name the rule the tree now disagrees
+      // on: a refusal that says only "the tree changed" leaves the caller guessing at which half
+      // of the move was wrong.
+      const rechecked =
+        requestedParent === undefined
+          ? null
+          : this.checkReparent(db, taskId, row.parent ?? null, requestedParent);
+      if (rechecked !== null && !rechecked.ok) return reject(rechecked.category, rechecked.message);
+      return reject(
+        'guard',
+        `the tree changed while task ${taskId} was being moved under ${err.to}, so nothing was ` +
+          'written; task_show {"view":"tree"} prints the tree as it stands now',
+      );
+    }
 
     if (report !== undefined) {
       report.stamps = stamps;
