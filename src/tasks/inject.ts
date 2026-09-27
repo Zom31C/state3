@@ -182,6 +182,36 @@ function branchOf(db: SqlDatabase, id: string): BranchRow[] {
 const BRANCH_NEAREST_LEVELS = 2;
 
 /**
+ * The most characters one ancestor's goal carries inside the `Branch:` line.
+ *
+ * Depth is capped by `BRANCH_NEAREST_LEVELS`; length was not capped at all, so the axis left
+ * without a bound is the one a goal grows along. A container's goal collects the outcomes of the
+ * pieces closed under it — the session of 27.09.2026 carried one of 255 characters, ten of them
+ * commit hashes — and it rides on every prompt of every piece underneath. What the line owes is
+ * which job this is a piece of, and that is a label; the outcomes belong in `decisions`, where
+ * they cost nothing per turn.
+ */
+export const BRANCH_SEGMENT_CHARS = 120;
+
+/**
+ * The most characters of a queued sibling's goal the queue line quotes.
+ *
+ * The line names the next piece so that a session finishing this one can pick it up without a
+ * call, and the id is what a call needs — the goal is there to tell two pieces apart, which is a
+ * label's job and not a paragraph's. The review of 27.09.2026 measured one of these lines at 442
+ * characters, 31% of everything the injection carried besides Σ, paid on every turn of a piece
+ * whose successor nobody was about to start. The whole goal is one `task_show {"view":"tree"}`
+ * away.
+ */
+export const QUEUE_GOAL_CHARS = 90;
+
+/** `text` shortened to at most `limit` characters, ending in ` …` when it was cut. */
+function capped(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, Math.max(1, limit - 2)).trimEnd()} …`;
+}
+
+/**
  * The branch line's segments: the root, the levels nearest the task, and a count of what was left
  * out between them.
  *
@@ -189,7 +219,11 @@ const BRANCH_NEAREST_LEVELS = 2;
  * nearly every tree has — reads in full and the cap costs it nothing.
  */
 function branchPath(branch: readonly BranchRow[]): string[] {
-  const ancestors = branch.slice(0, -1).map((task) => `${task.goal} [${task.status}]`);
+  const ancestors = branch
+    .slice(0, -1)
+    // The status stays outside the cap: which end of the queue an ancestor sits at is the part of
+    // the segment a reader acts on, and it is the goal that grows without bound.
+    .map((task) => `${capped(task.goal, BRANCH_SEGMENT_CHARS)} [${task.status}]`);
   const [root, ...above] = ancestors;
   if (root === undefined || above.length <= BRANCH_NEAREST_LEVELS) return ancestors;
   const nearest = above.slice(-BRANCH_NEAREST_LEVELS);
@@ -224,7 +258,9 @@ function queuedAfter(db: SqlDatabase, row: CandidateRow): BranchRow[] {
  * larger job this step belongs to, and that something follows — and not the queue itself.
  * Naming the next sibling is what lets a session that just finished one pick up the following
  * one without spending a call; the rest are a count, because their goals are text no action of
- * this turn reads.
+ * this turn reads. The one goal that is quoted is quoted up to `QUEUE_GOAL_CHARS` for the same
+ * reason — picking the next piece up needs its id, and telling it apart from this one needs a
+ * label, not the paragraph its author wrote into the goal.
  *
  * `queue` is off for a delegated subagent: it was handed one piece of work and must not start
  * the next one, so telling it what comes next is an invitation it should not be given.
@@ -246,7 +282,7 @@ function branchLines(db: SqlDatabase, row: CandidateRow, queue: boolean): string
     if (next === undefined) return lines;
     const rest = queued.length - 1;
     lines.push(
-      `Queued after this: "${next.goal}" (${next.id})` +
+      `Queued after this: "${capped(next.goal, QUEUE_GOAL_CHARS)}" (${next.id})` +
         `${rest === 0 ? '' : ` + ${rest} more`} — task_list prints the tree.`,
     );
   } catch {
