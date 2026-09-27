@@ -351,6 +351,28 @@ function leadFor(event) {
 }
 
 /**
+ * The patch rule in two lengths.
+ *
+ * A cold session gets the long one: it has no transcript, and the procedure that holds the patch
+ * syntax arrives only with the first `task_show`. Every later turn gets the short one, and it is
+ * short because the long one did not do the job — on 27.09.2026 an agent carrying the tutorial in
+ * every prompt still sent a bare `decisions` key three times in one session, dropping entries each
+ * time and paying two calls to restore them. What carries is the name of the failure and of the
+ * line that reports it; the syntax is in P, one call away, and at 504 characters it was over a
+ * third of the block's service text on every turn of every task in the project.
+ */
+const PATCH_TUTORIAL =
+  'After every meaningful step call task_patch with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one, {"verifications[2]":null} removes one, {"plan[id=5].notes":"…"} names a step by its own id — without resending the array; exactly one plan item in_progress, and a finished step whose outcome is already in decisions may be marked {"plan[0].archived":true} to leave this injection).';
+
+const PATCH_REMINDER =
+  'Call task_patch after every step with only the changed fields. A bare "decisions" or "plan" key ' +
+  'replaces the array and drops entries — append with {"decisions[+]":…}, and the Note: in the ' +
+  'answer names what left Σ.';
+
+const RISK_REMINDER =
+  'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.';
+
+/**
  * The brief, as its own section. The lead says what the text is and how old it is: a page
  * written later in the session is newer than this snapshot, and an agent that treats the
  * brief as live would argue with the project's own database.
@@ -445,8 +467,11 @@ if (primary !== null && typeof primary.task === 'string') {
             'If next.risk is "destructive" or "external", stop and report it: asking the user is the orchestrator\'s job, not yours.',
           ]
         : [
-            'After every meaningful step call task_patch with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one, {"verifications[2]":null} removes one, {"plan[id=5].notes":"…"} names a step by its own id — without resending the array; exactly one plan item in_progress, and a finished step whose outcome is already in decisions may be marked {"plan[0].archived":true} to leave this injection).',
-            'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.',
+            // A prompt gets the short form: this session saw the tutorial when it started, and P
+            // holds the syntax in full one call away. A start, a resume and a compaction are the
+            // three moments with nothing behind them, so those get the long one.
+            eventName === 'UserPromptSubmit' ? PATCH_REMINDER : PATCH_TUTORIAL,
+            RISK_REMINDER,
           ]),
     ].join('\n'),
   );

@@ -201,14 +201,34 @@ function leadFor(purpose) {
     : 'Authoritative progress record for the active task (the transcript may be incomplete):';
 }
 
-/** The two rules a host that injects Σ without the procedure P still has to carry. */
-const REMINDERS = [
-  'After every meaningful step call the task_patch tool with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one, {"verifications[2]":null} removes one, {"plan[id=5].notes":"…"} names a step by its own id — without resending the array; exactly one plan item in_progress, and a finished step whose outcome is already in decisions may be marked {"plan[0].archived":true} to leave this injection).',
-  'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.',
-];
+/**
+ * The rules a host that injects Σ without the procedure P still has to carry, the patch rule in
+ * two lengths.
+ *
+ * The long one is for the moments with no transcript behind them — a session's first request and
+ * a compaction — because P arrives only with the first `task_show`. Every later request gets the
+ * short one: the long form rode on every turn and did not prevent the drift it warns about, while
+ * the syntax it teaches sits in P one call away.
+ */
+const PATCH_TUTORIAL =
+  'After every meaningful step call the task_patch tool with only the changed fields (null deletes a key; arrays are replaced wholesale, but a path key touches one item — {"plan[1].status":"done"} edits it, {"plan[+]":{…}} appends one, {"verifications[2]":null} removes one, {"plan[id=5].notes":"…"} names a step by its own id — without resending the array; exactly one plan item in_progress, and a finished step whose outcome is already in decisions may be marked {"plan[0].archived":true} to leave this injection).';
 
-function stateBlock(head, purpose) {
-  return ['## Active task state (state3)', leadFor(purpose), head, ...REMINDERS]
+const PATCH_REMINDER =
+  'Call the task_patch tool after every step with only the changed fields. A bare "decisions" or ' +
+  '"plan" key replaces the array and drops entries — append with {"decisions[+]":…}, and the Note: ' +
+  'in the answer names what left Σ.';
+
+const RISK_REMINDER =
+  'If next.risk is "destructive" or "external", ask the user for confirmation before executing that action.';
+
+function stateBlock(head, purpose, tutorial) {
+  return [
+    '## Active task state (state3)',
+    leadFor(purpose),
+    head,
+    tutorial === true ? PATCH_TUTORIAL : PATCH_REMINDER,
+    RISK_REMINDER,
+  ]
     .filter((line) => line !== '')
     .join('\n');
 }
@@ -296,11 +316,21 @@ export const State3 = async ({ directory, worktree, project, client }) => {
   /** Sessions that already got the brief: it is a map, not something to pay for every turn. */
   const briefed = new Set();
 
+  /**
+   * Sessions that already got the long form of the patch rule.
+   *
+   * Its own set rather than a reuse of `briefed`: that one is filled only when a brief was
+   * actually delivered, so a project with no pages would never fill it and would pay for the
+   * tutorial on every request — the one case the split exists to remove.
+   */
+  const tutored = new Set();
+
   /** The blocks to inject for one hook call: Σ always, the brief once per session and at compaction. */
   const readBlocks = async (purpose, input) => {
     try {
       const key = typeof input?.sessionID === 'string' ? input.sessionID : 'default';
       const oncePerSession = purpose === 'compacting' || !briefed.has(key);
+      const tutorial = purpose === 'compacting' || !tutored.has(key);
       const context = await loadContext(stateDir, oncePerSession);
       if (context === null) return [];
       // A warning no longer ends the read. It used to be the only thing a warning could
@@ -312,7 +342,10 @@ export const State3 = async ({ directory, worktree, project, client }) => {
       const brief = typeof context.brief === 'string' ? context.brief : null;
       if (brief !== null) briefed.add(key);
       const blocks = [];
-      if (head !== null) blocks.push(stateBlock(head, purpose));
+      if (head !== null) {
+        blocks.push(stateBlock(head, purpose, tutorial));
+        tutored.add(key);
+      }
       if (brief !== null) blocks.push(briefBlock(brief));
       return blocks;
     } catch (err) {
@@ -381,7 +414,9 @@ if (invokedDirectly && process.argv.includes('--self-test')) {
       ];
       for (const [hook, purpose] of sections) {
         console.log(`--- ${hook} ---`);
-        if (context.head != null) console.log(stateBlock(context.head, purpose));
+        // The long form, as both of these moments carry it: the self-test prints what a session
+        // start and a compaction inject, and a later request differs only in that one line.
+        if (context.head != null) console.log(stateBlock(context.head, purpose, true));
         if (context.brief != null) console.log(briefBlock(context.brief));
         console.log('');
       }

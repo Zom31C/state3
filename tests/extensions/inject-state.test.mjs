@@ -100,6 +100,23 @@ describe('inject-state hook', () => {
     expect(context).toContain('task_patch');
   });
 
+  it('carries the short patch rule on a prompt, and the tutorial where nothing is behind it', async () => {
+    await writeTask('task-1.json', record('task-1', devState()));
+
+    const onPrompt = contextOf(await runSelfTestEvent('UserPromptSubmit'));
+    expect(onPrompt).toContain('Call task_patch after every step');
+    expect(onPrompt).toContain('A bare "decisions" or "plan" key replaces the array');
+    // The tutorial is 504 characters, P holds it in full one call away, and carrying it on every
+    // prompt did not stop the drift it warns about — a session pays for it once, at its start.
+    expect(onPrompt).not.toContain('arrays are replaced wholesale');
+
+    for (const event of ['SessionStart', 'PreCompact']) {
+      const context = contextOf(await runSelfTestEvent(event));
+      expect(context).toContain('After every meaningful step call task_patch');
+      expect(context).not.toContain('Call task_patch after every step');
+    }
+  });
+
   it('injects a blocked task, because a blocked task is still open', async () => {
     await writeTask(
       'task-1.json',

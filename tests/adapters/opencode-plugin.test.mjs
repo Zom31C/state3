@@ -84,6 +84,30 @@ describe('state3 opencode plugin', () => {
     expect(injected).not.toContain('about to be compacted');
   });
 
+  it('gives a session the patch tutorial once and the short rule on every request after it', async () => {
+    await writeTask(makeRecord());
+    const hooks = await loadHooks();
+    const first = { system: [] };
+    const second = { system: [] };
+
+    await hooks['experimental.chat.system.transform']({ sessionID: 's1' }, first);
+    await hooks['experimental.chat.system.transform']({ sessionID: 's1' }, second);
+
+    expect(first.system[0]).toContain('After every meaningful step call the task_patch tool');
+    expect(second.system[0]).toContain('Call the task_patch tool after every step');
+    expect(second.system[0]).not.toContain('arrays are replaced wholesale');
+
+    // A compaction empties the transcript, so it carries the long form again, and another session
+    // gets its own first request.
+    const compacted = { context: [] };
+    await hooks['experimental.session.compacting']({ sessionID: 's1' }, compacted);
+    expect(compacted.context[0]).toContain('After every meaningful step call the task_patch tool');
+
+    const other = { system: [] };
+    await hooks['experimental.chat.system.transform']({ sessionID: 's2' }, other);
+    expect(other.system[0]).toContain('After every meaningful step call the task_patch tool');
+  });
+
   it('skips the system hook when STATE3_NO_SYSTEM=1', async () => {
     await writeTask(makeRecord());
     process.env.STATE3_NO_SYSTEM = '1';
