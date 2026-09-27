@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -713,6 +713,40 @@ try {
     missing.isError === true && text(missing).includes('No task found'),
     text(missing).split('\n')[0],
   );
+
+  // The incident the RESTART line exists for, against the server this script is talking to: it
+  // was started before the checks ran, so a build written to disk now is one it will never load.
+  // Bumping the mtime of the module that reports the build is what a rebuild does to that
+  // comparison, and putting the stamp back leaves the tree as the smoke found it.
+  const runtimeLine = text(await call('task_list', {}))
+    .split('\n')
+    .find((line) => line.startsWith('runtime: state3 '));
+  const loadedFrom = runtimeLine?.slice(runtimeLine.indexOf('(') + 1, runtimeLine.lastIndexOf(')'));
+  const runtimeModule = loadedFrom === undefined ? null : join(loadedFrom, 'runtime-info.js');
+  check(
+    'a server running the newest build asks for no restart',
+    runtimeLine !== undefined && !runtimeLine.includes('RESTART'),
+    runtimeLine ?? '(no runtime line)',
+  );
+  if (runtimeModule === null || !existsSync(runtimeModule)) {
+    check('the runtime line names a build this script can inspect', false, String(runtimeModule));
+  } else {
+    const stamp = statSync(runtimeModule);
+    const rebuilt = new Date();
+    utimesSync(runtimeModule, rebuilt, rebuilt);
+    try {
+      const replaced = await call('task_list', {});
+      check(
+        'the runtime line says RESTART once the build was replaced under the process answering',
+        text(replaced).includes('RESTART: this build was replaced on disk at'),
+        text(replaced)
+          .split('\n')
+          .find((line) => line.startsWith('runtime: state3 ')) ?? '(no runtime line)',
+      );
+    } finally {
+      utimesSync(runtimeModule, stamp.atime, stamp.mtime);
+    }
+  }
 } finally {
   await client.close();
 }

@@ -452,6 +452,19 @@ function handOverNote(next: Handover | undefined): string {
   return `\n${describeHandover(next)}; task_show reads its Σ.`;
 }
 
+/**
+ * What a write says when the caller did not name the task it just wrote to.
+ *
+ * The id in the first line is not enough by itself: an agent whose injection named another task
+ * reads a bare id as its own mistake, when what happened is that the runtime chose — and a
+ * runtime whose build was replaced on disk chooses by an older rule than the hook that injected
+ * the other name. Saying that the choice was the runtime's turns "this is the wrong Σ" into "who
+ * chose it", which is the question the `RESTART` line on the next read answers.
+ */
+function choseTargetNote(id: string | undefined): string {
+  return id === undefined ? ' No id was given: the runtime picked the frontier.' : '';
+}
+
 async function patchTask(
   resolver: StoreResolver,
   args: Record<string, unknown>,
@@ -468,7 +481,7 @@ async function patchTask(
     const report: PatchReport = {};
     const task = await store.patch(patch.value, id.value, report);
     return success(
-      `Patched task ${task.meta.id}.\n\n${renderState(task)}` +
+      `Patched task ${task.meta.id}.${choseTargetNote(id.value)}\n\n${renderState(task)}` +
         handOverNote(report.handedOver) +
         movedNote(report) +
         stampNote(report) +
@@ -496,7 +509,8 @@ async function finishTask(
     const report: FinishReport = {};
     const task = await store.finish(summary.value, id.value, report);
     return success(
-      `Finished task ${task.meta.id}.\n\n${renderState(task)}` + handOverNote(report.handedOver),
+      `Finished task ${task.meta.id}.${choseTargetNote(id.value)}\n\n${renderState(task)}` +
+        handOverNote(report.handedOver),
     );
   } catch (err) {
     return failureFromError(err, rootNote(store));

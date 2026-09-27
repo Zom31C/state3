@@ -28,6 +28,7 @@ Task rules:
 - Store only what future steps need; compress finished work into its outcome instead of narrating how you got there. When Σ grows, `task_show {"view":"size"}` says which field to shorten first.
 - `artifacts` keys that look like paths are checked against the project on write: a missing one is reported as a note under the answer, never as a refusal, because an artifact may also be a page, a URL or a resource outside the tree. A file artifact is also stamped (`mtime`, size) when Σ is written, and `task_show` — plus the injection at session start — says which of them changed on disk since: Σ then describes a tree that has moved, so read the file or run `git status` before trusting what it says about it.
 - Tools name the state root they use (`no tasks (state root: …)`, `Started task <id> [<skill>] at <path>`). If that root is not inside your project, stop and tell the user instead of creating or patching tasks there: the host starts the server in its own startup directory, and `STATE3_STATE_DIR` pins the right one.
+- A `runtime:` line ending in `RESTART` says the host answers from a build the repository has already replaced: a hook reloads `dist` on every event while the server keeps the code it was started with, so the two can pick different tasks. Pass an explicit `id` on every call until the user restarts the host.
 
 Knowledge rules:
 

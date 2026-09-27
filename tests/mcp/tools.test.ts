@@ -688,6 +688,19 @@ describe('task_patch', () => {
     expect(store.calledWith('patch')).toEqual([{ decisions: ['used stdio'] }, 'task-1']);
   });
 
+  it('says the runtime chose the target when the caller named none', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+
+    const chosen = await call('task_patch', { patch: { decisions: ['used stdio'] } });
+    const named = await call('task_patch', { patch: { decisions: ['used stdio'] }, id: 'task-1' });
+
+    // The id alone leaves a write to the wrong Σ looking like the caller's mistake; naming the
+    // choice is what makes it a question about the runtime — which the build line then answers.
+    expect(chosen.content).toContain('Patched task task-1. No id was given');
+    expect(named.content).not.toContain('No id was given');
+  });
+
   it('returns Σ alone, without asking the store for P', async () => {
     const { store, call } = setup();
     await store.start('ship it');
@@ -975,6 +988,16 @@ describe('task_finish', () => {
     expect(jsonLine(result.content)).toContain('"status":"done"');
     expect(jsonLine(result.content)).toContain('server shipped and tested');
     expect(store.callCount('instructionsFor')).toBe(0);
+  });
+
+  it('says the runtime chose the task it closed when the caller named none', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+
+    const result = await call('task_finish', { summary: 'shipped' });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('Finished task task-1. No id was given');
   });
 
   it('names the piece the queue moved on to, which the closed task cannot', async () => {
