@@ -108,7 +108,7 @@ const SUPERVISE_STATE_DICT: string = `State dictionary (all keys required, stric
 - spec: where the authoritative specification lives (path or URL) and which revision the worker follows.
 - worker: who implements it — model, runtime, and the root of the worker's own task state, so its progress can be read.
 - rounds: array of { id, assignment, verdict, evidence, feedback }, one entry per assign → work → review cycle. verdict stays "pending" until you have reviewed, then becomes "accepted" or "rejected". evidence is what YOU checked; feedback is what the worker must change.
-- decisions: append-only log of significant choices (spec changes, scope cuts, tool choices), one line each.
+- decisions: append-only log of significant choices (spec changes, scope cuts, tool choices), one line each. A patch replaces the whole array, so an entry you leave out leaves Σ: the answer names the entries that were dropped and task_history keeps their text. Append; do not rewrite what is already recorded.
 - blockers: list of things preventing progress (empty when not blocked).
 - next: { action, risk } — the very next concrete step and its risk level.`;
 

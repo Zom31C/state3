@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import type { StateDict } from './core/types.js';
 import { formatRuntimeInfo, runtimeInfo } from './runtime-info.js';
+import { decisionsWarnings } from './tasks/decisions.js';
 import { formatDoctorReport, inspectStateRoot } from './tasks/doctor.js';
 import { formatMigrationReport, migrateRootToDatabase } from './tasks/migrate.js';
 import { isNotation, NOTATIONS } from './tasks/notation.js';
@@ -8,6 +9,7 @@ import { describeProjects, parseProjectsSpec } from './tasks/projects.js';
 import { describeMove, formatTaskList, renderTaskHead, subtreeRows } from './tasks/render.js';
 import type { HistoryEntry, PatchReport, StartOptions } from './tasks/store.js';
 import { TaskStore } from './tasks/store.js';
+import { stampWarnings } from './tasks/verifications.js';
 
 export type TaskStorePort = Pick<
   TaskStore,
@@ -469,11 +471,17 @@ async function runStoreCommand(
         ? store.patch(patch, undefined, report)
         : store.patch(patch, options.id, report));
       deps.log(renderTaskHead(task));
-      // Printed because Σ does not carry it: a `parent` patch moves the task in the tree while
-      // the state above reads exactly as it did before, so without this line the move — the one
-      // thing the patch did — is invisible in the output.
+      // Printed because Σ carries none of it: the move is a column, and the stamps and the log
+      // entries a patch detached exist nowhere else once the write has landed. The CLI has no
+      // answer tail of its own, so what the tools say under theirs becomes a line of its own here.
       if (report.moved !== undefined) {
         deps.log(`${describeMove(report.moved)} — \`state3 task list\` prints the tree`);
+      }
+      for (const line of [
+        ...(report.stamps === undefined ? [] : stampWarnings(report.stamps)),
+        ...decisionsWarnings(report.dropped ?? null),
+      ]) {
+        deps.log(line);
       }
       return;
     }

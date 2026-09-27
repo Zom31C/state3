@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { StateDict } from '../src/core/types.js';
+import { droppedDecisions } from '../src/tasks/decisions.js';
 import { devTaskSchema } from '../src/tasks/schema.js';
 import type { DevTaskState } from '../src/tasks/schema.js';
 import type {
@@ -144,8 +145,14 @@ class FakeStore {
       ...this.dev(found),
       ...(statePatch as Partial<DevTaskState>),
     };
+    const before = found.state;
     found.state = asDict(merged);
     found.meta.updatedAt = this.stamp();
+    if (report !== undefined) {
+      // The log entries a wholesale replacement dropped, by the same function the store uses.
+      const dropped = droppedDecisions(before, found.state);
+      if (dropped !== null) report.dropped = dropped;
+    }
     return found;
   }
 
@@ -589,6 +596,23 @@ describe('runTaskCommand', () => {
     // The key addressed the tree, so Σ gained nothing to show for it — the printed state reads
     // exactly as it did before the move, which is why the line below it is not optional.
     expect(lines[0]).not.toContain('parent');
+  });
+
+  it('prints what a patch cost Σ, which the state itself does not show', async () => {
+    const store = new FakeStore();
+    const { deps, lines } = makeDeps(store);
+    await store.start('Refactor the importer');
+    await runTaskCommand(
+      parseTaskArgs(['patch', '{"decisions":["used stdio","kept the legacy root"]}']),
+      deps,
+    );
+
+    await runTaskCommand(parseTaskArgs(['patch', '{"decisions":["kept the legacy root"]}']), deps);
+
+    // The printed Σ holds only what survived, so this line is the only thing on this surface that
+    // says an entry left — the same wording the tool answer carries.
+    expect(lines.at(-1)).toContain('1 decisions entry(s) are no longer in Σ (2 -> 1)');
+    expect(lines.at(-1)).toContain('"used stdio"');
   });
 
   it('reads the patch from stdin when the argument is a dash', async () => {

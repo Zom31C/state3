@@ -9,6 +9,7 @@ import {
   renderStateWithProcedure,
 } from '../../src/mcp/tools.js';
 import type { TaskStorePort, TaskToolDefinition, ToolResult } from '../../src/mcp/tools.js';
+import { droppedDecisions } from '../../src/tasks/decisions.js';
 import type { Notation } from '../../src/tasks/notation.js';
 import type { ProjectEntry } from '../../src/tasks/ports.js';
 import { createProjectResolver, singleStoreResolver } from '../../src/tasks/projects.js';
@@ -190,7 +191,8 @@ class FakeTaskStore {
     // Path keys ("plan[1].status") are expanded before anything else runs, as in the store.
     const expanded = expandPathPatch(task.state, statePatch);
     if (!expanded.ok) throw new FakePatchError('path', expanded.message);
-    task.state = mergeState(task.state, expanded.patch);
+    const before = task.state;
+    task.state = mergeState(before, expanded.patch);
     task.meta.updatedAt = '2026-09-05T10:05:00.000Z';
     if (movesTree) {
       const from = task.meta.parent;
@@ -199,7 +201,12 @@ class FakeTaskStore {
       if (report !== undefined && from !== to) report.moved = { from, to };
     }
     this.entries.push({ at: task.meta.updatedAt, patch: { ...patch }, ok: true });
-    if (report !== undefined && this.stamps !== null) report.stamps = this.stamps;
+    if (report !== undefined) {
+      if (this.stamps !== null) report.stamps = this.stamps;
+      // The log entries a wholesale replacement dropped, by the same pure function the store uses.
+      const dropped = droppedDecisions(before, task.state);
+      if (dropped !== null) report.dropped = dropped;
+    }
     return task;
   }
 
@@ -762,6 +769,19 @@ describe('task_patch', () => {
     expect(result.ok).toBe(true);
     expect(result.content).not.toContain('Moved');
     expect(result.content).not.toContain('Filed under');
+  });
+
+  it('names the log entries a wholesale replacement dropped from Σ', async () => {
+    const { store, call } = setup();
+    await store.start('ship it');
+    await call('task_patch', { patch: { decisions: ['used stdio', 'kept the legacy root'] } });
+
+    const result = await call('task_patch', { patch: { decisions: ['kept the legacy root'] } });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('1 decisions entry(s) are no longer in Σ (2 -> 1)');
+    expect(result.content).toContain('"used stdio"');
+    expect(result.content).toContain('task_history keeps this line');
   });
 
   it('applies a path key that changes one plan item', async () => {

@@ -18,6 +18,8 @@ import { builtinSkillRegistry } from './registry.js';
 import type { SkillRegistry } from './registry.js';
 import { driftedArtifacts, recordArtifactStamps, storedArtifactStamps } from './artifact-stamps.js';
 import type { DriftedArtifact } from './artifact-stamps.js';
+import { decisionsHistoryNote, droppedDecisions } from './decisions.js';
+import type { DroppedDecisions } from './decisions.js';
 import { stampHistoryNote, stampVerifications } from './verifications.js';
 import type { StampReport } from './verifications.js';
 
@@ -77,6 +79,13 @@ export interface PatchReport {
    * told about is how a decomposition gets quietly rearranged.
    */
   moved?: { from: string | null; to: string | null };
+  /**
+   * The entries the append-only `decisions` log lost to this patch, when it lost any.
+   *
+   * Reported for the reason the stamps are: after the write Σ holds only what survived, so the
+   * answer and the history are the two places the dropped text still exists in.
+   */
+  dropped?: DroppedDecisions;
 }
 
 /**
@@ -777,6 +786,9 @@ export class TaskStore {
       at: now,
       commit: gitHead(projectDirOf(this.rootDir)),
     }));
+    // The other thing a write can cost that Σ cannot show afterwards: entries the append-only log
+    // had and the merged array no longer does.
+    const dropped = droppedDecisions(state, merged);
     const parsed = skill.schema.safeParse(merged);
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
@@ -787,9 +799,11 @@ export class TaskStore {
 
     // Written before the transaction so a patch that the schema then refuses leaves no
     // note behind: nothing was superseded by a write that never happened.
-    const notes = [didMove ? moveNote(moved) : null, stampHistoryNote(stamps)].filter(
-      (line): line is string => line !== null,
-    );
+    const notes = [
+      didMove ? moveNote(moved) : null,
+      stampHistoryNote(stamps),
+      decisionsHistoryNote(dropped),
+    ].filter((line): line is string => line !== null);
     const note = notes.length === 0 ? null : notes.join('; ');
 
     db.transaction(() => {
@@ -808,8 +822,9 @@ export class TaskStore {
         db.prepare('UPDATE task SET parent = ? WHERE id = ?').run(moved.to, taskId);
       }
       // The patch is recorded as sent: the history shows what the agent asked for,
-      // which is what an audit of a rejected or surprising patch needs. The note carries
-      // what the write then did to the stamps, which the patch cannot show.
+      // which is what an audit of a rejected or surprising patch needs. The note carries what the
+      // write cost and the patch cannot show — the stamps it detached, the log entries it dropped,
+      // the place in the tree it moved the task to.
       this.insertHistory(db, taskId, now, patch, true, undefined, note);
       // Σ was just written, so this is the moment its file artifacts are true of the tree;
       // a later read compares the disk against what was recorded here.
@@ -819,6 +834,7 @@ export class TaskStore {
     if (report !== undefined) {
       report.stamps = stamps;
       if (didMove && moved !== null) report.moved = moved;
+      if (dropped !== null) report.dropped = dropped;
     }
     return this.readTask(taskId);
   }

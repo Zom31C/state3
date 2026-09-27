@@ -6,6 +6,7 @@ import { formatRuntimeInfo, runtimeInfo } from '../runtime-info.js';
 import { driftWarnings } from '../tasks/artifact-stamps.js';
 import type { DriftedArtifact } from '../tasks/artifact-stamps.js';
 import { artifactWarnings, missingArtifactPaths } from '../tasks/artifacts.js';
+import { decisionsWarnings } from '../tasks/decisions.js';
 import { isNotation, NOTATIONS } from '../tasks/notation.js';
 import type { ProjectEntry, StoreResolver, TaskStorePort } from '../tasks/ports.js';
 import { describeProjects } from '../tasks/projects.js';
@@ -422,6 +423,20 @@ function movedNote(report: PatchReport): string {
   return `\n${describeMove(move)}; task_show {"view":"tree"} prints the decomposition.`;
 }
 
+/**
+ * The log entries this patch dropped from Σ, as a line under the answer.
+ *
+ * `decisions` is the record of why the work went the way it did, and a patch replaces the array
+ * wholesale — so a shorter one empties part of that record without any field of the state looking
+ * wrong. After the write Σ holds only what survived: the answer and the history are the two places
+ * the dropped text still exists in, and naming it is what turns a silent loss into an edit the
+ * caller can put back.
+ */
+function decisionsNote(report: PatchReport): string {
+  const lines = decisionsWarnings(report.dropped ?? null);
+  return lines.length === 0 ? '' : `\n${lines.join('\n')}`;
+}
+
 async function patchTask(
   resolver: StoreResolver,
   args: Record<string, unknown>,
@@ -441,6 +456,7 @@ async function patchTask(
       `Patched task ${task.meta.id}.\n\n${renderState(task)}` +
         movedNote(report) +
         stampNote(report) +
+        decisionsNote(report) +
         artifactNote(store, task.state, patch.value),
     );
   } catch (err) {

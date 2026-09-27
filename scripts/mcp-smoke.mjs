@@ -536,6 +536,26 @@ try {
       ?.slice(0, 90) ?? '',
   );
 
+  // Shortening an append-only log is legal — refusing it would leave Σ unable to compress — but it
+  // must not be silent: after the write Σ holds only what survived, so the answer names the entry
+  // that left and the history keeps its text.
+  await call('task_patch', {
+    patch: { decisions: ['smoke: used stdio', 'smoke: kept one database'] },
+  });
+  const shortened = await call('task_patch', {
+    patch: { decisions: ['smoke: kept one database'] },
+  });
+  check(
+    'shortening an append-only log names the entry that left Σ',
+    shortened.isError !== true &&
+      text(shortened).includes('1 decisions entry(s) are no longer in Σ (2 -> 1)') &&
+      text(shortened).includes('"smoke: used stdio"'),
+    text(shortened)
+      .split('\n')
+      .find((line) => line.startsWith('Note:'))
+      ?.slice(0, 90) ?? '',
+  );
+
   const sizes = await call('task_show', { view: 'size' });
   check(
     'task_show {"view":"size"} reports the fields by cost and carries no Σ',
