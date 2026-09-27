@@ -31,7 +31,7 @@ describe('isPathLikeArtifact', () => {
       'src/reader.ts',
       'src/',
       'tools\\check.ps1',
-      'D:\\Projects\\RaceGame',
+      'D:\\Projects\\worker',
       '.qwen/tmp/',
     ]) {
       expect(isPathLikeArtifact(key), key).toBe(true);
@@ -47,7 +47,7 @@ describe('isPathLikeArtifact', () => {
       'git state3',
       'github.com/Zom31C/state3',
       'https://example.com/report.html',
-      'Σ task-mtv1tug2-fbus',
+      'Σ task-mabc1234-xyz9',
     ]) {
       expect(isPathLikeArtifact(key), key).toBe(false);
     }

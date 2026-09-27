@@ -184,7 +184,7 @@ STATE3_PROJECTS=worker=D:\Projects\worker\.state3
   его, ни записать в него. Объявление приходит из окружения пользователя, не от
   модели;
 - необъявленное имя — ошибка с перечислением объявленных корней (проверено):
-  `unknown project "nope" — declared: racegame (D:\Projects\RaceGame\.state3)`;
+  `unknown project "nope" — declared: <name> (<rootDir>)`;
 - `task_list` дописывает строки возможностей `skills: …` и `projects: …`;
 - хук при заданной `STATE3_PROJECTS` инжектирует также активную задачу
   каждого объявленного проекта — блоком `## Supervised projects (state3)` с
